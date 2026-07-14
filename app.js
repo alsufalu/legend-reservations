@@ -18,6 +18,9 @@ let state = {
   selectedDate: todayISO(),
   reservations: [],
   tables: [],
+  areas: [],
+  currentAreaId: null,
+  editMode: false,
   guests: [],
   waitlist: [],
   staffList: [],
@@ -170,8 +173,9 @@ async function loadAll(){
   const statusEl = document.getElementById('syncStatus');
   setStatus(statusEl, '☁ Syncing…', '');
   try {
-    const [tablesRes, guestsRes, waitlistRes, staffRes, spRes, resRes] = await Promise.all([
-      sb.from('dining_tables').select('*').order('section').order('label'),
+    const [tablesRes, areasRes, guestsRes, waitlistRes, staffRes, spRes, resRes] = await Promise.all([
+      sb.from('dining_tables').select('*').order('label'),
+      sb.from('floor_areas').select('*').order('sort_order').order('created_at'),
       sb.from('guests').select('*').order('last_name'),
       sb.from('waitlist').select('*').eq('status','waiting').order('added_at'),
       sb.from('staff').select('*').order('created_at'),
@@ -179,11 +183,13 @@ async function loadAll(){
       sb.from('reservations').select('*').eq('reservation_date', state.selectedDate).order('reservation_time'),
     ]);
     state.tables = tablesRes.data || [];
+    state.areas = areasRes.data || [];
     state.guests = guestsRes.data || [];
     state.waitlist = waitlistRes.data || [];
     state.staffList = staffRes.data || [];
     state.servicePeriods = spRes.data || [];
     state.reservations = resRes.data || [];
+    if (!state.currentAreaId && state.areas.length) state.currentAreaId = state.areas[0].id;
     setStatus(statusEl, '☁ Synced', 'synced');
   } catch(e){
     setStatus(statusEl, '⚠ Offline', 'error');
@@ -438,46 +444,271 @@ window.deleteReservation = async function(id){
 };
 
 // ============================================================================
-// FLOOR PLAN TAB
+// FLOOR PLAN TAB — drag & drop editor with per-area background sketches
 // ============================================================================
 async function reloadTables(){
-  const { data } = await sb.from('dining_tables').select('*').order('section').order('label');
+  const { data } = await sb.from('dining_tables').select('*').order('label');
   state.tables = data || [];
 }
+async function reloadAreas(){
+  const { data } = await sb.from('floor_areas').select('*').order('sort_order').order('created_at');
+  state.areas = data || [];
+  if (state.currentAreaId !== '__unassigned' && !state.areas.find(a => a.id === state.currentAreaId)) state.currentAreaId = state.areas[0]?.id || null;
+}
+function currentArea(){ return state.areas.find(a => a.id === state.currentAreaId); }
 
 function renderFloorPlanTab(){
-  const sections = [...new Set(state.tables.map(t => t.section))];
   const activeRes = state.reservations.filter(r => r.status === 'seated');
-  const body = sections.length ? sections.map(sec => {
-    const tables = state.tables.filter(t => t.section === sec && t.active);
+  const area = currentArea();
+  const unassignedCount = state.tables.filter(t => !t.area_id).length;
+
+  const areaTabs = state.areas.map(a => `<span class="area-chip ${a.id===state.currentAreaId?'active':''}" onclick="switchArea('${a.id}')">${esc(a.name)}</span>`).join('')
+    + (unassignedCount ? `<span class="area-chip ${state.currentAreaId==='__unassigned'?'active':''}" onclick="switchArea('__unassigned')">Unassigned (${unassignedCount})</span>` : '')
+    + `<span class="area-chip-add" onclick="openAreaModal()">+ New Area</span>`;
+
+  const tablesInArea = state.currentAreaId === '__unassigned'
+    ? state.tables.filter(t => !t.area_id)
+    : state.tables.filter(t => t.area_id === state.currentAreaId);
+
+  const canvasW = area?.canvas_width || 1200;
+  const canvasH = area?.canvas_height || 800;
+  const bgStyle = area?.background_image_url ? `background-image:url('${esc(area.background_image_url)}');background-size:cover;background-position:center;` : '';
+
+  const tableEls = tablesInArea.map(t => {
+    const occ = activeRes.find(r => r.table_id === t.id);
+    const dragAttr = state.editMode ? `onpointerdown="startDragTable(event,'${t.id}')"` : `onclick="cycleTableStatus('${t.id}')"`;
     return `
-    <div class="section-heading">${esc(sec)}</div>
-    <div class="grid grid-4">
-      ${tables.map(t => {
-        const occ = activeRes.find(r => r.table_id === t.id);
-        return `
-        <div class="table-card status-${t.status}" onclick="cycleTableStatus('${t.id}')">
-          <div class="table-label">${esc(t.label)}</div>
-          <div class="table-meta">Seats ${t.min_party}-${t.max_party}</div>
-          <div class="table-status">${t.status}</div>
-          ${occ ? `<div class="table-meta" style="margin-top:4px">${esc(guestName(guestById(occ.guest_id)))} · ${occ.party_size}p</div>` : ''}
-        </div>`;
-      }).join('')}
-    </div>`;
-  }).join('') : `<div class="empty-state"><div class="empty-state-icon">🗺️</div>No tables yet. Add tables in Settings.</div>`;
+      <div id="tbl-${t.id}" class="floor-table shape-${t.shape} status-${t.status}" ${dragAttr}
+           style="left:${t.pos_x}px;top:${t.pos_y}px;width:${t.width}px;height:${t.height}px;">
+        <div class="ft-name">${esc(t.label)}</div>
+        <div class="ft-meta">${t.seats} seats</div>
+        ${occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>` : ''}
+      </div>`;
+  }).join('');
+
+  const toolbar = area ? `
+    <button class="btn btn-secondary btn-sm" onclick="openAreaModal('${area.id}')">✏️ Rename / Background</button>
+    ${state.editMode ? `<button class="btn btn-primary btn-sm" onclick="addTableToCanvas()">+ Add Table</button>` : ''}
+    <button class="btn ${state.editMode?'btn-success':'btn-secondary'} btn-sm" onclick="toggleEditMode()">${state.editMode ? '✅ Done Editing' : '✏️ Edit Layout'}</button>
+  ` : (state.currentAreaId === '__unassigned' ? `<span class="panel-sub">Assign these tables to an area via Edit Layout → tap a table.</span>` : '');
 
   return `
   <div class="panel-header">
-    <div><h2 class="panel-title">Floor Plan</h2><div class="panel-sub">Tap a table to cycle its status</div></div>
+    <div><h2 class="panel-title">Floor Plan</h2><div class="panel-sub">${state.editMode ? 'Drag tables to reposition. Tap a table to rename, resize, or delete.' : 'Tap a table to cycle its status.'}</div></div>
+    <div class="floor-toolbar">${toolbar}</div>
   </div>
-  ${body}`;
+  <div class="area-tabs" style="margin-bottom:14px">${areaTabs || '<span class="panel-sub">No areas yet — create one to start placing tables.</span>'}</div>
+  ${state.editMode ? `<div class="edit-mode-banner">✏️ Edit Layout is on — drag tables anywhere on the canvas. Changes save automatically.</div>` : ''}
+  ${area ? `
+  <div class="floor-canvas-wrap">
+    <div id="floorCanvas" class="floor-canvas" style="width:${canvasW}px;height:${canvasH}px;${bgStyle}">
+      ${tableEls || '<div class="empty-state" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">No tables in this area yet. Click "Edit Layout" then "+ Add Table".</div>'}
+    </div>
+  </div>` : (state.currentAreaId === '__unassigned' ? `
+  <div class="grid grid-4">${tablesInArea.map(t => `<div class="table-card status-${t.status}" onclick="openCanvasTableModal('${t.id}')"><div class="table-label">${esc(t.label)}</div><div class="table-meta">Seats ${t.seats}</div></div>`).join('')}</div>
+  ` : '')}`;
 }
+
+window.switchArea = function(id){ state.editMode = false; state.currentAreaId = id; render(); };
+window.toggleEditMode = function(){ state.editMode = !state.editMode; render(); };
 
 window.cycleTableStatus = async function(id){
   const t = tableById(id);
   const order = ['available','reserved','seated','dirty','blocked'];
   const next = order[(order.indexOf(t.status)+1) % order.length];
   await sb.from('dining_tables').update({ status: next }).eq('id', id);
+  await reloadTables();
+  render();
+};
+
+// ---- Dragging (pointer events, works with mouse + touch/iPad) ----
+window.startDragTable = function(ev, id){
+  ev.preventDefault();
+  const el = document.getElementById('tbl-'+id);
+  if (!el) return;
+  const startX = ev.clientX, startY = ev.clientY;
+  const origLeft = parseFloat(el.style.left) || 0;
+  const origTop = parseFloat(el.style.top) || 0;
+  let moved = false;
+  try { el.setPointerCapture(ev.pointerId); } catch(e){}
+
+  function onMove(e){
+    const dx = e.clientX - startX, dy = e.clientY - startY;
+    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) moved = true;
+    el.style.left = Math.max(0, origLeft + dx) + 'px';
+    el.style.top = Math.max(0, origTop + dy) + 'px';
+  }
+  async function onUp(){
+    el.removeEventListener('pointermove', onMove);
+    el.removeEventListener('pointerup', onUp);
+    if (moved){
+      const newX = Math.round(parseFloat(el.style.left));
+      const newY = Math.round(parseFloat(el.style.top));
+      const t = tableById(id);
+      if (t){ t.pos_x = newX; t.pos_y = newY; }
+      await sb.from('dining_tables').update({ pos_x: newX, pos_y: newY }).eq('id', id);
+    } else {
+      openCanvasTableModal(id);
+    }
+  }
+  el.addEventListener('pointermove', onMove);
+  el.addEventListener('pointerup', onUp);
+};
+
+// ---- Areas: create / rename / delete / background image ----
+window.openAreaModal = function(id){
+  const a = id ? state.areas.find(x => x.id === id) : null;
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>${a ? 'Edit Area' : 'New Area'}</h3>
+    <label class="field-label">Area name</label>
+    <input type="text" class="modal-input" id="areaName" placeholder="e.g. Patio, Main Dining, Private Room" value="${esc(a?.name||'')}"/>
+    ${a ? `
+    <div class="modal-section">
+      <h4>Floor Plan Background</h4>
+      ${a.background_image_url ? `<img src="${esc(a.background_image_url)}" style="width:100%;border-radius:8px;margin-bottom:8px;border:1px solid var(--border)"/>` : `<p style="font-size:12px;color:var(--gray)">No sketch or floor plan image uploaded yet. Upload a photo or rough sketch of this area and drag tables onto it.</p>`}
+      <input type="file" accept="image/*" id="areaImageInput" style="display:none" onchange="uploadFloorPlanImage(event,'${a.id}')"/>
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-secondary" onclick="document.getElementById('areaImageInput').click()">🖼 ${a.background_image_url ? 'Replace' : 'Upload'} Image</button>
+        ${a.background_image_url ? `<button class="modal-btn modal-btn-secondary" onclick="removeFloorplanImage('${a.id}')">Remove Image</button>` : ''}
+      </div>
+    </div>` : ''}
+    <div class="modal-actions">
+      ${a ? `<button class="modal-btn modal-btn-danger" onclick="deleteArea('${a.id}')">Delete Area</button>` : ''}
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="saveArea(${a?`'${a.id}'`:'null'})">Save</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+
+window.saveArea = async function(id){
+  const name = document.getElementById('areaName').value.trim();
+  if (!name){ alert('Enter an area name.'); return; }
+  if (id){
+    await sb.from('floor_areas').update({ name }).eq('id', id);
+  } else {
+    const { data, error } = await sb.from('floor_areas').insert({ name, sort_order: state.areas.length }).select().single();
+    if (error){ alert('Error: '+error.message); return; }
+    state.currentAreaId = data.id;
+  }
+  closeModal('formModal');
+  await reloadAreas();
+  render();
+};
+
+window.deleteArea = async function(id){
+  if (!confirm('Delete this area? Its tables will move to "Unassigned" (not deleted).')) return;
+  await sb.from('floor_areas').delete().eq('id', id);
+  closeModal('formModal');
+  await Promise.all([reloadAreas(), reloadTables()]);
+  render();
+};
+
+window.uploadFloorPlanImage = async function(ev, areaId){
+  const file = ev.target.files[0];
+  if (!file) return;
+  const ext = file.name.split('.').pop();
+  const path = `area-${areaId}-${Date.now()}.${ext}`;
+  const { error } = await sb.storage.from('floorplans').upload(path, file, { upsert: true });
+  if (error){ alert('Upload failed: '+error.message); return; }
+  const { data } = sb.storage.from('floorplans').getPublicUrl(path);
+  await sb.from('floor_areas').update({ background_image_url: data.publicUrl }).eq('id', areaId);
+  closeModal('formModal');
+  await reloadAreas();
+  render();
+};
+
+window.removeFloorplanImage = async function(areaId){
+  await sb.from('floor_areas').update({ background_image_url: null }).eq('id', areaId);
+  closeModal('formModal');
+  await reloadAreas();
+  render();
+};
+
+// ---- Tables on the canvas: add / edit / resize / rename / delete ----
+window.addTableToCanvas = async function(){
+  const area = currentArea();
+  if (!area){ alert('Create an area first.'); return; }
+  const n = state.tables.filter(t => t.area_id === area.id).length + 1;
+  const { data, error } = await sb.from('dining_tables').insert({
+    label: 'Table '+n, area_id: area.id, section: area.name,
+    min_party: 1, max_party: 4, seats: 4, shape: 'square',
+    pos_x: 40, pos_y: 40, width: 80, height: 80, status: 'available',
+  }).select().single();
+  if (error){ alert('Error: '+error.message); return; }
+  state.tables.push(data);
+  render();
+};
+
+window.openCanvasTableModal = function(id){
+  const t = tableById(id);
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Edit Table</h3>
+    <label class="field-label">Table name</label>
+    <input type="text" class="modal-input" id="ctName" value="${esc(t.label)}"/>
+    <div class="formgrid">
+      <div><label class="field-label">Area</label>
+        <select class="modal-select" id="ctArea">
+          ${state.areas.map(a => `<option value="${a.id}" ${a.id===t.area_id?'selected':''}>${esc(a.name)}</option>`).join('')}
+        </select>
+      </div>
+      <div><label class="field-label">Shape</label>
+        <select class="modal-select" id="ctShape">
+          ${['square','round','rect'].map(s => `<option value="${s}" ${s===t.shape?'selected':''}>${s}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div class="formgrid">
+      <div><label class="field-label">Seats</label><input type="number" min="1" class="modal-input" id="ctSeats" value="${t.seats}"/></div>
+      <div><label class="field-label">Status</label>
+        <select class="modal-select" id="ctStatus">
+          ${['available','reserved','seated','dirty','blocked'].map(s => `<option value="${s}" ${s===t.status?'selected':''}>${s}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div class="formgrid">
+      <div><label class="field-label">Min party</label><input type="number" min="1" class="modal-input" id="ctMin" value="${t.min_party}"/></div>
+      <div><label class="field-label">Max party</label><input type="number" min="1" class="modal-input" id="ctMax" value="${t.max_party}"/></div>
+    </div>
+    <div class="formgrid">
+      <div><label class="field-label">Width (px)</label><input type="number" min="40" class="modal-input" id="ctWidth" value="${t.width}"/></div>
+      <div><label class="field-label">Height (px)</label><input type="number" min="40" class="modal-input" id="ctHeight" value="${t.height}"/></div>
+    </div>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-danger" onclick="deleteCanvasTable('${t.id}')">Delete Table</button>
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="saveCanvasTable('${t.id}')">Save</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+
+window.saveCanvasTable = async function(id){
+  const areaId = document.getElementById('ctArea').value || null;
+  const area = state.areas.find(a => a.id === areaId);
+  const payload = {
+    label: document.getElementById('ctName').value.trim() || 'Table',
+    area_id: areaId,
+    section: area ? area.name : null,
+    shape: document.getElementById('ctShape').value,
+    seats: Number(document.getElementById('ctSeats').value)||1,
+    status: document.getElementById('ctStatus').value,
+    min_party: Number(document.getElementById('ctMin').value)||1,
+    max_party: Number(document.getElementById('ctMax').value)||1,
+    width: Number(document.getElementById('ctWidth').value)||80,
+    height: Number(document.getElementById('ctHeight').value)||80,
+  };
+  const { error } = await sb.from('dining_tables').update(payload).eq('id', id);
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await reloadTables();
+  render();
+};
+
+window.deleteCanvasTable = async function(id){
+  if (!confirm('Delete this table? This cannot be undone.')) return;
+  await sb.from('dining_tables').delete().eq('id', id);
+  closeModal('formModal');
   await reloadTables();
   render();
 };
@@ -736,19 +967,17 @@ function renderSettingsTab(){
   return `
   <div class="panel-header"><h2 class="panel-title">Settings</h2></div>
 
-  <div class="section-heading">Dining Tables</div>
+  <div class="section-heading">Dining Tables &amp; Floor Plan</div>
   <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">${state.tables.length} tables across ${state.areas.length} area${state.areas.length===1?'':'s'}. Add, rename, resize, delete, and drag-position tables on your floor plan sketch from the <b>Floor Plan</b> tab.</div>
     <table class="data-table">
-      <thead><tr><th>Label</th><th>Section</th><th>Seats</th><th>Status</th><th></th></tr></thead>
+      <thead><tr><th>Area</th><th>Table Count</th></tr></thead>
       <tbody>
-        ${state.tables.map(t => `<tr>
-          <td>${esc(t.label)}</td><td>${esc(t.section)}</td><td>${t.min_party}-${t.max_party}</td>
-          <td><span class="badge badge-confirmed">${t.status}</span></td>
-          <td><button class="btn btn-sm btn-secondary" onclick="openTableModal('${t.id}')">Edit</button></td>
-        </tr>`).join('')}
+        ${state.areas.map(a => `<tr><td>${esc(a.name)}</td><td>${state.tables.filter(t=>t.area_id===a.id).length}</td></tr>`).join('')}
+        ${state.tables.some(t=>!t.area_id) ? `<tr><td>Unassigned</td><td>${state.tables.filter(t=>!t.area_id).length}</td></tr>` : ''}
       </tbody>
     </table>
-    <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openTableModal()">+ Add Table</button></div>
+    <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="setTab('floorplan')">🗺️ Open Floor Plan Editor</button></div>
   </div>
 
   <div class="section-heading">Service Periods</div>
@@ -785,52 +1014,6 @@ function renderSettingsTab(){
     </table>
   </div>` : ''}`;
 }
-
-window.openTableModal = function(id){
-  const t = id ? tableById(id) : null;
-  const box = document.getElementById('formModalBox');
-  box.innerHTML = `
-    <h3>${t ? 'Edit' : 'New'} Table</h3>
-    <div class="formgrid">
-      <div><label class="field-label">Label</label><input type="text" class="modal-input" id="tLabel" value="${esc(t?.label||'')}"/></div>
-      <div><label class="field-label">Section</label><input type="text" class="modal-input" id="tSection" value="${esc(t?.section||'Main')}"/></div>
-    </div>
-    <div class="formgrid">
-      <div><label class="field-label">Min party</label><input type="number" min="1" class="modal-input" id="tMin" value="${t?.min_party||1}"/></div>
-      <div><label class="field-label">Max party</label><input type="number" min="1" class="modal-input" id="tMax" value="${t?.max_party||4}"/></div>
-    </div>
-    <label class="field-label">Seats</label>
-    <input type="number" min="1" class="modal-input" id="tSeats" value="${t?.seats||4}"/>
-    <div class="modal-actions">
-      ${t ? `<button class="modal-btn modal-btn-danger" onclick="deleteTable('${t.id}')">Delete</button>` : ''}
-      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
-      <button class="modal-btn modal-btn-primary" onclick="saveTable(${t?`'${t.id}'`:'null'})">Save</button>
-    </div>`;
-  document.getElementById('formModal').classList.remove('hidden');
-};
-
-window.saveTable = async function(id){
-  const payload = {
-    label: document.getElementById('tLabel').value.trim(),
-    section: document.getElementById('tSection').value.trim() || 'Main',
-    min_party: Number(document.getElementById('tMin').value)||1,
-    max_party: Number(document.getElementById('tMax').value)||4,
-    seats: Number(document.getElementById('tSeats').value)||4,
-  };
-  const { error } = id ? await sb.from('dining_tables').update(payload).eq('id', id) : await sb.from('dining_tables').insert(payload);
-  if (error){ alert('Error: '+error.message); return; }
-  closeModal('formModal');
-  await reloadTables();
-  render();
-};
-
-window.deleteTable = async function(id){
-  if (!confirm('Delete this table?')) return;
-  await sb.from('dining_tables').delete().eq('id', id);
-  closeModal('formModal');
-  await reloadTables();
-  render();
-};
 
 window.openServicePeriodModal = function(){
   const box = document.getElementById('formModalBox');
