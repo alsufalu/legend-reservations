@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.05';
+const APP_VERSION = '1.08';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -24,12 +24,15 @@ let _authMode = 'signin';
 
 let state = {
   tab: 'reservations',
+  resView: 'list',
   selectedDate: todayISO(),
   reservations: [],
   tables: [],
   areas: [],
   currentAreaId: '__all',
   editMode: false,
+  serverView: false,
+  serverSections: [],
   floorPlan: { background_image_url: null, canvas_width: 1200, canvas_height: 800 },
   guests: [],
   waitlist: [],
@@ -58,6 +61,42 @@ function fmtDateHuman(iso){
 function minutesAgo(iso){
   if(!iso) return 0;
   return Math.max(0, Math.round((Date.now() - new Date(iso).getTime())/60000));
+}
+
+// ============================================================================
+// AVAILABILITY — capacity + time-overlap checking (soft vs hard table assignment)
+// ============================================================================
+function timeToMinutes(t){
+  if (!t) return 0;
+  const [h,m] = t.split(':').map(Number);
+  return h*60 + m;
+}
+function rangesOverlap(startA, endA, startB, endB){
+  return startA < endB && startB < endA;
+}
+// Active reservations already holding a specific table on a given date (DB is the
+// ultimate source of truth via an exclusion constraint — this is for live UI feedback).
+async function fetchDateReservations(dateStr, excludeId){
+  let q = sb.from('reservations')
+    .select('id,table_id,reservation_time,duration_minutes,party_size')
+    .eq('reservation_date', dateStr)
+    .not('table_id', 'is', null)
+    .in('status', ['pending','confirmed','seated']);
+  if (excludeId) q = q.neq('id', excludeId);
+  const { data, error } = await q;
+  return error ? [] : (data || []);
+}
+function tablesFittingParty(partySize){
+  return state.tables.filter(t => t.active && partySize >= t.min_party && partySize <= t.max_party);
+}
+function isTableBusy(tableId, timeStr, durationMinutes, dateReservations){
+  const start = timeToMinutes(timeStr), end = start + (Number(durationMinutes)||90);
+  return dateReservations.some(r => {
+    if (r.table_id !== tableId) return false;
+    const rStart = timeToMinutes(r.reservation_time);
+    const rEnd = rStart + (r.duration_minutes||90);
+    return rangesOverlap(start, end, rStart, rEnd);
+  });
 }
 function guestName(g){
   if(!g) return 'Walk-in';
@@ -183,10 +222,11 @@ async function loadAll(){
   const statusEl = document.getElementById('syncStatus');
   setStatus(statusEl, '☁ Syncing…', '');
   try {
-    const [tablesRes, areasRes, fpRes, guestsRes, waitlistRes, staffRes, spRes, resRes] = await Promise.all([
+    const [tablesRes, areasRes, fpRes, ssRes, guestsRes, waitlistRes, staffRes, spRes, resRes] = await Promise.all([
       sb.from('dining_tables').select('*').order('label'),
       sb.from('floor_areas').select('*').order('sort_order').order('created_at'),
       sb.from('floor_plan_settings').select('*').eq('id', true).maybeSingle(),
+      sb.from('server_sections').select('*').order('sort_order').order('created_at'),
       sb.from('guests').select('*').order('last_name'),
       sb.from('waitlist').select('*').eq('status','waiting').order('added_at'),
       sb.from('staff').select('*').order('created_at'),
@@ -196,6 +236,7 @@ async function loadAll(){
     state.tables = tablesRes.data || [];
     state.areas = areasRes.data || [];
     if (fpRes.data) state.floorPlan = fpRes.data;
+    state.serverSections = ssRes.data || [];
     state.guests = guestsRes.data || [];
     state.waitlist = waitlistRes.data || [];
     state.staffList = staffRes.data || [];
@@ -229,7 +270,7 @@ window.setTab = function(tab){
 function render(){
   const c = document.getElementById('content');
   if (state.tab === 'reservations') c.innerHTML = renderReservationsTab();
-  else if (state.tab === 'floorplan') c.innerHTML = renderFloorPlanTab();
+  else if (state.tab === 'floorplan') { c.innerHTML = renderFloorPlanTab(); fitFloorCanvasView(); }
   else if (state.tab === 'waitlist') c.innerHTML = renderWaitlistTab();
   else if (state.tab === 'guests') c.innerHTML = renderGuestsTab();
   else if (state.tab === 'dashboard') { c.innerHTML = renderDashboardTab(); loadDashboard(); }
@@ -243,6 +284,25 @@ function renderReservationsTab(){
   const list = state.reservations.slice().sort((a,b) => a.reservation_time.localeCompare(b.reservation_time));
   const activeCount = list.filter(r => !['cancelled','no_show'].includes(r.status)).length;
   const covers = list.filter(r => ['confirmed','pending','seated','completed'].includes(r.status)).reduce((s,r) => s+r.party_size, 0);
+
+  const header = `
+  <div class="panel-header">
+    <div>
+      <h2 class="panel-title">Reservations</h2>
+      <div class="panel-sub">${activeCount} reservations · ${covers} covers booked</div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <div class="view-toggle">
+        <button class="view-toggle-btn ${state.resView!=='timeline'?'active':''}" onclick="setResView('list')">📋 List</button>
+        <button class="view-toggle-btn ${state.resView==='timeline'?'active':''}" onclick="setResView('timeline')">🕐 Timeline</button>
+      </div>
+      <input type="date" class="search-input" style="margin:0;width:auto" value="${state.selectedDate}" onchange="changeDate(this.value)"/>
+      <button class="btn btn-secondary" onclick="changeDate(todayISO())">Today</button>
+      <button class="btn btn-primary" onclick="openReservationModal()">+ New Reservation</button>
+    </div>
+  </div>`;
+
+  if (state.resView === 'timeline') return header + renderReservationsTimeline(list);
 
   const items = list.length ? list.map(r => {
     const g = guestById(r.guest_id);
@@ -266,19 +326,79 @@ function renderReservationsTab(){
     </div>`;
   }).join('') : `<div class="empty-state"><div class="empty-state-icon">📖</div>No reservations for this date yet.</div>`;
 
+  return header + `<div class="res-list">${items}</div>`;
+}
+
+window.setResView = function(v){ state.resView = v; render(); };
+
+// ---- Timeline: tables as rows, time-of-day across the top, gap/conflict aware ----
+function renderReservationsTimeline(list){
+  const PX_PER_MIN = 2.2;
+  const starts = state.servicePeriods.map(sp => timeToMinutes(sp.start_time));
+  const ends = state.servicePeriods.map(sp => timeToMinutes(sp.end_time));
+  const rangeStart = Math.max(0, (starts.length ? Math.min(...starts) : 10*60) - 30);
+  const rangeEnd = Math.min(24*60, (ends.length ? Math.max(...ends) : 23*60) + 30);
+  const totalW = (rangeEnd - rangeStart) * PX_PER_MIN;
+  const x = min => (min - rangeStart) * PX_PER_MIN;
+
+  const hourMarks = [];
+  for (let m = Math.ceil(rangeStart/60)*60; m <= rangeEnd; m += 60) hourMarks.push(m);
+
+  const tables = state.tables.filter(t => t.active).slice().sort((a,b) => (a.section||'').localeCompare(b.section||'') || a.label.localeCompare(b.label));
+  const unassigned = list.filter(r => !r.table_id && !['cancelled'].includes(r.status));
+
+  const nowMin = (() => {
+    const now = new Date();
+    const todayStr = now.toISOString().slice(0,10);
+    if (state.selectedDate !== todayStr) return null;
+    return now.getHours()*60 + now.getMinutes();
+  })();
+  function rowFor(label, sub, resForRow){
+    const sorted = resForRow.slice().sort((a,b) => a.reservation_time.localeCompare(b.reservation_time));
+    const bars = sorted.map(r => {
+      const start = timeToMinutes(r.reservation_time);
+      const dur = r.duration_minutes || 90;
+      const g = guestById(r.guest_id);
+      return `<div class="timeline-bar status-${r.status}" style="left:${x(start)}px;width:${Math.max(30,dur*PX_PER_MIN)}px" onclick="openReservationModal('${r.id}')" title="${esc(guestName(g))} · ${r.party_size}p · ${fmtTime(r.reservation_time)}">${esc(guestName(g))} · ${r.party_size}p</div>`;
+    }).join('');
+    const gaps = [];
+    for (let i=0;i<sorted.length-1;i++){
+      const aEnd = timeToMinutes(sorted[i].reservation_time) + (sorted[i].duration_minutes||90);
+      const bStart = timeToMinutes(sorted[i+1].reservation_time);
+      if (bStart - aEnd >= 0 && bStart - aEnd < 20){
+        gaps.push(`<div class="timeline-tight-gap" style="left:${x(aEnd)}px" title="Only ${bStart-aEnd} min to turn this table"></div>`);
+      }
+    }
+    return `
+    <div class="timeline-row">
+      <div class="timeline-row-label">${esc(label)}${sub?`<span class="timeline-row-sub">${esc(sub)}</span>`:''}</div>
+      <div class="timeline-row-track" style="width:${totalW}px">${bars}${gaps.join('')}</div>
+    </div>`;
+  }
+
+  const rows = tables.map(t => rowFor(t.label, `${t.section||''} · ${t.seats} seats`, list.filter(r => r.table_id === t.id && r.status!=='cancelled'))).join('')
+    + (unassigned.length ? rowFor('Unassigned', `${unassigned.length} to seat`, unassigned) : '');
+
+  const headerCells = hourMarks.map(m => `<div class="timeline-hour" style="width:${60*PX_PER_MIN}px">${fmtTime(String(Math.floor(m/60)).padStart(2,'0')+':00')}</div>`).join('');
+
+  // "Now" line spans the full height of the grid — placed once on the shared
+  // relatively-positioned wrapper so it isn't clipped to a single row.
+  const LABEL_COL_W = 130;
+  const nowLine = nowMin!=null && nowMin>=rangeStart && nowMin<=rangeEnd
+    ? `<div class="timeline-now-line" style="left:${LABEL_COL_W + x(nowMin)}px" title="Now"></div>` : '';
+
   return `
-  <div class="panel-header">
-    <div>
-      <h2 class="panel-title">Reservations</h2>
-      <div class="panel-sub">${activeCount} reservations · ${covers} covers booked</div>
-    </div>
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-      <input type="date" class="search-input" style="margin:0;width:auto" value="${state.selectedDate}" onchange="changeDate(this.value)"/>
-      <button class="btn btn-secondary" onclick="changeDate(todayISO())">Today</button>
-      <button class="btn btn-primary" onclick="openReservationModal()">+ New Reservation</button>
+  <div class="timeline-wrap">
+    <div style="position:relative">
+      <div class="timeline-header">
+        <div class="timeline-corner"></div>
+        <div>${headerCells}</div>
+      </div>
+      ${rows || '<div class="empty-state">No active tables to show.</div>'}
+      ${nowLine}
     </div>
   </div>
-  <div class="res-list">${items}</div>`;
+  <div class="panel-sub" style="margin-top:8px">🟠 Dashed marker = less than 20 min to turn a table between reservations. Tap any bar to edit.</div>`;
 }
 
 function resActionButtons(r){
@@ -311,7 +431,9 @@ window.updateReservationStatus = async function(id, status){
 
 window.openSeatModal = function(id){
   const r = state.reservations.find(x => x.id === id);
-  const available = state.tables.filter(t => t.active && ['available','reserved'].includes(t.status));
+  const physicallyFree = state.tables.filter(t => t.active && ['available','reserved'].includes(t.status));
+  const fits = physicallyFree.filter(t => r.party_size >= t.min_party && r.party_size <= t.max_party);
+  const tooSmallOrBig = physicallyFree.filter(t => !(r.party_size >= t.min_party && r.party_size <= t.max_party));
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
     <h3>Seat Reservation</h3>
@@ -319,8 +441,10 @@ window.openSeatModal = function(id){
     <label class="field-label">Assign Table</label>
     <select class="modal-select" id="seatTableSelect">
       <option value="">No table / seat at bar</option>
-      ${available.map(t => `<option value="${t.id}" ${t.id===r.table_id?'selected':''}>${esc(t.label)} (${t.section}, seats ${t.seats})</option>`).join('')}
+      ${fits.map(t => `<option value="${t.id}" ${t.id===r.table_id?'selected':''}>✅ ${esc(t.label)} (${t.section}, seats ${t.seats})</option>`).join('')}
+      ${tooSmallOrBig.map(t => `<option value="${t.id}" ${t.id===r.table_id?'selected':''}>⚠️ ${esc(t.label)} — seats ${t.min_party}-${t.max_party}, party is ${r.party_size}</option>`).join('')}
     </select>
+    ${!fits.length ? `<div class="panel-sub" style="color:var(--warn)">No free table is sized right for ${r.party_size} guests — you can still pick one above, or seat with no table assigned.</div>` : ''}
     <div class="modal-actions">
       <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
       <button class="modal-btn modal-btn-primary" onclick="confirmSeat('${id}')">Seat Now</button>
@@ -330,7 +454,12 @@ window.openSeatModal = function(id){
 
 window.confirmSeat = async function(id){
   const tableId = document.getElementById('seatTableSelect').value || null;
-  await sb.from('reservations').update({ status:'seated', seated_at: new Date().toISOString(), table_id: tableId }).eq('id', id);
+  const { error } = await sb.from('reservations').update({ status:'seated', seated_at: new Date().toISOString(), table_id: tableId }).eq('id', id);
+  if (error){
+    if (error.code === '23P01') alert('That table was just taken for an overlapping reservation — pick a different table.');
+    else alert('Error: '+error.message);
+    return;
+  }
   if (tableId) await sb.from('dining_tables').update({ status:'seated' }).eq('id', tableId);
   closeModal('formModal');
   await Promise.all([reloadReservationsForDate(), reloadTables()]);
@@ -347,6 +476,7 @@ window.openReservationModal = function(id){
     <input type="text" class="modal-input" id="resGuestName" placeholder="Search or add new guest" value="${esc(g ? guestName(g) : '')}" oninput="filterGuestSuggestions(this.value)" autocomplete="off"/>
     <div id="guestSuggestions"></div>
     <input type="hidden" id="resGuestId" value="${r?.guest_id || ''}"/>
+    <input type="hidden" id="resId" value="${r?.id || ''}"/>
     <div class="formgrid">
       <div>
         <label class="field-label">Phone</label>
@@ -354,26 +484,23 @@ window.openReservationModal = function(id){
       </div>
       <div>
         <label class="field-label">Party size</label>
-        <input type="number" min="1" class="modal-input" id="resPartySize" value="${r?.party_size || 2}"/>
+        <input type="number" min="1" class="modal-input" id="resPartySize" value="${r?.party_size || 2}" oninput="refreshAvailability()"/>
       </div>
     </div>
     <div class="formgrid">
       <div>
         <label class="field-label">Date</label>
-        <input type="date" class="modal-input" id="resDate" value="${r?.reservation_date || state.selectedDate}"/>
+        <input type="date" class="modal-input" id="resDate" value="${r?.reservation_date || state.selectedDate}" onchange="refreshAvailability()"/>
       </div>
       <div>
         <label class="field-label">Time</label>
-        <input type="time" class="modal-input" id="resTime" value="${r?.reservation_time?.slice(0,5) || '18:00'}"/>
+        <input type="time" class="modal-input" id="resTime" value="${r?.reservation_time?.slice(0,5) || '18:00'}" onchange="refreshAvailability()"/>
       </div>
     </div>
     <div class="formgrid">
       <div>
-        <label class="field-label">Table (optional)</label>
-        <select class="modal-select" id="resTable">
-          <option value="">Unassigned</option>
-          ${state.tables.filter(t=>t.active).map(t => `<option value="${t.id}" ${t.id===r?.table_id?'selected':''}>${esc(t.label)} (${t.section})</option>`).join('')}
-        </select>
+        <label class="field-label">Duration (minutes)</label>
+        <input type="number" min="15" step="15" class="modal-input" id="resDuration" value="${r?.duration_minutes || 90}" onchange="refreshAvailability()"/>
       </div>
       <div>
         <label class="field-label">Source</label>
@@ -382,6 +509,11 @@ window.openReservationModal = function(id){
         </select>
       </div>
     </div>
+    <label class="field-label">Table</label>
+    <select class="modal-select" id="resTable" onchange="refreshAvailability()">
+      <option value="">Unassigned — assign a table at seating (recommended)</option>
+    </select>
+    <div id="availabilityNote" class="panel-sub" style="margin:-4px 0 10px"></div>
     <label class="field-label">Occasion (optional)</label>
     <input type="text" class="modal-input" id="resOccasion" placeholder="Birthday, anniversary…" value="${esc(r?.occasion || '')}"/>
     <label class="field-label">Special requests / allergies</label>
@@ -392,6 +524,51 @@ window.openReservationModal = function(id){
       <button class="modal-btn modal-btn-primary" onclick="saveReservation(${r ? `'${r.id}'` : 'null'})">Save</button>
     </div>`;
   document.getElementById('formModal').classList.remove('hidden');
+  refreshAvailability(r?.table_id || '');
+};
+
+window.waitlistFromReservationModal = function(){
+  const name = document.getElementById('resGuestName')?.value.trim() || '';
+  const phone = document.getElementById('resGuestPhone')?.value.trim() || '';
+  const party = Number(document.getElementById('resPartySize')?.value) || 2;
+  openWaitlistModal({ name, phone, party });
+};
+
+// Rebuilds the Table dropdown + status note based on current party size / date /
+// time / duration, showing which tables actually fit and are free at that time.
+window.refreshAvailability = async function(preserveSelection){
+  const sel = document.getElementById('resTable');
+  const noteEl = document.getElementById('availabilityNote');
+  if (!sel) return;
+  const partySize = Number(document.getElementById('resPartySize').value) || 1;
+  const date = document.getElementById('resDate').value;
+  const time = document.getElementById('resTime').value;
+  const duration = Number(document.getElementById('resDuration').value) || 90;
+  const currentVal = preserveSelection !== undefined ? preserveSelection : sel.value;
+  const excludeId = document.getElementById('resId')?.value || null;
+
+  const fitting = tablesFittingParty(partySize);
+  const dateReservations = date ? await fetchDateReservations(date, excludeId) : [];
+  const freeFitting = fitting.filter(t => !isTableBusy(t.id, time, duration, dateReservations));
+  const busyFitting = fitting.filter(t => isTableBusy(t.id, time, duration, dateReservations));
+
+  sel.innerHTML = `<option value="">Unassigned — assign a table at seating (recommended)</option>`
+    + freeFitting.map(t => `<option value="${t.id}">✅ ${esc(t.label)} (${t.section||''}, seats ${t.seats})</option>`).join('')
+    + busyFitting.map(t => `<option value="${t.id}">⛔ ${esc(t.label)} — booked at that time</option>`).join('');
+  if ([...sel.options].some(o => o.value === currentVal)) sel.value = currentVal;
+
+  if (noteEl){
+    if (!fitting.length){
+      noteEl.style.color = 'var(--danger)';
+      noteEl.textContent = `No tables in the house fit a party of ${partySize}.`;
+    } else if (!freeFitting.length){
+      noteEl.style.color = 'var(--warn)';
+      noteEl.innerHTML = `⚠️ Fully booked for a party of ${partySize} at that time. <span class="linkBtn" style="cursor:pointer" onclick="waitlistFromReservationModal()">Add to Waitlist instead</span>`;
+    } else {
+      noteEl.style.color = 'var(--success)';
+      noteEl.textContent = `${freeFitting.length} table${freeFitting.length===1?'':'s'} available for this party size at this time.`;
+    }
+  }
 };
 
 window.filterGuestSuggestions = function(q){
@@ -426,12 +603,30 @@ window.saveReservation = async function(id){
     await sb.from('guests').update({ phone }).eq('id', guestId);
   }
 
+  const tableId = document.getElementById('resTable').value || null;
+  const partySize = Number(document.getElementById('resPartySize').value) || 1;
+  const date = document.getElementById('resDate').value;
+  const time = document.getElementById('resTime').value;
+  const duration = Number(document.getElementById('resDuration').value) || 90;
+
+  // Hard-assignment defense in depth: re-check the chosen table right before saving
+  // (the DB exclusion constraint is the ultimate backstop for race conditions).
+  if (tableId){
+    const dateReservations = await fetchDateReservations(date, id);
+    if (isTableBusy(tableId, time, duration, dateReservations)){
+      alert('That table just got booked for an overlapping time — pick a different table or leave it Unassigned.');
+      refreshAvailability(tableId);
+      return;
+    }
+  }
+
   const payload = {
     guest_id: guestId,
-    party_size: Number(document.getElementById('resPartySize').value) || 1,
-    reservation_date: document.getElementById('resDate').value,
-    reservation_time: document.getElementById('resTime').value,
-    table_id: document.getElementById('resTable').value || null,
+    party_size: partySize,
+    reservation_date: date,
+    reservation_time: time,
+    duration_minutes: duration,
+    table_id: tableId,
     source: document.getElementById('resSource').value,
     occasion: document.getElementById('resOccasion').value.trim() || null,
     special_requests: document.getElementById('resNotes').value.trim() || null,
@@ -441,7 +636,11 @@ window.saveReservation = async function(id){
   const { error } = id
     ? await sb.from('reservations').update(payload).eq('id', id)
     : await sb.from('reservations').insert(payload);
-  if (error){ alert('Error: '+error.message); return; }
+  if (error){
+    if (error.code === '23P01') alert('That table just got booked for an overlapping time — pick a different table or leave it Unassigned.');
+    else alert('Error: '+error.message);
+    return;
+  }
   closeModal('formModal');
   await reloadReservationsForDate();
   render();
@@ -471,6 +670,10 @@ async function reloadFloorPlanSettings(){
   const { data } = await sb.from('floor_plan_settings').select('*').eq('id', true).maybeSingle();
   if (data) state.floorPlan = data;
 }
+async function reloadServerSections(){
+  const { data } = await sb.from('server_sections').select('*').order('sort_order').order('created_at');
+  state.serverSections = data || [];
+}
 function currentArea(){ return state.areas.find(a => a.id === state.currentAreaId); }
 
 function renderFloorPlanTab(){
@@ -498,13 +701,16 @@ function renderFloorPlanTab(){
     const occ = activeRes.find(r => r.table_id === t.id);
     const dragAttr = state.editMode ? `onpointerdown="startDragTable(event,'${t.id}')"` : `onclick="cycleTableStatus('${t.id}')"`;
     const areaName = state.areas.find(a => a.id === t.area_id)?.name;
+    const section = state.serverSections.find(s => s.id === t.server_section_id);
+    const server = section ? state.staffList.find(s => s.id === section.assigned_staff_id) : null;
+    const colorStyle = state.serverView && section ? `border-color:${section.color};background:${section.color}22;` : (state.serverView ? 'opacity:.45;' : '');
     return `
-      <div id="tbl-${t.id}" class="floor-table shape-${t.shape} status-${t.status}" ${dragAttr}
-           style="left:${t.pos_x}px;top:${t.pos_y}px;width:${t.width}px;height:${t.height}px;">
+      <div id="tbl-${t.id}" class="floor-table shape-${t.shape} ${state.serverView ? '' : 'status-'+t.status}" ${dragAttr}
+           style="left:${t.pos_x}px;top:${t.pos_y}px;width:${t.width}px;height:${t.height}px;${colorStyle}">
         <div class="ft-name">${esc(t.label)}</div>
-        <div class="ft-meta">${t.seats} seats</div>
-        ${showingAll && areaName ? `<div class="ft-meta">${esc(areaName)}</div>` : ''}
-        ${occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>` : ''}
+        ${state.serverView
+          ? `<div class="ft-meta">${section ? esc(section.name) : 'No section'}</div>${server ? `<div class="ft-meta">${esc(server.name)}</div>` : ''}`
+          : `<div class="ft-meta">${t.seats} seats</div>${showingAll && areaName ? `<div class="ft-meta">${esc(areaName)}</div>` : ''}${occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>` : ''}`}
         ${state.editMode ? `<div class="resize-handle" onpointerdown="startResizeTable(event,'${t.id}')" title="Drag to resize"></div>` : ''}
       </div>`;
   }).join('');
@@ -513,6 +719,7 @@ function renderFloorPlanTab(){
     <button class="btn btn-secondary btn-sm" onclick="openBackgroundModal()">🖼 Floor Plan Image</button>
     ${area ? `<button class="btn btn-secondary btn-sm" onclick="openAreaModal('${area.id}')">✏️ Rename Area</button>` : ''}
     ${state.editMode ? `<button class="btn btn-primary btn-sm" onclick="addTableToCanvas()">+ Add Table</button>` : ''}
+    <button class="btn ${state.serverView?'btn-success':'btn-secondary'} btn-sm" onclick="toggleServerView()">🎨 Server View</button>
     <button class="btn ${state.editMode?'btn-success':'btn-secondary'} btn-sm" onclick="toggleEditMode()">${state.editMode ? '✅ Done Editing' : '✏️ Edit Layout'}</button>
   `;
 
@@ -523,15 +730,53 @@ function renderFloorPlanTab(){
   </div>
   <div class="area-tabs" style="margin-bottom:14px">${areaTabs}</div>
   ${state.editMode ? `<div class="edit-mode-banner">✏️ Edit Layout is on — drag tables anywhere on the canvas. Changes save automatically.</div>` : ''}
-  <div class="floor-canvas-wrap">
+  <div class="floor-canvas-wrap" id="floorCanvasWrap">
     <div id="floorCanvas" class="floor-canvas" style="width:${canvasW}px;height:${canvasH}px;${bgStyle}">
       ${tableEls || '<div class="empty-state" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">No tables here yet. Click "Edit Layout" then "+ Add Table".</div>'}
     </div>
-  </div>`;
+  </div>
+  ${!showingAll ? `<div class="panel-sub" style="margin-top:8px">🔍 Zoomed to ${area?esc(area.name):'Unassigned'}. <span class="linkBtn" style="cursor:pointer" onclick="switchArea('__all')">View full floor plan</span></div>` : ''}`;
 }
 
 window.switchArea = function(id){ state.editMode = false; state.currentAreaId = id; render(); };
 window.toggleEditMode = function(){ state.editMode = !state.editMode; render(); };
+window.toggleServerView = function(){ state.serverView = !state.serverView; render(); };
+
+// Zoom/pan the canvas to fit the bounding box of whichever area's tables are
+// currently in view, so filtering by area frames just that part of the sketch.
+function fitFloorCanvasView(){
+  const wrap = document.getElementById('floorCanvasWrap');
+  const canvas = document.getElementById('floorCanvas');
+  if (!wrap || !canvas) return;
+
+  const tables = state.currentAreaId === '__all' ? null
+    : state.currentAreaId === '__unassigned' ? state.tables.filter(t => !t.area_id)
+    : state.tables.filter(t => t.area_id === state.currentAreaId);
+
+  if (!tables || !tables.length){
+    canvas.style.transform = 'none';
+    canvas.dataset.scale = '1';
+    wrap.scrollLeft = 0; wrap.scrollTop = 0;
+    return;
+  }
+
+  const PAD = 90;
+  const minX = Math.max(0, Math.min(...tables.map(t => t.pos_x)) - PAD);
+  const minY = Math.max(0, Math.min(...tables.map(t => t.pos_y)) - PAD);
+  const maxX = Math.max(...tables.map(t => t.pos_x + t.width)) + PAD;
+  const maxY = Math.max(...tables.map(t => t.pos_y + t.height)) + PAD;
+  const boxW = Math.max(1, maxX - minX), boxH = Math.max(1, maxY - minY);
+
+  const scale = Math.max(0.3, Math.min(4, Math.min(wrap.clientWidth / boxW, wrap.clientHeight / boxH)));
+  canvas.style.transformOrigin = '0 0';
+  canvas.style.transform = `scale(${scale})`;
+  canvas.dataset.scale = String(scale);
+  wrap.scrollLeft = minX * scale;
+  wrap.scrollTop = minY * scale;
+}
+function getCanvasScale(){
+  return Number(document.getElementById('floorCanvas')?.dataset.scale) || 1;
+}
 
 window.cycleTableStatus = async function(id){
   const t = tableById(id);
@@ -552,10 +797,11 @@ window.startDragTable = function(ev, id){
   const origLeft = parseFloat(el.style.left) || 0;
   const origTop = parseFloat(el.style.top) || 0;
   let moved = false;
+  const scale = getCanvasScale();
   try { el.setPointerCapture(ev.pointerId); } catch(e){}
 
   function onMove(e){
-    const dx = e.clientX - startX, dy = e.clientY - startY;
+    const dx = (e.clientX - startX) / scale, dy = (e.clientY - startY) / scale;
     if (Math.abs(dx) > 4 || Math.abs(dy) > 4) moved = true;
     el.style.left = Math.max(0, origLeft + dx) + 'px';
     el.style.top = Math.max(0, origTop + dy) + 'px';
@@ -588,10 +834,11 @@ window.startResizeTable = function(ev, id){
   const origW = parseFloat(el.style.width) || 80;
   const origH = parseFloat(el.style.height) || 80;
   const MIN_SIZE = 40;
+  const scale = getCanvasScale();
   try { handle.setPointerCapture(ev.pointerId); } catch(e){}
 
   function onMove(e){
-    const dx = e.clientX - startX, dy = e.clientY - startY;
+    const dx = (e.clientX - startX) / scale, dy = (e.clientY - startY) / scale;
     el.style.width = Math.max(MIN_SIZE, origW + dx) + 'px';
     el.style.height = Math.max(MIN_SIZE, origH + dy) + 'px';
   }
@@ -752,6 +999,11 @@ window.openCanvasTableModal = function(id){
       <div><label class="field-label">Width (px)</label><input type="number" min="40" class="modal-input" id="ctWidth" value="${t.width}"/></div>
       <div><label class="field-label">Height (px)</label><input type="number" min="40" class="modal-input" id="ctHeight" value="${t.height}"/></div>
     </div>
+    <label class="field-label">Server Section</label>
+    <select class="modal-select" id="ctServerSection">
+      <option value="">No section</option>
+      ${state.serverSections.map(s => `<option value="${s.id}" ${s.id===t.server_section_id?'selected':''}>${esc(s.name)}${s.assigned_staff_id ? ' — '+esc(state.staffList.find(st=>st.id===s.assigned_staff_id)?.name||'') : ''}</option>`).join('')}
+    </select>
     <div class="modal-actions">
       <button class="modal-btn modal-btn-danger" onclick="deleteCanvasTable('${t.id}')">Delete Table</button>
       <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
@@ -774,6 +1026,7 @@ window.saveCanvasTable = async function(id){
     max_party: Number(document.getElementById('ctMax').value)||1,
     width: Number(document.getElementById('ctWidth').value)||80,
     height: Number(document.getElementById('ctHeight').value)||80,
+    server_section_id: document.getElementById('ctServerSection').value || null,
   };
   const { error } = await sb.from('dining_tables').update(payload).eq('id', id);
   if (error){ alert('Error: '+error.message); return; }
@@ -816,15 +1069,16 @@ function renderWaitlistTab(){
   <div class="res-list">${items}</div>`;
 }
 
-window.openWaitlistModal = function(){
+window.openWaitlistModal = function(prefill){
+  const p = prefill || {};
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
     <h3>Add to Waitlist</h3>
     <label class="field-label">Guest name</label>
-    <input type="text" class="modal-input" id="wlName" placeholder="Name"/>
+    <input type="text" class="modal-input" id="wlName" placeholder="Name" value="${esc(p.name||'')}"/>
     <div class="formgrid">
-      <div><label class="field-label">Phone</label><input type="tel" class="modal-input" id="wlPhone"/></div>
-      <div><label class="field-label">Party size</label><input type="number" min="1" class="modal-input" id="wlParty" value="2"/></div>
+      <div><label class="field-label">Phone</label><input type="tel" class="modal-input" id="wlPhone" value="${esc(p.phone||'')}"/></div>
+      <div><label class="field-label">Party size</label><input type="number" min="1" class="modal-input" id="wlParty" value="${p.party||2}"/></div>
     </div>
     <label class="field-label">Quoted wait (minutes)</label>
     <input type="number" min="0" class="modal-input" id="wlWait" value="15"/>
@@ -1057,6 +1311,29 @@ function renderSettingsTab(){
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="setTab('floorplan')">🗺️ Open Floor Plan Editor</button></div>
   </div>
 
+  <div class="section-heading">Server Sections</div>
+  <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">Group tables into color-coded sections and assign a server to each. Turn on "🎨 Server View" on the Floor Plan tab to see the floor colored by section instead of table status. Assign individual tables to a section from the table's edit panel on the Floor Plan tab.</div>
+    <table class="data-table">
+      <thead><tr><th>Color</th><th>Section</th><th>Assigned Server</th><th>Tables</th><th></th></tr></thead>
+      <tbody>
+        ${state.serverSections.map(s => `<tr>
+          <td><span style="display:inline-block;width:16px;height:16px;border-radius:4px;background:${esc(s.color)};border:1px solid var(--border)"></span></td>
+          <td>${esc(s.name)}</td>
+          <td>
+            <select class="modal-select" style="margin:0;padding:4px 8px" onchange="setSectionServer('${s.id}', this.value)">
+              <option value="">Unassigned</option>
+              ${state.staffList.filter(st=>st.active).map(st => `<option value="${st.id}" ${st.id===s.assigned_staff_id?'selected':''}>${esc(st.name)}</option>`).join('')}
+            </select>
+          </td>
+          <td>${state.tables.filter(t=>t.server_section_id===s.id).length}</td>
+          <td><button class="btn btn-sm btn-danger" onclick="deleteServerSection('${s.id}')">Delete</button></td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openServerSectionModal()">+ Add Section</button></div>
+  </div>
+
   <div class="section-heading">Service Periods</div>
   <div class="card">
     <table class="data-table">
@@ -1091,6 +1368,55 @@ function renderSettingsTab(){
     </table>
   </div>` : ''}`;
 }
+
+window.openServerSectionModal = function(){
+  const box = document.getElementById('formModalBox');
+  const defaultColors = ['#0070f2','#dc2626','#16a34a','#d97706','#7c3aed','#0891b2','#db2777','#65a30d'];
+  const nextColor = defaultColors[state.serverSections.length % defaultColors.length];
+  box.innerHTML = `
+    <h3>New Server Section</h3>
+    <label class="field-label">Section name</label>
+    <input type="text" class="modal-input" id="ssName" placeholder="Section A"/>
+    <label class="field-label">Color</label>
+    <input type="color" class="modal-input" id="ssColor" value="${nextColor}" style="padding:4px;height:42px"/>
+    <label class="field-label">Assign server</label>
+    <select class="modal-select" id="ssStaff">
+      <option value="">Unassigned</option>
+      ${state.staffList.filter(st=>st.active).map(st => `<option value="${st.id}">${esc(st.name)}</option>`).join('')}
+    </select>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="saveServerSection()">Save</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+
+window.saveServerSection = async function(){
+  const payload = {
+    name: document.getElementById('ssName').value.trim() || 'Section',
+    color: document.getElementById('ssColor').value,
+    assigned_staff_id: document.getElementById('ssStaff').value || null,
+    sort_order: state.serverSections.length,
+  };
+  const { error } = await sb.from('server_sections').insert(payload);
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await reloadServerSections();
+  render();
+};
+
+window.setSectionServer = async function(id, staffId){
+  await sb.from('server_sections').update({ assigned_staff_id: staffId || null }).eq('id', id);
+  await reloadServerSections();
+};
+
+window.deleteServerSection = async function(id){
+  if (!confirm('Delete this section? Tables in it will show "No section" but are not deleted.')) return;
+  await sb.from('server_sections').delete().eq('id', id);
+  await reloadServerSections();
+  await reloadTables();
+  render();
+};
 
 window.openServicePeriodModal = function(){
   const box = document.getElementById('formModalBox');
