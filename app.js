@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.04';
+const APP_VERSION = '1.05';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -28,8 +28,9 @@ let state = {
   reservations: [],
   tables: [],
   areas: [],
-  currentAreaId: null,
+  currentAreaId: '__all',
   editMode: false,
+  floorPlan: { background_image_url: null, canvas_width: 1200, canvas_height: 800 },
   guests: [],
   waitlist: [],
   staffList: [],
@@ -182,9 +183,10 @@ async function loadAll(){
   const statusEl = document.getElementById('syncStatus');
   setStatus(statusEl, '☁ Syncing…', '');
   try {
-    const [tablesRes, areasRes, guestsRes, waitlistRes, staffRes, spRes, resRes] = await Promise.all([
+    const [tablesRes, areasRes, fpRes, guestsRes, waitlistRes, staffRes, spRes, resRes] = await Promise.all([
       sb.from('dining_tables').select('*').order('label'),
       sb.from('floor_areas').select('*').order('sort_order').order('created_at'),
+      sb.from('floor_plan_settings').select('*').eq('id', true).maybeSingle(),
       sb.from('guests').select('*').order('last_name'),
       sb.from('waitlist').select('*').eq('status','waiting').order('added_at'),
       sb.from('staff').select('*').order('created_at'),
@@ -193,12 +195,13 @@ async function loadAll(){
     ]);
     state.tables = tablesRes.data || [];
     state.areas = areasRes.data || [];
+    if (fpRes.data) state.floorPlan = fpRes.data;
     state.guests = guestsRes.data || [];
     state.waitlist = waitlistRes.data || [];
     state.staffList = staffRes.data || [];
     state.servicePeriods = spRes.data || [];
     state.reservations = resRes.data || [];
-    if (!state.currentAreaId && state.areas.length) state.currentAreaId = state.areas[0].id;
+    if (!state.currentAreaId) state.currentAreaId = '__all';
     setStatus(statusEl, '☁ Synced', 'synced');
   } catch(e){
     setStatus(statusEl, '⚠ Offline', 'error');
@@ -462,7 +465,11 @@ async function reloadTables(){
 async function reloadAreas(){
   const { data } = await sb.from('floor_areas').select('*').order('sort_order').order('created_at');
   state.areas = data || [];
-  if (state.currentAreaId !== '__unassigned' && !state.areas.find(a => a.id === state.currentAreaId)) state.currentAreaId = state.areas[0]?.id || null;
+  if (!['__all','__unassigned'].includes(state.currentAreaId) && !state.areas.find(a => a.id === state.currentAreaId)) state.currentAreaId = '__all';
+}
+async function reloadFloorPlanSettings(){
+  const { data } = await sb.from('floor_plan_settings').select('*').eq('id', true).maybeSingle();
+  if (data) state.floorPlan = data;
 }
 function currentArea(){ return state.areas.find(a => a.id === state.currentAreaId); }
 
@@ -470,53 +477,57 @@ function renderFloorPlanTab(){
   const activeRes = state.reservations.filter(r => r.status === 'seated');
   const area = currentArea();
   const unassignedCount = state.tables.filter(t => !t.area_id).length;
+  const showingAll = state.currentAreaId === '__all';
 
-  const areaTabs = state.areas.map(a => `<span class="area-chip ${a.id===state.currentAreaId?'active':''}" onclick="switchArea('${a.id}')">${esc(a.name)}</span>`).join('')
+  const areaTabs = `<span class="area-chip ${showingAll?'active':''}" onclick="switchArea('__all')">🗺️ All Areas</span>`
+    + state.areas.map(a => `<span class="area-chip ${a.id===state.currentAreaId?'active':''}" onclick="switchArea('${a.id}')">${esc(a.name)}</span>`).join('')
     + (unassignedCount ? `<span class="area-chip ${state.currentAreaId==='__unassigned'?'active':''}" onclick="switchArea('__unassigned')">Unassigned (${unassignedCount})</span>` : '')
     + `<span class="area-chip-add" onclick="openAreaModal()">+ New Area</span>`;
 
-  const tablesInArea = state.currentAreaId === '__unassigned'
-    ? state.tables.filter(t => !t.area_id)
+  const tablesInArea = showingAll ? state.tables
+    : state.currentAreaId === '__unassigned' ? state.tables.filter(t => !t.area_id)
     : state.tables.filter(t => t.area_id === state.currentAreaId);
 
-  const canvasW = area?.canvas_width || 1200;
-  const canvasH = area?.canvas_height || 800;
-  const bgStyle = area?.background_image_url ? `background-image:url('${esc(area.background_image_url)}');background-size:100% 100%;background-position:center;` : '';
+  // One shared background/canvas for the whole restaurant — area chips just filter
+  // which tables are shown/draggable, so everything stays lined up on the same sketch.
+  const canvasW = state.floorPlan.canvas_width || 1200;
+  const canvasH = state.floorPlan.canvas_height || 800;
+  const bgStyle = state.floorPlan.background_image_url ? `background-image:url('${esc(state.floorPlan.background_image_url)}');background-size:100% 100%;background-position:center;` : '';
 
   const tableEls = tablesInArea.map(t => {
     const occ = activeRes.find(r => r.table_id === t.id);
     const dragAttr = state.editMode ? `onpointerdown="startDragTable(event,'${t.id}')"` : `onclick="cycleTableStatus('${t.id}')"`;
+    const areaName = state.areas.find(a => a.id === t.area_id)?.name;
     return `
       <div id="tbl-${t.id}" class="floor-table shape-${t.shape} status-${t.status}" ${dragAttr}
            style="left:${t.pos_x}px;top:${t.pos_y}px;width:${t.width}px;height:${t.height}px;">
         <div class="ft-name">${esc(t.label)}</div>
         <div class="ft-meta">${t.seats} seats</div>
+        ${showingAll && areaName ? `<div class="ft-meta">${esc(areaName)}</div>` : ''}
         ${occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>` : ''}
         ${state.editMode ? `<div class="resize-handle" onpointerdown="startResizeTable(event,'${t.id}')" title="Drag to resize"></div>` : ''}
       </div>`;
   }).join('');
 
-  const toolbar = area ? `
-    <button class="btn btn-secondary btn-sm" onclick="openAreaModal('${area.id}')">✏️ Rename / Background</button>
+  const toolbar = `
+    <button class="btn btn-secondary btn-sm" onclick="openBackgroundModal()">🖼 Floor Plan Image</button>
+    ${area ? `<button class="btn btn-secondary btn-sm" onclick="openAreaModal('${area.id}')">✏️ Rename Area</button>` : ''}
     ${state.editMode ? `<button class="btn btn-primary btn-sm" onclick="addTableToCanvas()">+ Add Table</button>` : ''}
     <button class="btn ${state.editMode?'btn-success':'btn-secondary'} btn-sm" onclick="toggleEditMode()">${state.editMode ? '✅ Done Editing' : '✏️ Edit Layout'}</button>
-  ` : (state.currentAreaId === '__unassigned' ? `<span class="panel-sub">Assign these tables to an area via Edit Layout → tap a table.</span>` : '');
+  `;
 
   return `
   <div class="panel-header">
     <div><h2 class="panel-title">Floor Plan</h2><div class="panel-sub">${state.editMode ? 'Drag tables to reposition. Tap a table to rename, resize, or delete.' : 'Tap a table to cycle its status.'}</div></div>
     <div class="floor-toolbar">${toolbar}</div>
   </div>
-  <div class="area-tabs" style="margin-bottom:14px">${areaTabs || '<span class="panel-sub">No areas yet — create one to start placing tables.</span>'}</div>
+  <div class="area-tabs" style="margin-bottom:14px">${areaTabs}</div>
   ${state.editMode ? `<div class="edit-mode-banner">✏️ Edit Layout is on — drag tables anywhere on the canvas. Changes save automatically.</div>` : ''}
-  ${area ? `
   <div class="floor-canvas-wrap">
     <div id="floorCanvas" class="floor-canvas" style="width:${canvasW}px;height:${canvasH}px;${bgStyle}">
-      ${tableEls || '<div class="empty-state" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">No tables in this area yet. Click "Edit Layout" then "+ Add Table".</div>'}
+      ${tableEls || '<div class="empty-state" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">No tables here yet. Click "Edit Layout" then "+ Add Table".</div>'}
     </div>
-  </div>` : (state.currentAreaId === '__unassigned' ? `
-  <div class="grid grid-4">${tablesInArea.map(t => `<div class="table-card status-${t.status}" onclick="openCanvasTableModal('${t.id}')"><div class="table-label">${esc(t.label)}</div><div class="table-meta">Seats ${t.seats}</div></div>`).join('')}</div>
-  ` : '')}`;
+  </div>`;
 }
 
 window.switchArea = function(id){ state.editMode = false; state.currentAreaId = id; render(); };
@@ -597,28 +608,36 @@ window.startResizeTable = function(ev, id){
   handle.addEventListener('pointerup', onUp);
 };
 
-// ---- Areas: create / rename / delete / background image ----
+// ---- Areas: create / rename / delete (just groupings/filters — background lives in openBackgroundModal) ----
 window.openAreaModal = function(id){
   const a = id ? state.areas.find(x => x.id === id) : null;
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
-    <h3>${a ? 'Edit Area' : 'New Area'}</h3>
+    <h3>${a ? 'Rename Area' : 'New Area'}</h3>
     <label class="field-label">Area name</label>
     <input type="text" class="modal-input" id="areaName" placeholder="e.g. Patio, Main Dining, Private Room" value="${esc(a?.name||'')}"/>
-    ${a ? `
-    <div class="modal-section">
-      <h4>Floor Plan Background</h4>
-      ${a.background_image_url ? `<img src="${esc(a.background_image_url)}" style="width:100%;border-radius:8px;margin-bottom:8px;border:1px solid var(--border)"/>` : `<p style="font-size:12px;color:var(--gray)">No sketch or floor plan image uploaded yet. Upload a photo or rough sketch of this area and drag tables onto it.</p>`}
-      <input type="file" accept="image/*" id="areaImageInput" style="display:none" onchange="uploadFloorPlanImage(event,'${a.id}')"/>
-      <div class="modal-actions">
-        <button class="modal-btn modal-btn-secondary" onclick="document.getElementById('areaImageInput').click()">🖼 ${a.background_image_url ? 'Replace' : 'Upload'} Image</button>
-        ${a.background_image_url ? `<button class="modal-btn modal-btn-secondary" onclick="removeFloorplanImage('${a.id}')">Remove Image</button>` : ''}
-      </div>
-    </div>` : ''}
+    <p style="font-size:12px;color:var(--gray);margin-top:-4px">Areas are just groupings for filtering tables — everyone shares one floor plan image, set via "🖼 Floor Plan Image" on the toolbar.</p>
     <div class="modal-actions">
       ${a ? `<button class="modal-btn modal-btn-danger" onclick="deleteArea('${a.id}')">Delete Area</button>` : ''}
       <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
       <button class="modal-btn modal-btn-primary" onclick="saveArea(${a?`'${a.id}'`:'null'})">Save</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+
+// ---- Shared floor plan background image (one canvas for the whole restaurant) ----
+window.openBackgroundModal = function(){
+  const fp = state.floorPlan;
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Floor Plan Image</h3>
+    <p style="font-size:12px;color:var(--gray)">Upload a photo, blueprint, or rough sketch of your restaurant. All areas share this one image — drag tables onto it from any area tab or "All Areas".</p>
+    ${fp.background_image_url ? `<img src="${esc(fp.background_image_url)}" style="width:100%;border-radius:8px;margin:10px 0;border:1px solid var(--border)"/>` : ''}
+    <input type="file" accept="image/*" id="fpImageInput" style="display:none" onchange="uploadFloorPlanImage(event)"/>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-primary" onclick="document.getElementById('fpImageInput').click()">🖼 ${fp.background_image_url ? 'Replace' : 'Upload'} Image</button>
+      ${fp.background_image_url ? `<button class="modal-btn modal-btn-secondary" onclick="removeFloorplanImage()">Remove Image</button>` : ''}
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Close</button>
     </div>`;
   document.getElementById('formModal').classList.remove('hidden');
 };
@@ -646,17 +665,17 @@ window.deleteArea = async function(id){
   render();
 };
 
-window.uploadFloorPlanImage = async function(ev, areaId){
+window.uploadFloorPlanImage = async function(ev){
   const file = ev.target.files[0];
   if (!file) return;
   const ext = file.name.split('.').pop();
-  const path = `area-${areaId}-${Date.now()}.${ext}`;
+  const path = `floorplan-${Date.now()}.${ext}`;
   const { error } = await sb.storage.from('floorplans').upload(path, file, { upsert: true });
   if (error){ alert('Upload failed: '+error.message); return; }
   const { data } = sb.storage.from('floorplans').getPublicUrl(path);
 
-  // Size the canvas to match the uploaded image's real proportions so it isn't
-  // stretched/cropped by a mismatched box (cap the longest side for usability).
+  // Size the shared canvas to match the uploaded image's real proportions so it
+  // isn't stretched/cropped by a mismatched box (cap the longest side for usability).
   const dims = await new Promise(resolve => {
     const img = new Image();
     img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
@@ -668,26 +687,27 @@ window.uploadFloorPlanImage = async function(ev, areaId){
   const canvas_width = Math.round(dims.w * scale);
   const canvas_height = Math.round(dims.h * scale);
 
-  await sb.from('floor_areas').update({ background_image_url: data.publicUrl, canvas_width, canvas_height }).eq('id', areaId);
+  await sb.from('floor_plan_settings').update({ background_image_url: data.publicUrl, canvas_width, canvas_height, updated_at: new Date().toISOString() }).eq('id', true);
   closeModal('formModal');
-  await reloadAreas();
+  await reloadFloorPlanSettings();
   render();
 };
 
-window.removeFloorplanImage = async function(areaId){
-  await sb.from('floor_areas').update({ background_image_url: null }).eq('id', areaId);
+window.removeFloorplanImage = async function(){
+  await sb.from('floor_plan_settings').update({ background_image_url: null }).eq('id', true);
   closeModal('formModal');
-  await reloadAreas();
+  await reloadFloorPlanSettings();
   render();
 };
 
 // ---- Tables on the canvas: add / edit / resize / rename / delete ----
 window.addTableToCanvas = async function(){
-  const area = currentArea();
-  if (!area){ alert('Create an area first.'); return; }
-  const n = state.tables.filter(t => t.area_id === area.id).length + 1;
+  // On a specific area tab, new tables go there. On "All Areas" default to the
+  // first area (reassignable in the edit modal); on "Unassigned" leave unassigned.
+  const area = currentArea() || (state.currentAreaId === '__all' ? state.areas[0] : null);
+  const n = state.tables.filter(t => t.area_id === (area?.id||null)).length + 1;
   const { data, error } = await sb.from('dining_tables').insert({
-    label: 'Table '+n, area_id: area.id, section: area.name,
+    label: 'Table '+n, area_id: area?.id || null, section: area?.name || null,
     min_party: 1, max_party: 4, seats: 4, shape: 'square',
     pos_x: 40, pos_y: 40, width: 80, height: 80, status: 'available',
   }).select().single();
@@ -706,6 +726,7 @@ window.openCanvasTableModal = function(id){
     <div class="formgrid">
       <div><label class="field-label">Area</label>
         <select class="modal-select" id="ctArea">
+          <option value="">Unassigned</option>
           ${state.areas.map(a => `<option value="${a.id}" ${a.id===t.area_id?'selected':''}>${esc(a.name)}</option>`).join('')}
         </select>
       </div>
