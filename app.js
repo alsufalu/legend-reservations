@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.02';
+const APP_VERSION = '1.04';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -481,7 +481,7 @@ function renderFloorPlanTab(){
 
   const canvasW = area?.canvas_width || 1200;
   const canvasH = area?.canvas_height || 800;
-  const bgStyle = area?.background_image_url ? `background-image:url('${esc(area.background_image_url)}');background-size:cover;background-position:center;` : '';
+  const bgStyle = area?.background_image_url ? `background-image:url('${esc(area.background_image_url)}');background-size:100% 100%;background-position:center;` : '';
 
   const tableEls = tablesInArea.map(t => {
     const occ = activeRes.find(r => r.table_id === t.id);
@@ -492,6 +492,7 @@ function renderFloorPlanTab(){
         <div class="ft-name">${esc(t.label)}</div>
         <div class="ft-meta">${t.seats} seats</div>
         ${occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>` : ''}
+        ${state.editMode ? `<div class="resize-handle" onpointerdown="startResizeTable(event,'${t.id}')" title="Drag to resize"></div>` : ''}
       </div>`;
   }).join('');
 
@@ -532,6 +533,7 @@ window.cycleTableStatus = async function(id){
 
 // ---- Dragging (pointer events, works with mouse + touch/iPad) ----
 window.startDragTable = function(ev, id){
+  if (ev.target.classList.contains('resize-handle')) return; // let the resize handle own this gesture
   ev.preventDefault();
   const el = document.getElementById('tbl-'+id);
   if (!el) return;
@@ -562,6 +564,37 @@ window.startDragTable = function(ev, id){
   }
   el.addEventListener('pointermove', onMove);
   el.addEventListener('pointerup', onUp);
+};
+
+// ---- Resizing (drag the corner handle) ----
+window.startResizeTable = function(ev, id){
+  ev.preventDefault();
+  ev.stopPropagation();
+  const handle = ev.currentTarget;
+  const el = document.getElementById('tbl-'+id);
+  if (!el) return;
+  const startX = ev.clientX, startY = ev.clientY;
+  const origW = parseFloat(el.style.width) || 80;
+  const origH = parseFloat(el.style.height) || 80;
+  const MIN_SIZE = 40;
+  try { handle.setPointerCapture(ev.pointerId); } catch(e){}
+
+  function onMove(e){
+    const dx = e.clientX - startX, dy = e.clientY - startY;
+    el.style.width = Math.max(MIN_SIZE, origW + dx) + 'px';
+    el.style.height = Math.max(MIN_SIZE, origH + dy) + 'px';
+  }
+  async function onUp(){
+    handle.removeEventListener('pointermove', onMove);
+    handle.removeEventListener('pointerup', onUp);
+    const newW = Math.round(parseFloat(el.style.width));
+    const newH = Math.round(parseFloat(el.style.height));
+    const t = tableById(id);
+    if (t){ t.width = newW; t.height = newH; }
+    await sb.from('dining_tables').update({ width: newW, height: newH }).eq('id', id);
+  }
+  handle.addEventListener('pointermove', onMove);
+  handle.addEventListener('pointerup', onUp);
 };
 
 // ---- Areas: create / rename / delete / background image ----
@@ -621,7 +654,21 @@ window.uploadFloorPlanImage = async function(ev, areaId){
   const { error } = await sb.storage.from('floorplans').upload(path, file, { upsert: true });
   if (error){ alert('Upload failed: '+error.message); return; }
   const { data } = sb.storage.from('floorplans').getPublicUrl(path);
-  await sb.from('floor_areas').update({ background_image_url: data.publicUrl }).eq('id', areaId);
+
+  // Size the canvas to match the uploaded image's real proportions so it isn't
+  // stretched/cropped by a mismatched box (cap the longest side for usability).
+  const dims = await new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
+    img.onerror = () => resolve({ w: 1200, h: 800 });
+    img.src = data.publicUrl;
+  });
+  const MAX_SIDE = 1400;
+  const scale = Math.min(1, MAX_SIDE / Math.max(dims.w, dims.h));
+  const canvas_width = Math.round(dims.w * scale);
+  const canvas_height = Math.round(dims.h * scale);
+
+  await sb.from('floor_areas').update({ background_image_url: data.publicUrl, canvas_width, canvas_height }).eq('id', areaId);
   closeModal('formModal');
   await reloadAreas();
   render();

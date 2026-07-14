@@ -192,6 +192,11 @@ table.data-table td{padding:10px 12px;border-top:1px solid var(--border);font-si
 }
 .floor-table:active{cursor:grabbing;}
 .floor-table.shape-round{border-radius:50%;}
+.resize-handle{
+  position:absolute;right:-8px;bottom:-8px;width:18px;height:18px;
+  background:var(--primary);border:2px solid #fff;border-radius:50%;
+  cursor:nwse-resize;touch-action:none;box-shadow:0 1px 4px rgba(0,0,0,.3);
+}
 .floor-table.status-available{border-color:var(--success);}
 .floor-table.status-seated{border-color:var(--danger);background:var(--danger-bg);}
 .floor-table.status-reserved{border-color:var(--warn);background:var(--warn-bg);}
