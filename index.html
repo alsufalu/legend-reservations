@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
+<title>Legend Reservations</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🍽️</text></svg>">
+<link rel="stylesheet" href="styles.css"/>
+</head>
+<body>
+
+<!-- ===== LOGIN ===== -->
+<div id="loginOverlay" class="login-overlay">
+  <div class="loginBox">
+    <div class="loginLogo">🍽️</div>
+    <h2>Legend Reservations</h2>
+    <p>Host Stand &amp; Management Console</p>
+    <div class="login-tabs">
+      <button class="login-tab active" id="tabSignIn" onclick="switchAuthTab('signin')">Sign In</button>
+      <button class="login-tab" id="tabRegister" onclick="switchAuthTab('register')">Request Access</button>
+    </div>
+    <input type="email" id="authEmail" placeholder="Email address" autocomplete="username" onkeydown="if(event.key==='Enter')submitAuth()"/>
+    <input type="password" id="authPassword" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key==='Enter')submitAuth()"/>
+    <div id="authConfirmWrap" style="display:none">
+      <input type="password" id="authConfirm" placeholder="Confirm password" onkeydown="if(event.key==='Enter')submitAuth()"/>
+      <input type="text" id="authName" placeholder="Your name" onkeydown="if(event.key==='Enter')submitAuth()"/>
+    </div>
+    <button class="loginBtn" id="authSubmitBtn" onclick="submitAuth()">Sign In</button>
+    <div style="text-align:center;margin-top:10px">
+      <button type="button" onclick="sendPasswordReset()" class="linkBtn">Forgot password?</button>
+    </div>
+    <div class="loginError" id="loginError"></div>
+  </div>
+</div>
+
+<!-- ===== PENDING APPROVAL ===== -->
+<div id="pendingOverlay" class="login-overlay hidden">
+  <div class="loginBox">
+    <div class="loginLogo">⏳</div>
+    <h2>Access Pending</h2>
+    <p>Your account has been created. Ask your manager or admin to approve your access in Staff settings before you can sign in.</p>
+    <button class="loginBtn" onclick="signOut()">Sign Out</button>
+  </div>
+</div>
+
+<!-- ===== APP SHELL ===== -->
+<div id="app" class="app hidden">
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="brand">🍽️ Legend Reservations</span>
+    </div>
+    <nav class="tabnav" id="tabnav">
+      <button class="tabbtn active" data-tab="reservations" onclick="setTab('reservations')">📖 Reservations</button>
+      <button class="tabbtn" data-tab="floorplan" onclick="setTab('floorplan')">🗺️ Floor Plan</button>
+      <button class="tabbtn" data-tab="waitlist" onclick="setTab('waitlist')">⏱️ Waitlist</button>
+      <button class="tabbtn" data-tab="guests" onclick="setTab('guests')">👥 Guests</button>
+      <button class="tabbtn" data-tab="dashboard" onclick="setTab('dashboard')">📊 Dashboard</button>
+      <button class="tabbtn" data-tab="settings" onclick="setTab('settings')">⚙️ Settings</button>
+    </nav>
+    <div class="topbar-actions">
+      <span id="syncStatus" class="sync-status">☁ Connecting…</span>
+      <button class="account-topbar-btn" onclick="openAccountModal()">👤 <span id="topbarName">Account</span></button>
+    </div>
+  </header>
+
+  <main id="content" class="content"></main>
+</div>
+
+<!-- ===== ACCOUNT MODAL ===== -->
+<div class="modal-overlay hidden" id="accountModal">
+  <div class="modal-box">
+    <h3>My Account</h3>
+    <div class="modal-user-email" id="modalUserEmail"></div>
+    <div class="modal-section">
+      <h4>Change Password</h4>
+      <input type="password" class="modal-input" id="newPwdInput" placeholder="New password"/>
+      <input type="password" class="modal-input" id="confirmPwdInput" placeholder="Confirm new password"/>
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-primary" onclick="changePassword()">Update Password</button>
+      </div>
+    </div>
+    <div class="modal-actions" style="margin-top:24px;">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('accountModal')">Close</button>
+      <button class="modal-btn modal-btn-danger" onclick="signOut()">Sign Out</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== GENERIC MODAL ROOT (reservation / waitlist / guest / table forms) ===== -->
+<div class="modal-overlay hidden" id="formModal">
+  <div class="modal-box modal-box-wide" id="formModalBox"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
