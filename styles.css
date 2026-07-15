@@ -184,6 +184,7 @@ table.data-table td{padding:10px 12px;border-top:1px solid var(--border);font-si
 .timeline-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:12px;background:#fff;max-height:70vh;overflow-y:auto;}
 .timeline-header{display:flex;position:sticky;top:0;background:#fff;border-bottom:2px solid var(--border);z-index:2;}
 .timeline-corner{width:130px;flex-shrink:0;border-right:1px solid var(--border);position:sticky;left:0;background:#fff;z-index:3;}
+.timeline-header-hours{display:flex;}
 .timeline-hour{flex-shrink:0;border-right:1px solid var(--border);font-size:11px;color:var(--gray);padding:6px 4px;font-weight:700;}
 .timeline-row{display:flex;border-bottom:1px solid var(--border);position:relative;}
 .timeline-row-label{width:130px;flex-shrink:0;border-right:1px solid var(--border);padding:8px;font-size:12px;font-weight:700;background:var(--bg-alt);position:sticky;left:0;z-index:1;display:flex;flex-direction:column;justify-content:center;}
