@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.17';
+const APP_VERSION = '1.18';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -637,14 +637,18 @@ window.applyAutoAssign = async function(){
   const toApply = plan.filter((p, i) => p.table && document.getElementById(`autoAssignChk_${i}`)?.checked);
   if (!toApply.length){ closeModal('formModal'); return; }
   let okCount = 0;
+  const errors = [];
   for (const p of toApply){
     const { error } = await sb.from('reservations').update({ table_id: p.table.id }).eq('id', p.reservation.id);
     if (!error) okCount++;
+    else errors.push(`${guestName(guestById(p.reservation.guest_id))}: ${error.message}`);
   }
   closeModal('formModal');
   await reloadReservationsForDate();
   render();
-  alert(`Assigned ${okCount} of ${toApply.length} reservation${toApply.length===1?'':'s'}.${okCount<toApply.length ? ' Some tables were taken in the meantime — re-run Auto-Assign to catch the rest.' : ''}`);
+  let msg = `Assigned ${okCount} of ${toApply.length} reservation${toApply.length===1?'':'s'}.`;
+  if (errors.length) msg += `\n\nFailed:\n${errors.slice(0,5).join('\n')}${errors.length>5?`\n…and ${errors.length-5} more`:''}`;
+  alert(msg);
 };
 
 // ---- Timeline: tables as rows, time-of-day across the top, gap/conflict aware ----
