@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.08';
+const APP_VERSION = '1.10';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -33,6 +33,8 @@ let state = {
   editMode: false,
   serverView: false,
   serverSections: [],
+  comboMembers: {},   // comboTableId -> [memberTableId, ...]
+  memberOfCombos: {}, // memberTableId -> [comboTableId, ...]
   floorPlan: { background_image_url: null, canvas_width: 1200, canvas_height: 800 },
   guests: [],
   waitlist: [],
@@ -87,12 +89,38 @@ async function fetchDateReservations(dateStr, excludeId){
   return error ? [] : (data || []);
 }
 function tablesFittingParty(partySize){
-  return state.tables.filter(t => t.active && partySize >= t.min_party && partySize <= t.max_party);
+  // A table's actual seat count is always the hard ceiling, even if max_party
+  // was set higher than seats by mistake when the table was configured.
+  return state.tables.filter(t => t.active && partySize >= t.min_party && partySize <= Math.min(t.max_party, t.seats));
 }
+// ---- Table combinations: predefined pairs/groups that book as one unit ----
+function buildComboMaps(rows){
+  const members = {}, memberOf = {};
+  rows.forEach(({combo_table_id, member_table_id}) => {
+    (members[combo_table_id] ||= []).push(member_table_id);
+    (memberOf[member_table_id] ||= []).push(combo_table_id);
+  });
+  state.comboMembers = members;
+  state.memberOfCombos = memberOf;
+}
+async function reloadCombos(){
+  const { data } = await sb.from('table_combo_members').select('*');
+  buildComboMaps(data || []);
+}
+// A table and its combo partners can't be double-booked against each other —
+// e.g. booking the "3+4" combo must also block Table 3 and Table 4 individually.
+function conflictingTableIds(tableId){
+  const ids = new Set([tableId]);
+  (state.comboMembers[tableId] || []).forEach(id => ids.add(id));
+  (state.memberOfCombos[tableId] || []).forEach(id => ids.add(id));
+  return ids;
+}
+
 function isTableBusy(tableId, timeStr, durationMinutes, dateReservations){
   const start = timeToMinutes(timeStr), end = start + (Number(durationMinutes)||90);
+  const conflictSet = conflictingTableIds(tableId);
   return dateReservations.some(r => {
-    if (r.table_id !== tableId) return false;
+    if (!conflictSet.has(r.table_id)) return false;
     const rStart = timeToMinutes(r.reservation_time);
     const rEnd = rStart + (r.duration_minutes||90);
     return rangesOverlap(start, end, rStart, rEnd);
@@ -104,6 +132,11 @@ function guestName(g){
 }
 function guestById(id){ return state.guests.find(g => g.id === id); }
 function tableById(id){ return state.tables.find(t => t.id === id); }
+function tableDisplayLabel(t){
+  if (!t?.is_combo) return t?.label || '';
+  const members = (state.comboMembers[t.id] || []).map(id => tableById(id)?.label).filter(Boolean);
+  return `🔗 ${t.label}${members.length ? ' ('+members.join(' + ')+')' : ''}`;
+}
 function setStatus(el, text, cls){
   el.textContent = text;
   el.className = 'sync-status' + (cls ? ' '+cls : '');
@@ -222,11 +255,12 @@ async function loadAll(){
   const statusEl = document.getElementById('syncStatus');
   setStatus(statusEl, '☁ Syncing…', '');
   try {
-    const [tablesRes, areasRes, fpRes, ssRes, guestsRes, waitlistRes, staffRes, spRes, resRes] = await Promise.all([
+    const [tablesRes, areasRes, fpRes, ssRes, comboRes, guestsRes, waitlistRes, staffRes, spRes, resRes] = await Promise.all([
       sb.from('dining_tables').select('*').order('label'),
       sb.from('floor_areas').select('*').order('sort_order').order('created_at'),
       sb.from('floor_plan_settings').select('*').eq('id', true).maybeSingle(),
       sb.from('server_sections').select('*').order('sort_order').order('created_at'),
+      sb.from('table_combo_members').select('*'),
       sb.from('guests').select('*').order('last_name'),
       sb.from('waitlist').select('*').eq('status','waiting').order('added_at'),
       sb.from('staff').select('*').order('created_at'),
@@ -237,6 +271,7 @@ async function loadAll(){
     state.areas = areasRes.data || [];
     if (fpRes.data) state.floorPlan = fpRes.data;
     state.serverSections = ssRes.data || [];
+    buildComboMaps(comboRes.data || []);
     state.guests = guestsRes.data || [];
     state.waitlist = waitlistRes.data || [];
     state.staffList = staffRes.data || [];
@@ -314,7 +349,7 @@ function renderReservationsTab(){
         <div class="res-name">${esc(guestName(g))} ${g?.vip ? '<span class="badge badge-vip">VIP</span>' : ''} · ${r.party_size} guests</div>
         <div class="res-meta">
           <span class="badge badge-${r.status}">${r.status.replace('_',' ')}</span>
-          ${t ? ` · Table ${esc(t.label)}` : ' · No table assigned'}
+          ${t ? ` · Table ${esc(tableDisplayLabel(t))}` : ' · No table assigned'}
           ${r.special_requests ? ` · 📝 ${esc(r.special_requests)}` : ''}
           ${r.occasion ? ` · 🎉 ${esc(r.occasion)}` : ''}
         </div>
@@ -432,8 +467,9 @@ window.updateReservationStatus = async function(id, status){
 window.openSeatModal = function(id){
   const r = state.reservations.find(x => x.id === id);
   const physicallyFree = state.tables.filter(t => t.active && ['available','reserved'].includes(t.status));
-  const fits = physicallyFree.filter(t => r.party_size >= t.min_party && r.party_size <= t.max_party);
-  const tooSmallOrBig = physicallyFree.filter(t => !(r.party_size >= t.min_party && r.party_size <= t.max_party));
+  const capFits = t => r.party_size >= t.min_party && r.party_size <= Math.min(t.max_party, t.seats);
+  const fits = physicallyFree.filter(capFits);
+  const tooSmallOrBig = physicallyFree.filter(t => !capFits(t));
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
     <h3>Seat Reservation</h3>
@@ -441,8 +477,8 @@ window.openSeatModal = function(id){
     <label class="field-label">Assign Table</label>
     <select class="modal-select" id="seatTableSelect">
       <option value="">No table / seat at bar</option>
-      ${fits.map(t => `<option value="${t.id}" ${t.id===r.table_id?'selected':''}>✅ ${esc(t.label)} (${t.section}, seats ${t.seats})</option>`).join('')}
-      ${tooSmallOrBig.map(t => `<option value="${t.id}" ${t.id===r.table_id?'selected':''}>⚠️ ${esc(t.label)} — seats ${t.min_party}-${t.max_party}, party is ${r.party_size}</option>`).join('')}
+      ${fits.map(t => `<option value="${t.id}" ${t.id===r.table_id?'selected':''}>✅ ${esc(tableDisplayLabel(t))} (${t.section}, seats ${t.seats})</option>`).join('')}
+      ${tooSmallOrBig.map(t => `<option value="${t.id}" ${t.id===r.table_id?'selected':''}>⚠️ ${esc(tableDisplayLabel(t))} — seats ${t.min_party}-${t.max_party}, party is ${r.party_size}</option>`).join('')}
     </select>
     ${!fits.length ? `<div class="panel-sub" style="color:var(--warn)">No free table is sized right for ${r.party_size} guests — you can still pick one above, or seat with no table assigned.</div>` : ''}
     <div class="modal-actions">
@@ -456,11 +492,16 @@ window.confirmSeat = async function(id){
   const tableId = document.getElementById('seatTableSelect').value || null;
   const { error } = await sb.from('reservations').update({ status:'seated', seated_at: new Date().toISOString(), table_id: tableId }).eq('id', id);
   if (error){
-    if (error.code === '23P01') alert('That table was just taken for an overlapping reservation — pick a different table.');
+    if (error.code === '23P01' || error.message?.includes('TABLE_COMBO_CONFLICT')) alert('That table was just taken for an overlapping reservation — pick a different table.');
     else alert('Error: '+error.message);
     return;
   }
-  if (tableId) await sb.from('dining_tables').update({ status:'seated' }).eq('id', tableId);
+  if (tableId){
+    // Seating a combo also marks its member tables seated, so the floor plan
+    // shows both physical tables occupied (combos don't get their own tile).
+    const idsToMark = [tableId, ...(state.comboMembers[tableId] || [])];
+    await sb.from('dining_tables').update({ status:'seated' }).in('id', idsToMark);
+  }
   closeModal('formModal');
   await Promise.all([reloadReservationsForDate(), reloadTables()]);
   render();
@@ -553,8 +594,8 @@ window.refreshAvailability = async function(preserveSelection){
   const busyFitting = fitting.filter(t => isTableBusy(t.id, time, duration, dateReservations));
 
   sel.innerHTML = `<option value="">Unassigned — assign a table at seating (recommended)</option>`
-    + freeFitting.map(t => `<option value="${t.id}">✅ ${esc(t.label)} (${t.section||''}, seats ${t.seats})</option>`).join('')
-    + busyFitting.map(t => `<option value="${t.id}">⛔ ${esc(t.label)} — booked at that time</option>`).join('');
+    + freeFitting.map(t => `<option value="${t.id}">✅ ${esc(tableDisplayLabel(t))} (${t.section||''}, seats ${t.seats})</option>`).join('')
+    + busyFitting.map(t => `<option value="${t.id}">⛔ ${esc(tableDisplayLabel(t))} — booked at that time</option>`).join('');
   if ([...sel.options].some(o => o.value === currentVal)) sel.value = currentVal;
 
   if (noteEl){
@@ -637,7 +678,7 @@ window.saveReservation = async function(id){
     ? await sb.from('reservations').update(payload).eq('id', id)
     : await sb.from('reservations').insert(payload);
   if (error){
-    if (error.code === '23P01') alert('That table just got booked for an overlapping time — pick a different table or leave it Unassigned.');
+    if (error.code === '23P01' || error.message?.includes('TABLE_COMBO_CONFLICT')) alert('That table just got booked for an overlapping time — pick a different table or leave it Unassigned.');
     else alert('Error: '+error.message);
     return;
   }
@@ -687,9 +728,11 @@ function renderFloorPlanTab(){
     + (unassignedCount ? `<span class="area-chip ${state.currentAreaId==='__unassigned'?'active':''}" onclick="switchArea('__unassigned')">Unassigned (${unassignedCount})</span>` : '')
     + `<span class="area-chip-add" onclick="openAreaModal()">+ New Area</span>`;
 
-  const tablesInArea = showingAll ? state.tables
+  // Combos are a booking concept, not a physical spot on the floor — they don't
+  // get their own tile (their member tables already represent them visually).
+  const tablesInArea = (showingAll ? state.tables
     : state.currentAreaId === '__unassigned' ? state.tables.filter(t => !t.area_id)
-    : state.tables.filter(t => t.area_id === state.currentAreaId);
+    : state.tables.filter(t => t.area_id === state.currentAreaId)).filter(t => !t.is_combo);
 
   // One shared background/canvas for the whole restaurant — area chips just filter
   // which tables are shown/draggable, so everything stays lined up on the same sketch.
@@ -995,6 +1038,7 @@ window.openCanvasTableModal = function(id){
       <div><label class="field-label">Min party</label><input type="number" min="1" class="modal-input" id="ctMin" value="${t.min_party}"/></div>
       <div><label class="field-label">Max party</label><input type="number" min="1" class="modal-input" id="ctMax" value="${t.max_party}"/></div>
     </div>
+    ${t.max_party > t.seats ? `<div class="panel-sub" style="color:var(--warn);margin-top:-6px">⚠️ Max party (${t.max_party}) is higher than Seats (${t.seats}) — the app will still only offer this table to parties of ${t.seats} or fewer.</div>` : ''}
     <div class="formgrid">
       <div><label class="field-label">Width (px)</label><input type="number" min="40" class="modal-input" id="ctWidth" value="${t.width}"/></div>
       <div><label class="field-label">Height (px)</label><input type="number" min="40" class="modal-input" id="ctHeight" value="${t.height}"/></div>
@@ -1300,7 +1344,7 @@ function renderSettingsTab(){
 
   <div class="section-heading">Dining Tables &amp; Floor Plan</div>
   <div class="card">
-    <div class="panel-sub" style="margin-bottom:10px">${state.tables.length} tables across ${state.areas.length} area${state.areas.length===1?'':'s'}. Add, rename, resize, delete, and drag-position tables on your floor plan sketch from the <b>Floor Plan</b> tab.</div>
+    <div class="panel-sub" style="margin-bottom:10px">${state.tables.filter(t=>!t.is_combo).length} tables across ${state.areas.length} area${state.areas.length===1?'':'s'}. Add, rename, resize, delete, and drag-position tables on your floor plan sketch from the <b>Floor Plan</b> tab.</div>
     <table class="data-table">
       <thead><tr><th>Area</th><th>Table Count</th></tr></thead>
       <tbody>
@@ -1332,6 +1376,23 @@ function renderSettingsTab(){
       </tbody>
     </table>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openServerSectionModal()">+ Add Section</button></div>
+  </div>
+
+  <div class="section-heading">Table Combinations</div>
+  <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">Predefine which tables can be pushed together for larger parties (e.g. two 4-tops = a 6-8 top). A combo shows up automatically as a bookable option once a party is too big for any single table, and it's protected from ever double-booking against its member tables.</div>
+    <table class="data-table">
+      <thead><tr><th>Combo</th><th>Members</th><th>Combined Seats</th><th></th></tr></thead>
+      <tbody>
+        ${state.tables.filter(t=>t.is_combo).map(t => `<tr>
+          <td>${esc(t.label)}</td>
+          <td>${(state.comboMembers[t.id]||[]).map(id => esc(tableById(id)?.label||'?')).join(' + ')}</td>
+          <td>${t.seats}</td>
+          <td><button class="btn btn-sm btn-danger" onclick="deleteTableCombo('${t.id}')">Delete</button></td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openTableComboModal()">+ Add Combination</button></div>
   </div>
 
   <div class="section-heading">Service Periods</div>
@@ -1415,6 +1476,55 @@ window.deleteServerSection = async function(id){
   await sb.from('server_sections').delete().eq('id', id);
   await reloadServerSections();
   await reloadTables();
+  render();
+};
+
+window.openTableComboModal = function(){
+  const box = document.getElementById('formModalBox');
+  const candidates = state.tables.filter(t => t.active && !t.is_combo);
+  box.innerHTML = `
+    <h3>New Table Combination</h3>
+    <p style="font-size:12px;color:var(--gray)">Pick two or more tables that can be pushed together. Seats and party-size range are computed automatically.</p>
+    <div class="chip-row" id="comboMemberPicker">
+      ${candidates.map(t => `<span class="chip" data-id="${t.id}" onclick="this.classList.toggle('active')">${esc(t.label)} (${t.seats})</span>`).join('')}
+    </div>
+    <label class="field-label">Combo name</label>
+    <input type="text" class="modal-input" id="comboName" placeholder="e.g. 3 + 4"/>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="saveTableCombo()">Save</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+
+window.saveTableCombo = async function(){
+  const chosen = [...document.querySelectorAll('#comboMemberPicker .chip.active')].map(el => el.dataset.id);
+  if (chosen.length < 2){ alert('Pick at least two tables to combine.'); return; }
+  const members = chosen.map(id => tableById(id)).filter(Boolean);
+  const seats = members.reduce((s,t) => s+t.seats, 0);
+  const biggestSingle = Math.max(...members.map(t => t.seats));
+  const name = document.getElementById('comboName').value.trim() || members.map(t=>t.label).join('+');
+
+  const { data: combo, error } = await sb.from('dining_tables').insert({
+    label: name, is_combo: true, active: true, status: 'available',
+    seats, min_party: biggestSingle + 1, max_party: seats,
+    area_id: members[0].area_id, section: members[0].section,
+    pos_x: 0, pos_y: 0, width: 80, height: 80,
+  }).select().single();
+  if (error){ alert('Error: '+error.message); return; }
+
+  const { error: memErr } = await sb.from('table_combo_members').insert(chosen.map(id => ({ combo_table_id: combo.id, member_table_id: id })));
+  if (memErr){ alert('Error linking members: '+memErr.message); return; }
+
+  closeModal('formModal');
+  await Promise.all([reloadTables(), reloadCombos()]);
+  render();
+};
+
+window.deleteTableCombo = async function(id){
+  if (!confirm('Delete this combination? Its member tables are unaffected.')) return;
+  await sb.from('dining_tables').delete().eq('id', id);
+  await Promise.all([reloadTables(), reloadCombos()]);
   render();
 };
 
