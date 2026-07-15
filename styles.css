@@ -188,15 +188,17 @@ table.data-table td{padding:10px 12px;border-top:1px solid var(--border);font-si
 .timeline-row{display:flex;border-bottom:1px solid var(--border);position:relative;}
 .timeline-row-label{width:130px;flex-shrink:0;border-right:1px solid var(--border);padding:8px;font-size:12px;font-weight:700;background:var(--bg-alt);position:sticky;left:0;z-index:1;display:flex;flex-direction:column;justify-content:center;}
 .timeline-row-sub{font-size:10px;color:var(--gray);font-weight:600;}
-.timeline-row-track{position:relative;flex-shrink:0;height:46px;}
-.timeline-bar{position:absolute;top:6px;bottom:6px;border-radius:6px;padding:2px 6px;font-size:11px;font-weight:700;color:#fff;overflow:hidden;white-space:nowrap;cursor:pointer;display:flex;align-items:center;box-shadow:0 1px 3px rgba(0,0,0,.15);}
+.timeline-row-track{position:relative;flex-shrink:0;}
+.timeline-row-highlight .timeline-row-label{background:#fff7ed;}
+.timeline-row-highlight .timeline-row-track{background:#fffbeb;}
+.timeline-bar{position:absolute;border-radius:6px;padding:2px 6px;font-size:11px;font-weight:700;color:#fff;overflow:hidden;white-space:nowrap;cursor:pointer;display:flex;align-items:center;box-shadow:0 1px 3px rgba(0,0,0,.15);}
 .timeline-bar.status-pending{background:var(--warn);}
 .timeline-bar.status-confirmed{background:#0369a1;}
 .timeline-bar.status-seated{background:var(--success);}
 .timeline-bar.status-completed{background:var(--gray);}
 .timeline-bar.status-cancelled{background:var(--gray);opacity:.4;text-decoration:line-through;}
 .timeline-bar.status-no_show{background:var(--danger);}
-.timeline-tight-gap{position:absolute;top:4px;bottom:4px;width:5px;border-radius:3px;background:repeating-linear-gradient(45deg,#f59e0b,#f59e0b 3px,#fff 3px,#fff 6px);}
+.timeline-tight-gap{position:absolute;top:4px;width:5px;border-radius:3px;background:repeating-linear-gradient(45deg,#f59e0b,#f59e0b 3px,#fff 3px,#fff 6px);}
 .timeline-now-line{position:absolute;top:0;bottom:0;width:2px;background:var(--danger);z-index:2;}
 
 /* ===== FLOOR PLAN EDITOR ===== */

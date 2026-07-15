@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.14';
+const APP_VERSION = '1.15';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -555,31 +555,49 @@ function renderReservationsTimeline(list){
     if (state.selectedDate !== todayStr) return null;
     return now.getHours()*60 + now.getMinutes();
   })();
-  function rowFor(label, sub, resForRow){
+  // Bars are laid out into vertical "lanes" within a row using greedy interval
+  // scheduling, so multiple reservations that overlap in time (very common in the
+  // Unassigned row, where several soft-assigned parties can share the same slot)
+  // stack visibly instead of drawing exactly on top of one another and disappearing.
+  const LANE_H = 32, LANE_GAP = 4, ROW_PAD = 7;
+  function rowFor(label, sub, resForRow, highlight){
     const sorted = resForRow.slice().sort((a,b) => a.reservation_time.localeCompare(b.reservation_time));
-    const bars = sorted.map(r => {
+    const laneEnds = [];
+    const laned = sorted.map(r => {
       const start = timeToMinutes(r.reservation_time);
       const dur = r.duration_minutes || 90;
+      const end = start + dur;
+      let lane = laneEnds.findIndex(e => e <= start);
+      if (lane === -1){ lane = laneEnds.length; laneEnds.push(end); } else laneEnds[lane] = end;
+      return { r, start, dur, lane };
+    });
+    const laneCount = Math.max(1, laneEnds.length);
+    const rowHeight = laneCount*LANE_H + (laneCount-1)*LANE_GAP + ROW_PAD*2;
+
+    const bars = laned.map(({r,start,dur,lane}) => {
       const g = guestById(r.guest_id);
-      return `<div class="timeline-bar status-${r.status}" style="left:${x(start)}px;width:${Math.max(30,dur*PX_PER_MIN)}px" onclick="openReservationModal('${r.id}')" title="${esc(guestName(g))} · ${r.party_size}p · ${fmtTime(r.reservation_time)}">${esc(guestName(g))} · ${r.party_size}p</div>`;
+      const top = ROW_PAD + lane*(LANE_H+LANE_GAP);
+      return `<div class="timeline-bar status-${r.status}" style="left:${x(start)}px;width:${Math.max(30,dur*PX_PER_MIN)}px;top:${top}px;height:${LANE_H}px" onclick="openReservationModal('${r.id}')" title="${esc(guestName(g))} · ${r.party_size}p · ${fmtTime(r.reservation_time)}">${esc(guestName(g))} · ${r.party_size}p</div>`;
     }).join('');
     const gaps = [];
     for (let i=0;i<sorted.length-1;i++){
       const aEnd = timeToMinutes(sorted[i].reservation_time) + (sorted[i].duration_minutes||90);
       const bStart = timeToMinutes(sorted[i+1].reservation_time);
       if (bStart - aEnd >= 0 && bStart - aEnd < 20){
-        gaps.push(`<div class="timeline-tight-gap" style="left:${x(aEnd)}px" title="Only ${bStart-aEnd} min to turn this table"></div>`);
+        gaps.push(`<div class="timeline-tight-gap" style="left:${x(aEnd)}px;height:${rowHeight-8}px" title="Only ${bStart-aEnd} min to turn this table"></div>`);
       }
     }
     return `
-    <div class="timeline-row">
-      <div class="timeline-row-label">${esc(label)}${sub?`<span class="timeline-row-sub">${esc(sub)}</span>`:''}</div>
-      <div class="timeline-row-track" style="width:${totalW}px">${bars}${gaps.join('')}</div>
+    <div class="timeline-row${highlight?' timeline-row-highlight':''}" style="height:${rowHeight}px">
+      <div class="timeline-row-label" style="height:${rowHeight}px">${esc(label)}${sub?`<span class="timeline-row-sub">${esc(sub)}</span>`:''}</div>
+      <div class="timeline-row-track" style="width:${totalW}px;height:${rowHeight}px">${bars}${gaps.join('')}</div>
     </div>`;
   }
 
-  const rows = tables.map(t => rowFor(t.label, `${t.section||''} · ${t.seats} seats`, list.filter(r => r.table_id === t.id && r.status!=='cancelled'))).join('')
-    + (unassigned.length ? rowFor('Unassigned', `${unassigned.length} to seat`, unassigned) : '');
+  // Unassigned goes first — it's the row a hostess needs most (parties still
+  // needing a table) and previously sat buried below every table in the house.
+  const rows = (unassigned.length ? rowFor(`⚠️ Unassigned`, `${unassigned.length} to seat`, unassigned, true) : '')
+    + tables.map(t => rowFor(t.label, `${t.section||''} · ${t.seats} seats`, list.filter(r => r.table_id === t.id && r.status!=='cancelled'))).join('');
 
   const headerCells = hourMarks.map(m => `<div class="timeline-hour" style="width:${60*PX_PER_MIN}px">${fmtTime(String(Math.floor(m/60)).padStart(2,'0')+':00')}</div>`).join('');
 
