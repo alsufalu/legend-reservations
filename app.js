@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.10';
+const APP_VERSION = '1.14';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -79,19 +79,91 @@ function rangesOverlap(startA, endA, startB, endB){
 // Active reservations already holding a specific table on a given date (DB is the
 // ultimate source of truth via an exclusion constraint — this is for live UI feedback).
 async function fetchDateReservations(dateStr, excludeId){
+  // Includes Unassigned (table_id null) reservations too — simulateAvailability
+  // needs the full picture to know how many of the fitting tables are already
+  // spoken for by other pending bookings, not just ones with a table locked in.
   let q = sb.from('reservations')
     .select('id,table_id,reservation_time,duration_minutes,party_size')
     .eq('reservation_date', dateStr)
-    .not('table_id', 'is', null)
     .in('status', ['pending','confirmed','seated']);
   if (excludeId) q = q.neq('id', excludeId);
   const { data, error } = await q;
   return error ? [] : (data || []);
 }
-function tablesFittingParty(partySize){
+
+// ---- Per-area reservation bookability (weather-dependent / privately-rented areas) ----
+// An area's `bookable` flag is the default; rows in area_availability_overrides flip it
+// for one date — either all day, or scoped to a start_time/end_time window (e.g. block
+// a rented-out Speakeasy from 6–10pm only, or open the Patio on a nice afternoon).
+// Blocked areas are excluded from booking/availability only — the Floor Plan and
+// manual seating still show every table, so walk-ins there stay trackable.
+// Precedence when multiple overrides could apply at the same instant: a time-windowed
+// override beats an all-day override for that area (so "closed all day, open 6-8pm"
+// or "open all day, closed 6-8pm" both work as expected); ties broken by most recent.
+async function getBlockedAreaIds(date, time){
+  const blocked = new Set();
+  if (!date) return blocked;
+  const { data } = await sb.from('area_availability_overrides').select('*').eq('override_date', date).order('created_at');
+  const t = time ? timeToMinutes(time) : null;
+  const bestByArea = {};
+  (data || []).forEach(o => {
+    const isWindow = !!(o.start_time && o.end_time);
+    if (isWindow){
+      if (t === null) return; // no target time given — an all-day check ignores time-scoped overrides
+      const os = timeToMinutes(o.start_time), oe = timeToMinutes(o.end_time);
+      if (!(t >= os && t < oe)) return; // this window doesn't cover the target time
+    }
+    const prev = bestByArea[o.area_id];
+    // Prefer a time-windowed match over an all-day one; otherwise last (most recent) wins.
+    if (!prev || (isWindow && !prev.isWindow) || (isWindow === prev.isWindow)) {
+      bestByArea[o.area_id] = { bookable: o.bookable, isWindow };
+    }
+  });
+  state.areas.forEach(a => {
+    const effective = bestByArea.hasOwnProperty(a.id) ? bestByArea[a.id].bookable : a.bookable;
+    if (!effective) blocked.add(a.id);
+  });
+  return blocked;
+}
+function isTableBookable(t, blockedAreaIds){
+  return !t.area_id || !blockedAreaIds.has(t.area_id);
+}
+
+// Simulates seating every other reservation that overlaps this time window (hard
+// assignments first, then a greedy smallest-fit assignment for Unassigned ones)
+// to figure out how many tables are genuinely still free for a NEW party — so a
+// second unassigned 7-top at the same time correctly sees fewer options than the
+// first one did, instead of every check being evaluated in isolation.
+function simulateAvailability(dateReservations, time, duration, excludeId, blockedAreaIds){
+  const blocked = blockedAreaIds || new Set();
+  const start = timeToMinutes(time), end = start + (Number(duration)||90);
+  const overlapping = dateReservations.filter(r => {
+    if (excludeId && r.id === excludeId) return false;
+    const rs = timeToMinutes(r.reservation_time), re = rs + (r.duration_minutes||90);
+    return rangesOverlap(start, end, rs, re);
+  });
+
+  const consumed = new Set();
+  overlapping.filter(r => r.table_id).forEach(r => {
+    conflictingTableIds(r.table_id).forEach(id => consumed.add(id));
+  });
+
+  const fits = (t, partySize) => partySize >= t.min_party && partySize <= Math.min(t.max_party, t.seats);
+  const unassigned = overlapping.filter(r => !r.table_id).sort((a,b) => b.party_size - a.party_size);
+  unassigned.forEach(r => {
+    const candidate = state.tables
+      .filter(t => t.active && isTableBookable(t, blocked) && !consumed.has(t.id) && fits(t, r.party_size))
+      .sort((a,b) => a.seats - b.seats)[0];
+    if (candidate) conflictingTableIds(candidate.id).forEach(id => consumed.add(id));
+  });
+
+  return state.tables.filter(t => t.active && isTableBookable(t, blocked) && !consumed.has(t.id));
+}
+function tablesFittingParty(partySize, blockedAreaIds){
+  const blocked = blockedAreaIds || new Set();
   // A table's actual seat count is always the hard ceiling, even if max_party
   // was set higher than seats by mistake when the table was configured.
-  return state.tables.filter(t => t.active && partySize >= t.min_party && partySize <= Math.min(t.max_party, t.seats));
+  return state.tables.filter(t => t.active && isTableBookable(t, blocked) && partySize >= t.min_party && partySize <= Math.min(t.max_party, t.seats));
 }
 // ---- Table combinations: predefined pairs/groups that book as one unit ----
 function buildComboMaps(rows){
@@ -110,9 +182,16 @@ async function reloadCombos(){
 // A table and its combo partners can't be double-booked against each other —
 // e.g. booking the "3+4" combo must also block Table 3 and Table 4 individually.
 function conflictingTableIds(tableId){
+  // Full transitive closure over the combo<->member graph: if two combos share
+  // a physical table, the whole connected group is mutually exclusive, not just
+  // each combo's immediate members (mirrors the DB trigger's recursive check).
   const ids = new Set([tableId]);
-  (state.comboMembers[tableId] || []).forEach(id => ids.add(id));
-  (state.memberOfCombos[tableId] || []).forEach(id => ids.add(id));
+  const queue = [tableId];
+  while (queue.length){
+    const cur = queue.pop();
+    const neighbors = [...(state.comboMembers[cur] || []), ...(state.memberOfCombos[cur] || [])];
+    neighbors.forEach(n => { if (!ids.has(n)){ ids.add(n); queue.push(n); } });
+  }
   return ids;
 }
 
@@ -333,6 +412,7 @@ function renderReservationsTab(){
       </div>
       <input type="date" class="search-input" style="margin:0;width:auto" value="${state.selectedDate}" onchange="changeDate(this.value)"/>
       <button class="btn btn-secondary" onclick="changeDate(todayISO())">Today</button>
+      <button class="btn btn-secondary" onclick="openAreaAvailabilityModal()">📅 Area Availability</button>
       <button class="btn btn-primary" onclick="openReservationModal()">+ New Reservation</button>
     </div>
   </div>`;
@@ -365,6 +445,93 @@ function renderReservationsTab(){
 }
 
 window.setResView = function(v){ state.resView = v; render(); };
+
+// Per-day (and optionally per-time-window) override of an area's bookability, e.g.
+// close the Patio for rain, or block the Speakeasy 6pm-11pm only for a rented-out
+// private event while still allowing lunch reservations there earlier that day.
+// Only affects the reservation/availability engine — Floor Plan & seating are untouched.
+window.openAreaAvailabilityModal = async function(){
+  document.getElementById('formModal').classList.remove('hidden');
+  await renderAreaAvailabilityModal();
+};
+
+async function renderAreaAvailabilityModal(){
+  const date = state.selectedDate;
+  const { data } = await sb.from('area_availability_overrides').select('*').eq('override_date', date).order('start_time', { nullsFirst: true });
+  const byArea = {};
+  (data || []).forEach(o => { (byArea[o.area_id] = byArea[o.area_id] || []).push(o); });
+
+  const rows = state.areas.map(a => {
+    const overrides = byArea[a.id] || [];
+    const overrideRows = overrides.map(o => `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;padding:6px 10px;background:var(--gray-bg,#f3f4f6);border-radius:6px;font-size:13px">
+        <span>${o.start_time ? `🕐 ${fmtTime(o.start_time)}–${fmtTime(o.end_time)}` : '🌐 All day'} — ${o.bookable ? '✅ Open' : '⛔ Closed'}</span>
+        <button type="button" class="linkBtn" style="color:var(--danger)" onclick="deleteAreaOverride('${o.id}')">Remove</button>
+      </div>`).join('');
+
+    return `
+    <div class="card" style="margin-bottom:12px;padding:12px">
+      <div><strong>${esc(a.name)}</strong> <span class="panel-sub" style="margin:0">— default: ${a.bookable ? 'Bookable' : 'Not bookable'}</span></div>
+      ${overrideRows}
+      <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
+        <label style="font-size:12px;display:flex;align-items:center;gap:4px">
+          <input type="radio" name="scope_${a.id}" value="allday" checked onchange="toggleOverrideScope('${a.id}')"/> All day
+        </label>
+        <label style="font-size:12px;display:flex;align-items:center;gap:4px">
+          <input type="radio" name="scope_${a.id}" value="window" onchange="toggleOverrideScope('${a.id}')"/> Time window
+        </label>
+        <input type="time" class="modal-input" id="ovStart_${a.id}" style="width:110px;display:none;margin:0" value="18:00"/>
+        <span id="ovDash_${a.id}" style="display:none">–</span>
+        <input type="time" class="modal-input" id="ovEnd_${a.id}" style="width:110px;display:none;margin:0" value="22:00"/>
+        <select class="modal-select" id="ovBookable_${a.id}" style="width:120px;margin:0">
+          <option value="closed">⛔ Closed</option>
+          <option value="open">✅ Open</option>
+        </select>
+        <button type="button" class="btn btn-sm btn-secondary" onclick="addAreaOverride('${a.id}')">+ Add</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('formModalBox').innerHTML = `
+    <h3>Area Availability — ${date}</h3>
+    <p class="panel-sub" style="margin-top:-4px">Override which areas are bookable on this date — all day, or just for a specific time window (e.g. Speakeasy closed 6-11pm for a private event, open the rest of the day). Tables in a closed window still show on the Floor Plan and can be seated as walk-ins — they just won't be offered when booking a reservation for that time.</p>
+    ${state.areas.length ? rows : '<div class="empty-state">No areas defined yet.</div>'}
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Done</button>
+    </div>`;
+}
+
+window.toggleOverrideScope = function(areaId){
+  const isWindow = document.querySelector(`input[name="scope_${areaId}"]:checked`)?.value === 'window';
+  ['ovStart_','ovDash_','ovEnd_'].forEach(prefix => {
+    const el = document.getElementById(`${prefix}${areaId}`);
+    if (el) el.style.display = isWindow ? '' : 'none';
+  });
+};
+
+window.addAreaOverride = async function(areaId){
+  const date = state.selectedDate;
+  const isWindow = document.querySelector(`input[name="scope_${areaId}"]:checked`)?.value === 'window';
+  const bookable = document.getElementById(`ovBookable_${areaId}`).value === 'open';
+  const payload = { area_id: areaId, override_date: date, bookable, start_time: null, end_time: null };
+  if (isWindow){
+    const start = document.getElementById(`ovStart_${areaId}`).value;
+    const end = document.getElementById(`ovEnd_${areaId}`).value;
+    if (!start || !end || start >= end){ alert('Enter a valid start and end time (start before end).'); return; }
+    payload.start_time = start;
+    payload.end_time = end;
+  }
+  const { error } = await sb.from('area_availability_overrides').insert(payload);
+  if (error){ alert('Error: '+error.message); return; }
+  await renderAreaAvailabilityModal();
+  render();
+};
+
+window.deleteAreaOverride = async function(id){
+  await sb.from('area_availability_overrides').delete().eq('id', id);
+  await renderAreaAvailabilityModal();
+  render();
+};
 
 // ---- Timeline: tables as rows, time-of-day across the top, gap/conflict aware ----
 function renderReservationsTimeline(list){
@@ -588,26 +755,30 @@ window.refreshAvailability = async function(preserveSelection){
   const currentVal = preserveSelection !== undefined ? preserveSelection : sel.value;
   const excludeId = document.getElementById('resId')?.value || null;
 
-  const fitting = tablesFittingParty(partySize);
+  const blockedAreaIds = date ? await getBlockedAreaIds(date, time) : new Set();
+  const fitting = tablesFittingParty(partySize, blockedAreaIds);
   const dateReservations = date ? await fetchDateReservations(date, excludeId) : [];
-  const freeFitting = fitting.filter(t => !isTableBusy(t.id, time, duration, dateReservations));
-  const busyFitting = fitting.filter(t => isTableBusy(t.id, time, duration, dateReservations));
+  const stillFree = new Set(simulateAvailability(dateReservations, time, duration, excludeId, blockedAreaIds).map(t => t.id));
+  const freeFitting = fitting.filter(t => stillFree.has(t.id));
+  const busyFitting = fitting.filter(t => !stillFree.has(t.id));
+  const blockedAreaNames = state.areas.filter(a => blockedAreaIds.has(a.id)).map(a => a.name);
 
   sel.innerHTML = `<option value="">Unassigned — assign a table at seating (recommended)</option>`
     + freeFitting.map(t => `<option value="${t.id}">✅ ${esc(tableDisplayLabel(t))} (${t.section||''}, seats ${t.seats})</option>`).join('')
-    + busyFitting.map(t => `<option value="${t.id}">⛔ ${esc(tableDisplayLabel(t))} — booked at that time</option>`).join('');
+    + busyFitting.map(t => `<option value="${t.id}">⛔ ${esc(tableDisplayLabel(t))} — reserved for another party at that time</option>`).join('');
   if ([...sel.options].some(o => o.value === currentVal)) sel.value = currentVal;
 
+  const blockedNote = blockedAreaNames.length ? ` (${blockedAreaNames.join(', ')} not bookable this date)` : '';
   if (noteEl){
     if (!fitting.length){
       noteEl.style.color = 'var(--danger)';
-      noteEl.textContent = `No tables in the house fit a party of ${partySize}.`;
+      noteEl.textContent = `No bookable tables fit a party of ${partySize}${blockedNote}.`;
     } else if (!freeFitting.length){
       noteEl.style.color = 'var(--warn)';
-      noteEl.innerHTML = `⚠️ Fully booked for a party of ${partySize} at that time. <span class="linkBtn" style="cursor:pointer" onclick="waitlistFromReservationModal()">Add to Waitlist instead</span>`;
+      noteEl.innerHTML = `⚠️ Fully booked for a party of ${partySize} at that time${esc(blockedNote)}. <span class="linkBtn" style="cursor:pointer" onclick="waitlistFromReservationModal()">Add to Waitlist instead</span>`;
     } else {
       noteEl.style.color = 'var(--success)';
-      noteEl.textContent = `${freeFitting.length} table${freeFitting.length===1?'':'s'} available for this party size at this time.`;
+      noteEl.textContent = `${freeFitting.length} table${freeFitting.length===1?'':'s'} available for this party size at this time${blockedNote}.`;
     }
   }
 };
@@ -653,6 +824,13 @@ window.saveReservation = async function(id){
   // Hard-assignment defense in depth: re-check the chosen table right before saving
   // (the DB exclusion constraint is the ultimate backstop for race conditions).
   if (tableId){
+    const blockedAreaIds = await getBlockedAreaIds(date, time);
+    const chosenTable = tableById(tableId);
+    if (chosenTable && !isTableBookable(chosenTable, blockedAreaIds)){
+      alert('That table is in an area not bookable for this date (weather-dependent or privately reserved) — pick a different table or leave it Unassigned.');
+      refreshAvailability(tableId);
+      return;
+    }
     const dateReservations = await fetchDateReservations(date, id);
     if (isTableBusy(tableId, time, duration, dateReservations)){
       alert('That table just got booked for an overlapping time — pick a different table or leave it Unassigned.');
@@ -907,6 +1085,10 @@ window.openAreaModal = function(id){
     <label class="field-label">Area name</label>
     <input type="text" class="modal-input" id="areaName" placeholder="e.g. Patio, Main Dining, Private Room" value="${esc(a?.name||'')}"/>
     <p style="font-size:12px;color:var(--gray);margin-top:-4px">Areas are just groupings for filtering tables — everyone shares one floor plan image, set via "🖼 Floor Plan Image" on the toolbar.</p>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:14px 0 4px;">
+      <input type="checkbox" id="areaBookable" ${(a ? a.bookable : true) ? 'checked' : ''}/> Bookable through the reservation system by default
+    </label>
+    <p style="font-size:12px;color:var(--gray);margin-top:0">Turn this off for areas like an uncovered patio that shouldn't be offered when booking (e.g. weather-dependent). Tables here still show on the Floor Plan for walk-ins and status tracking either way. Use "📅 Area Availability" on the Reservations tab to override this for a single day (e.g. blocking a room that's rented for a private party, or opening the patio on a nice day).</p>
     <div class="modal-actions">
       ${a ? `<button class="modal-btn modal-btn-danger" onclick="deleteArea('${a.id}')">Delete Area</button>` : ''}
       <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
@@ -934,11 +1116,12 @@ window.openBackgroundModal = function(){
 
 window.saveArea = async function(id){
   const name = document.getElementById('areaName').value.trim();
+  const bookable = document.getElementById('areaBookable').checked;
   if (!name){ alert('Enter an area name.'); return; }
   if (id){
-    await sb.from('floor_areas').update({ name }).eq('id', id);
+    await sb.from('floor_areas').update({ name, bookable }).eq('id', id);
   } else {
-    const { data, error } = await sb.from('floor_areas').insert({ name, sort_order: state.areas.length }).select().single();
+    const { data, error } = await sb.from('floor_areas').insert({ name, bookable, sort_order: state.areas.length }).select().single();
     if (error){ alert('Error: '+error.message); return; }
     state.currentAreaId = data.id;
   }
