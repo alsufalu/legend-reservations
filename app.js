@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.25';
+const APP_VERSION = '1.26';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -913,6 +913,7 @@ window.openReservationModal = function(id, prefill){
     <label class="field-label">Table</label>
     <select class="modal-select" id="resTable" onchange="onResTableChange()">
       <option value="">Unassigned — assign a table at seating (recommended)</option>
+      ${(!r && prefill?.tableId) ? `<option value="${prefill.tableId}" selected>${esc(tableDisplayLabel(tableById(prefill.tableId)))} (checking availability…)</option>` : ''}
     </select>
     <div id="availabilityNote" class="panel-sub" style="margin:-4px 0 10px"></div>
     <label class="field-label">Occasion (optional)</label>
@@ -983,11 +984,20 @@ window.refreshAvailability = async function(preserveSelection){
   sel.innerHTML = `<option value="">Unassigned — assign a table at seating (recommended)</option>`
     + freeFitting.map(t => `<option value="${t.id}">✅ ${esc(tableDisplayLabel(t))} (${t.section||''}, seats ${t.seats})</option>`).join('')
     + busyFitting.map(t => `<option value="${t.id}">⛔ ${esc(tableDisplayLabel(t))} — reserved for another party at that time</option>`).join('');
-  if ([...sel.options].some(o => o.value === currentVal)) sel.value = currentVal;
+  const stillValid = [...sel.options].some(o => o.value === currentVal);
+  if (stillValid) sel.value = currentVal;
+  // If a table WAS selected but just fell out of the list (party size grew past its
+  // capacity, its area got blocked for this date, etc.), the <select> silently lands
+  // back on "Unassigned" — flag that loudly instead of saving a booking the hostess
+  // didn't actually choose.
+  const droppedTable = (!stillValid && currentVal) ? tableById(currentVal) : null;
 
   const blockedNote = blockedAreaNames.length ? ` (${blockedAreaNames.join(', ')} not bookable this date)` : '';
   if (noteEl){
-    if (!fitting.length){
+    if (droppedTable){
+      noteEl.style.color = 'var(--danger)';
+      noteEl.innerHTML = `⚠️ ${esc(tableDisplayLabel(droppedTable))} no longer fits/is free for this party — cleared to Unassigned. Pick another table below or leave it Unassigned.`;
+    } else if (!fitting.length){
       noteEl.style.color = 'var(--danger)';
       noteEl.textContent = `No bookable tables fit a party of ${partySize}${blockedNote}.`;
     } else if (!freeFitting.length){
