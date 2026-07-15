@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.24';
+const APP_VERSION = '1.25';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -423,6 +423,11 @@ async function loadAll(){
 async function reloadReservationsForDate(){
   const { data } = await sb.from('reservations').select('*').eq('reservation_date', state.selectedDate).order('reservation_time');
   state.reservations = data || [];
+  // The Floor Plan's "Check Availability" preview snapshots reservations for its own
+  // date/time separately from the Reservations tab — without this, a table just
+  // booked from a preview click (or edited/cancelled elsewhere) would keep showing
+  // its old color until the preview date/time was touched again.
+  if (state.previewMode) await loadFloorPreview();
 }
 
 async function logActivity(action, entity_type, entity_id, details){
