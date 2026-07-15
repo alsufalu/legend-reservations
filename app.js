@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.15';
+const APP_VERSION = '1.17';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -164,6 +164,47 @@ function tablesFittingParty(partySize, blockedAreaIds){
   // A table's actual seat count is always the hard ceiling, even if max_party
   // was set higher than seats by mistake when the table was configured.
   return state.tables.filter(t => t.active && isTableBookable(t, blocked) && partySize >= t.min_party && partySize <= Math.min(t.max_party, t.seats));
+}
+
+// ---- Auto-Assign: suggest tables for every still-Unassigned reservation on a date ----
+// Best-fit-decreasing bin packing: biggest parties are placed first (they have the
+// fewest valid tables/combos, so giving them first pick avoids painting the day into
+// a corner where a party of 8 is left with nothing because 2-tops grabbed everything).
+// A predefined table combination is only proposed when no single physical table is
+// big enough on its own — combining tables is a fallback, never the first choice.
+async function computeAutoAssignPlan(date){
+  const dayReservations = state.reservations.filter(r => r.reservation_date === date && r.status !== 'cancelled');
+  const targets = dayReservations
+    .filter(r => !r.table_id && ['pending','confirmed'].includes(r.status))
+    .slice()
+    .sort((a,b) => b.party_size - a.party_size || a.reservation_time.localeCompare(b.reservation_time));
+
+  // consumed[tableId] = minute ranges already spoken for on this date, seeded from
+  // reservations that already have a hard table assignment, then grown as we plan.
+  const consumed = {};
+  const block = (tableId, start, end) => {
+    conflictingTableIds(tableId).forEach(id => (consumed[id] = consumed[id] || []).push({ start, end }));
+  };
+  dayReservations.filter(r => r.table_id).forEach(r => {
+    const start = timeToMinutes(r.reservation_time);
+    block(r.table_id, start, start + (r.duration_minutes || 90));
+  });
+  const isFree = (tableId, start, end) => !(consumed[tableId] || []).some(iv => rangesOverlap(start, end, iv.start, iv.end));
+  const fits = (t, partySize) => partySize >= t.min_party && partySize <= Math.min(t.max_party, t.seats);
+
+  const plan = [];
+  for (const r of targets){
+    const start = timeToMinutes(r.reservation_time);
+    const end = start + (r.duration_minutes || 90);
+    const blockedAreaIds = await getBlockedAreaIds(r.reservation_date, r.reservation_time);
+    const candidates = state.tables
+      .filter(t => t.active && isTableBookable(t, blockedAreaIds) && fits(t, r.party_size) && isFree(t.id, start, end))
+      .sort((a,b) => (a.is_combo === b.is_combo ? a.seats - b.seats : (a.is_combo ? 1 : -1))); // single tables before combos, then smallest-fit
+    const chosen = candidates[0] || null;
+    if (chosen) block(chosen.id, start, end);
+    plan.push({ reservation: r, table: chosen });
+  }
+  return plan;
 }
 // ---- Table combinations: predefined pairs/groups that book as one unit ----
 function buildComboMaps(rows){
@@ -413,6 +454,7 @@ function renderReservationsTab(){
       <input type="date" class="search-input" style="margin:0;width:auto" value="${state.selectedDate}" onchange="changeDate(this.value)"/>
       <button class="btn btn-secondary" onclick="changeDate(todayISO())">Today</button>
       <button class="btn btn-secondary" onclick="openAreaAvailabilityModal()">📅 Area Availability</button>
+      <button class="btn btn-secondary" onclick="openAutoAssignModal()">🪄 Auto-Assign</button>
       <button class="btn btn-primary" onclick="openReservationModal()">+ New Reservation</button>
     </div>
   </div>`;
@@ -533,6 +575,78 @@ window.deleteAreaOverride = async function(id){
   render();
 };
 
+// Auto-Assign review modal: nothing is written to the database until the hostess
+// hits Apply, and each suggestion can be unchecked individually first. Any party
+// whose proposed table is a combo shows the exact member table numbers being
+// combined, both in the row itself and again in a callout, so it's never a surprise.
+window.openAutoAssignModal = async function(){
+  document.getElementById('formModal').classList.remove('hidden');
+  document.getElementById('formModalBox').innerHTML = `<h3>Auto-Assign Tables</h3><p class="panel-sub">Working out the best fit…</p>`;
+  const plan = await computeAutoAssignPlan(state.selectedDate);
+  state._autoAssignPlan = plan;
+  renderAutoAssignModal(plan);
+};
+
+function renderAutoAssignModal(plan){
+  const placed = plan.filter(p => p.table);
+  const unplaced = plan.filter(p => !p.table);
+  const combosUsed = placed.filter(p => p.table.is_combo);
+
+  const rows = plan.map((p, i) => {
+    const g = guestById(p.reservation.guest_id);
+    const r = p.reservation;
+    if (!p.table){
+      return `
+      <div class="card-row" style="padding:8px 0;border-bottom:1px solid var(--border);opacity:.7">
+        <div>
+          <strong>${fmtTime(r.reservation_time)} · ${esc(guestName(g))}</strong> · ${r.party_size} guests
+          <div class="panel-sub" style="margin:0;color:var(--warn)">⚠️ No table or combo currently fits/free — leave Unassigned or seat manually.</div>
+        </div>
+      </div>`;
+    }
+    const isCombo = p.table.is_combo;
+    const memberLabels = isCombo ? (state.comboMembers[p.table.id] || []).map(id => tableById(id)?.label).filter(Boolean) : [];
+    return `
+    <div class="card-row" style="padding:8px 0;border-bottom:1px solid var(--border)">
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+        <input type="checkbox" id="autoAssignChk_${i}" checked/>
+        <div>
+          <strong>${fmtTime(r.reservation_time)} · ${esc(guestName(g))}</strong> · ${r.party_size} guests
+          <div class="panel-sub" style="margin:0">
+            → ${esc(tableDisplayLabel(p.table))}
+            ${isCombo ? `<span style="color:var(--warn);font-weight:700"> — combines tables ${memberLabels.map(esc).join(' + ')}</span>` : ''}
+          </div>
+        </div>
+      </label>
+    </div>`;
+  }).join('');
+
+  document.getElementById('formModalBox').innerHTML = `
+    <h3>Auto-Assign Tables — ${state.selectedDate}</h3>
+    <p class="panel-sub" style="margin-top:-4px">Suggested tables for every Unassigned reservation, largest parties placed first. Single tables are always preferred — a combo is only suggested when no one table is big enough. Nothing is saved until you hit Apply, and you can uncheck any row first.</p>
+    ${combosUsed.length ? `<div class="panel-sub" style="background:#fff7ed;border-radius:8px;padding:8px 12px;color:#92400e;margin-bottom:10px">🔗 ${combosUsed.length} of these will physically combine tables — double-check those are actually pushed together before service: ${combosUsed.map(p => `${esc(guestName(guestById(p.reservation.guest_id)))} → ${(state.comboMembers[p.table.id]||[]).map(id=>esc(tableById(id)?.label||'?')).join(' + ')}`).join('; ')}.</div>` : ''}
+    ${plan.length ? rows : '<div class="empty-state">No Unassigned reservations for this date.</div>'}
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      ${placed.length ? `<button class="modal-btn modal-btn-primary" onclick="applyAutoAssign()">Apply Selected (${placed.length})</button>` : ''}
+    </div>`;
+}
+
+window.applyAutoAssign = async function(){
+  const plan = state._autoAssignPlan || [];
+  const toApply = plan.filter((p, i) => p.table && document.getElementById(`autoAssignChk_${i}`)?.checked);
+  if (!toApply.length){ closeModal('formModal'); return; }
+  let okCount = 0;
+  for (const p of toApply){
+    const { error } = await sb.from('reservations').update({ table_id: p.table.id }).eq('id', p.reservation.id);
+    if (!error) okCount++;
+  }
+  closeModal('formModal');
+  await reloadReservationsForDate();
+  render();
+  alert(`Assigned ${okCount} of ${toApply.length} reservation${toApply.length===1?'':'s'}.${okCount<toApply.length ? ' Some tables were taken in the meantime — re-run Auto-Assign to catch the rest.' : ''}`);
+};
+
 // ---- Timeline: tables as rows, time-of-day across the top, gap/conflict aware ----
 function renderReservationsTimeline(list){
   const PX_PER_MIN = 2.2;
@@ -577,7 +691,7 @@ function renderReservationsTimeline(list){
     const bars = laned.map(({r,start,dur,lane}) => {
       const g = guestById(r.guest_id);
       const top = ROW_PAD + lane*(LANE_H+LANE_GAP);
-      return `<div class="timeline-bar status-${r.status}" style="left:${x(start)}px;width:${Math.max(30,dur*PX_PER_MIN)}px;top:${top}px;height:${LANE_H}px" onclick="openReservationModal('${r.id}')" title="${esc(guestName(g))} · ${r.party_size}p · ${fmtTime(r.reservation_time)}">${esc(guestName(g))} · ${r.party_size}p</div>`;
+      return `<div class="timeline-bar status-${r.status}" style="left:${x(start)}px;width:${Math.max(30,dur*PX_PER_MIN)}px;top:${top}px;height:${LANE_H}px" onclick="openReservationModal('${r.id}')" title="${esc(guestName(g))} · ${r.party_size}p · ${fmtTime(r.reservation_time)}">${fmtTime(r.reservation_time)} · ${esc(guestName(g))} · ${r.party_size}p</div>`;
     }).join('');
     const gaps = [];
     for (let i=0;i<sorted.length-1;i++){
@@ -597,7 +711,7 @@ function renderReservationsTimeline(list){
   // Unassigned goes first — it's the row a hostess needs most (parties still
   // needing a table) and previously sat buried below every table in the house.
   const rows = (unassigned.length ? rowFor(`⚠️ Unassigned`, `${unassigned.length} to seat`, unassigned, true) : '')
-    + tables.map(t => rowFor(t.label, `${t.section||''} · ${t.seats} seats`, list.filter(r => r.table_id === t.id && r.status!=='cancelled'))).join('');
+    + tables.map(t => rowFor(tableDisplayLabel(t), `${t.section||''} · ${t.seats} seats`, list.filter(r => r.table_id === t.id && r.status!=='cancelled'))).join('');
 
   const headerCells = hourMarks.map(m => `<div class="timeline-hour" style="width:${60*PX_PER_MIN}px">${fmtTime(String(Math.floor(m/60)).padStart(2,'0')+':00')}</div>`).join('');
 
@@ -612,7 +726,7 @@ function renderReservationsTimeline(list){
     <div style="position:relative">
       <div class="timeline-header">
         <div class="timeline-corner"></div>
-        <div>${headerCells}</div>
+        <div class="timeline-header-hours">${headerCells}</div>
       </div>
       ${rows || '<div class="empty-state">No active tables to show.</div>'}
       ${nowLine}
