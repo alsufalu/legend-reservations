@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.23';
+const APP_VERSION = '1.24';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -40,6 +40,10 @@ let state = {
   currentAreaId: '__all',
   editMode: false,
   serverView: false,
+  previewMode: false,       // Floor Plan: live status vs. "what's free at this date/time" projection
+  previewDate: todayISO(),
+  previewTime: '',          // set lazily to "now" the first time preview mode turns on
+  previewData: null,        // { busyByTable: Map<tableId,{res,start,end}>, blockedAreaIds: Set }
   serverSections: [],
   comboMembers: {},   // comboTableId -> [memberTableId, ...]
   memberOfCombos: {}, // memberTableId -> [comboTableId, ...]
@@ -81,6 +85,10 @@ function timeToMinutes(t){
   const [h,m] = t.split(':').map(Number);
   return h*60 + m;
 }
+function minutesToTimeStr(mins){
+  const h = Math.floor(mins/60) % 24, m = mins % 60;
+  return String(h).padStart(2,'0') + ':' + String(m).padStart(2,'0');
+}
 function rangesOverlap(startA, endA, startB, endB){
   return startA < endB && startB < endA;
 }
@@ -91,7 +99,7 @@ async function fetchDateReservations(dateStr, excludeId){
   // needs the full picture to know how many of the fitting tables are already
   // spoken for by other pending bookings, not just ones with a table locked in.
   let q = sb.from('reservations')
-    .select('id,table_id,reservation_time,duration_minutes,party_size')
+    .select('id,table_id,reservation_time,duration_minutes,party_size,guest_id,status')
     .eq('reservation_date', dateStr)
     .in('status', ['pending','confirmed','seated']);
   if (excludeId) q = q.neq('id', excludeId);
@@ -845,7 +853,7 @@ window.confirmSeat = async function(id){
   render();
 };
 
-window.openReservationModal = function(id){
+window.openReservationModal = function(id, prefill){
   const r = id ? state.reservations.find(x => x.id === id) : null;
   const g = r ? guestById(r.guest_id) : null;
   state._resDurationTouched = false; // reset so the first area/table pick can still suggest a default duration
@@ -870,11 +878,11 @@ window.openReservationModal = function(id){
     <div class="formgrid">
       <div>
         <label class="field-label">Date</label>
-        <input type="date" class="modal-input" id="resDate" value="${r?.reservation_date || state.selectedDate}" onchange="refreshAvailability()"/>
+        <input type="date" class="modal-input" id="resDate" value="${r?.reservation_date || prefill?.date || state.selectedDate}" onchange="refreshAvailability()"/>
       </div>
       <div>
         <label class="field-label">Time</label>
-        <input type="time" class="modal-input" id="resTime" value="${r?.reservation_time?.slice(0,5) || '18:00'}" onchange="refreshAvailability()"/>
+        <input type="time" class="modal-input" id="resTime" value="${r?.reservation_time?.slice(0,5) || prefill?.time || '18:00'}" onchange="refreshAvailability()"/>
       </div>
     </div>
     <div class="formgrid">
@@ -882,12 +890,15 @@ window.openReservationModal = function(id){
         <label class="field-label">Area <span style="font-weight:400;color:var(--gray)">(sets default duration)</span></label>
         <select class="modal-select" id="resArea" onchange="onResAreaChange()">
           <option value="">No preference</option>
-          ${state.areas.map(a => `<option value="${a.id}" ${(r?.table_id && tableById(r.table_id)?.area_id===a.id) ? 'selected':''}>${esc(a.name)}</option>`).join('')}
+          ${state.areas.map(a => {
+            const preselectedAreaId = (r?.table_id && tableById(r.table_id)?.area_id) || (prefill?.tableId && tableById(prefill.tableId)?.area_id);
+            return `<option value="${a.id}" ${preselectedAreaId===a.id ? 'selected':''}>${esc(a.name)}</option>`;
+          }).join('')}
         </select>
       </div>
       <div>
         <label class="field-label">Duration (minutes)</label>
-        <input type="number" min="15" step="15" class="modal-input" id="resDuration" value="${r?.duration_minutes || 90}" oninput="state._resDurationTouched=true" onchange="refreshAvailability()"/>
+        <input type="number" min="15" step="15" class="modal-input" id="resDuration" value="${r?.duration_minutes || (prefill?.tableId && tableById(prefill.tableId)?.area_id ? (state.areas.find(a=>a.id===tableById(prefill.tableId).area_id)?.default_duration_minutes || 90) : 90)}" oninput="state._resDurationTouched=true" onchange="refreshAvailability()"/>
       </div>
     </div>
     <label class="field-label">Source</label>
@@ -909,7 +920,7 @@ window.openReservationModal = function(id){
       <button class="modal-btn modal-btn-primary" onclick="saveReservation(${r ? `'${r.id}'` : 'null'})">Save</button>
     </div>`;
   document.getElementById('formModal').classList.remove('hidden');
-  refreshAvailability(r?.table_id || '');
+  refreshAvailability(r?.table_id || prefill?.tableId || '');
 };
 
 // Suggests each area's configured default duration the moment a hostess indicates
@@ -1120,23 +1131,45 @@ function renderFloorPlanTab(){
   const bgStyle = state.floorPlan.background_image_url ? `background-image:url('${esc(state.floorPlan.background_image_url)}');background-size:100% 100%;background-position:center;` : '';
 
   const sc = statusColors();
+  const preview = state.previewMode ? state.previewData : null;
   const tableEls = tablesInArea.map(t => {
     const occ = activeRes.find(r => r.table_id === t.id);
-    const dragAttr = state.editMode ? `onpointerdown="startDragTable(event,'${t.id}')"` : `onclick="cycleTableStatus('${t.id}')"`;
-    const areaName = state.areas.find(a => a.id === t.area_id)?.name;
-    const section = state.serverSections.find(s => s.id === t.server_section_id);
-    const server = section ? state.staffList.find(s => s.id === section.assigned_staff_id) : null;
-    const statusColor = sc[t.status] || STATUS_COLORS_DEFAULT.dirty;
-    const colorStyle = state.serverView
-      ? (section ? `border-color:${section.color};background:${section.color}22;` : 'opacity:.45;')
-      : `border-color:${statusColor};background:${statusColor}22;`;
+    let dragAttr, colorStyle, metaHtml;
+
+    if (state.previewMode){
+      dragAttr = state.editMode ? `onpointerdown="startDragTable(event,'${t.id}')"` : `onclick="onPreviewTableClick('${t.id}')"`;
+      if (!preview){
+        colorStyle = `border-color:#c9ced6;background:#c9ced622;opacity:.6;`;
+        metaHtml = `<div class="ft-meta">${t.seats} seats</div><div class="ft-meta">Loading…</div>`;
+      } else {
+        const blocked = !isTableBookable(t, preview.blockedAreaIds);
+        const busy = preview.busyByTable.get(t.id);
+        const previewColor = blocked ? '#9aa3b0' : (busy ? (sc.seated || STATUS_COLORS_DEFAULT.seated) : (sc.available || STATUS_COLORS_DEFAULT.available));
+        colorStyle = `border-color:${previewColor};background:${previewColor}${blocked?'33':'22'};${blocked?'opacity:.6;':''}`;
+        metaHtml = `<div class="ft-meta">${t.seats} seats</div>`
+          + (blocked ? `<div class="ft-meta">Not bookable</div>`
+            : busy ? `<div class="ft-meta">Reserved ${fmtTime(busy.res.reservation_time)}–${fmtTime(minutesToTimeStr(busy.end))}</div><div class="ft-meta">${esc(guestName(guestById(busy.res.guest_id)))} · ${busy.res.party_size}p</div>`
+            : `<div class="ft-meta">Free at ${fmtTime(state.previewTime)}</div>`);
+      }
+    } else {
+      dragAttr = state.editMode ? `onpointerdown="startDragTable(event,'${t.id}')"` : `onclick="cycleTableStatus('${t.id}')"`;
+      const areaName = state.areas.find(a => a.id === t.area_id)?.name;
+      const section = state.serverSections.find(s => s.id === t.server_section_id);
+      const server = section ? state.staffList.find(s => s.id === section.assigned_staff_id) : null;
+      const statusColor = sc[t.status] || STATUS_COLORS_DEFAULT.dirty;
+      colorStyle = state.serverView
+        ? (section ? `border-color:${section.color};background:${section.color}22;` : 'opacity:.45;')
+        : `border-color:${statusColor};background:${statusColor}22;`;
+      metaHtml = state.serverView
+        ? `<div class="ft-meta">${section ? esc(section.name) : 'No section'}</div>${server ? `<div class="ft-meta">${esc(server.name)}</div>` : ''}`
+        : `<div class="ft-meta">${t.seats} seats</div>${showingAll && areaName ? `<div class="ft-meta">${esc(areaName)}</div>` : ''}${occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>` : ''}`;
+    }
+
     return `
       <div id="tbl-${t.id}" class="floor-table shape-${t.shape}" ${dragAttr}
            style="left:${t.pos_x}px;top:${t.pos_y}px;width:${t.width}px;height:${t.height}px;${colorStyle}">
         <div class="ft-name">${esc(t.label)}</div>
-        ${state.serverView
-          ? `<div class="ft-meta">${section ? esc(section.name) : 'No section'}</div>${server ? `<div class="ft-meta">${esc(server.name)}</div>` : ''}`
-          : `<div class="ft-meta">${t.seats} seats</div>${showingAll && areaName ? `<div class="ft-meta">${esc(areaName)}</div>` : ''}${occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>` : ''}`}
+        ${metaHtml}
         ${state.editMode ? `<div class="resize-handle" onpointerdown="startResizeTable(event,'${t.id}')" title="Drag to resize"></div>` : ''}
       </div>`;
   }).join('');
@@ -1145,16 +1178,27 @@ function renderFloorPlanTab(){
     <button class="btn btn-secondary btn-sm" onclick="openBackgroundModal()">🖼 Floor Plan Image</button>
     ${area ? `<button class="btn btn-secondary btn-sm" onclick="openAreaModal('${area.id}')">✏️ Rename Area</button>` : ''}
     ${state.editMode ? `<button class="btn btn-primary btn-sm" onclick="addTableToCanvas()">+ Add Table</button>` : ''}
+    <button class="btn ${state.previewMode?'btn-success':'btn-secondary'} btn-sm" onclick="togglePreviewMode()">🕐 Check Availability</button>
     <button class="btn ${state.serverView?'btn-success':'btn-secondary'} btn-sm" onclick="toggleServerView()">🎨 Server View</button>
     <button class="btn ${state.editMode?'btn-success':'btn-secondary'} btn-sm" onclick="toggleEditMode()">${state.editMode ? '✅ Done Editing' : '✏️ Edit Layout'}</button>
   `;
 
+  const previewBar = state.previewMode ? `
+    <div class="floor-toolbar" style="margin-bottom:12px;background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:10px 12px;">
+      <span style="font-weight:700;font-size:13px;">🕐 Checking availability for:</span>
+      <input type="date" class="modal-input" style="margin:0;width:auto" value="${state.previewDate}" onchange="setPreviewDateTime('date', this.value)"/>
+      <input type="time" class="modal-input" style="margin:0;width:auto" value="${state.previewTime}" onchange="setPreviewDateTime('time', this.value)"/>
+      <button class="btn btn-secondary btn-sm" onclick="jumpPreviewToNow()">Now</button>
+      <span class="panel-sub" style="margin:0">Green = free, red = reserved, gray = area not bookable that date. Tap a free table to book it, tap a reserved one to see/edit that reservation.</span>
+    </div>` : '';
+
   return `
   <div class="panel-header">
-    <div><h2 class="panel-title">Floor Plan</h2><div class="panel-sub">${state.editMode ? 'Drag tables to reposition. Tap a table to rename, resize, or delete.' : 'Tap a table to cycle its status.'}</div></div>
+    <div><h2 class="panel-title">Floor Plan</h2><div class="panel-sub">${state.previewMode ? 'Availability preview — tap a table to book or view its reservation.' : state.editMode ? 'Drag tables to reposition. Tap a table to rename, resize, or delete.' : 'Tap a table to cycle its status.'}</div></div>
     <div class="floor-toolbar">${toolbar}</div>
   </div>
   <div class="area-tabs" style="margin-bottom:14px">${areaTabs}</div>
+  ${previewBar}
   ${renderFloorLegend(sc)}
   ${state.editMode ? `<div class="edit-mode-banner">✏️ Edit Layout is on — drag tables anywhere on the canvas. Changes save automatically.</div>` : ''}
   <div class="floor-canvas-wrap" id="floorCanvasWrap">
@@ -1169,6 +1213,13 @@ function renderFloorPlanTab(){
 // legend while Server View is on (since colors mean something different in that mode).
 // Colors themselves are editable in Settings > Table Status Colors.
 function renderFloorLegend(sc){
+  if (state.previewMode){
+    return `<div class="floor-legend">
+      <span class="legend-chip"><span class="legend-swatch" style="background:${sc.available||STATUS_COLORS_DEFAULT.available}"></span>Free</span>
+      <span class="legend-chip"><span class="legend-swatch" style="background:${sc.seated||STATUS_COLORS_DEFAULT.seated}"></span>Reserved</span>
+      <span class="legend-chip"><span class="legend-swatch" style="background:#9aa3b0"></span>Not bookable that date</span>
+    </div>`;
+  }
   if (state.serverView){
     if (!state.serverSections.length) return `<div class="panel-sub" style="margin-bottom:10px">No server sections defined yet — add some in Settings.</div>`;
     return `<div class="floor-legend">${state.serverSections.map(s => `<span class="legend-chip"><span class="legend-swatch" style="background:${esc(s.color)}"></span>${esc(s.name)}</span>`).join('')}<span class="legend-chip"><span class="legend-swatch" style="background:#ccc;opacity:.45"></span>No section</span></div>`;
@@ -1179,6 +1230,73 @@ function renderFloorLegend(sc){
 window.switchArea = function(id){ state.editMode = false; state.currentAreaId = id; render(); };
 window.toggleEditMode = function(){ state.editMode = !state.editMode; render(); };
 window.toggleServerView = function(){ state.serverView = !state.serverView; render(); };
+
+// ---- Floor Plan availability preview: "what's free if someone calls right now,
+// or at 7:30pm on the 20th" — colors tables by projected occupancy for a chosen
+// date/time instead of their live physical status. Reuses the same reservation
+// data + combo-conflict + area-bookability logic as the booking engine itself, so
+// this always agrees with what the Reservations tab would actually offer.
+function nowHHMM(){
+  const d = new Date();
+  return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+}
+window.togglePreviewMode = async function(){
+  state.previewMode = !state.previewMode;
+  if (state.previewMode){
+    if (!state.previewTime) state.previewTime = nowHHMM();
+    state.previewData = null; // show a neutral loading state instead of a stale/empty preview
+    render();
+    await loadFloorPreview();
+  }
+  render();
+};
+window.jumpPreviewToNow = async function(){
+  state.previewDate = todayISO();
+  state.previewTime = nowHHMM();
+  await loadFloorPreview();
+  render();
+};
+window.setPreviewDateTime = async function(field, value){
+  if (field === 'date') state.previewDate = value; else state.previewTime = value;
+  await loadFloorPreview();
+  render();
+};
+async function loadFloorPreview(){
+  const targetMin = timeToMinutes(state.previewTime);
+  const dateReservations = await fetchDateReservations(state.previewDate, null);
+  const busyByTable = new Map();
+  dateReservations.forEach(r => {
+    if (!r.table_id) return;
+    const start = timeToMinutes(r.reservation_time);
+    const end = start + (r.duration_minutes || 90);
+    if (targetMin >= start && targetMin < end){
+      conflictingTableIds(r.table_id).forEach(id => {
+        // If a combo's member tables are each individually double-booked somehow,
+        // keep whichever reservation actually starts soonest relative to now.
+        const existing = busyByTable.get(id);
+        if (!existing || start < existing.start) busyByTable.set(id, { res: r, start, end });
+      });
+    }
+  });
+  const blockedAreaIds = await getBlockedAreaIds(state.previewDate, state.previewTime);
+  state.previewData = { busyByTable, blockedAreaIds };
+}
+
+window.onPreviewTableClick = function(tableId){
+  const t = tableById(tableId);
+  const pd = state.previewData;
+  if (!t || !pd) return;
+  if (!isTableBookable(t, pd.blockedAreaIds)){
+    alert(`${t.label} is in an area not bookable for ${state.previewDate}. Check "📅 Area Availability" on the Reservations tab to see or change why.`);
+    return;
+  }
+  const busy = pd.busyByTable.get(tableId);
+  if (busy){
+    openReservationModal(busy.res.id);
+  } else {
+    openReservationModal(null, { date: state.previewDate, time: state.previewTime, tableId });
+  }
+};
 
 // Zoom/pan the canvas to fit the bounding box of whichever area's tables are
 // currently in view, so filtering by area frames just that part of the sketch.
