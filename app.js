@@ -6,9 +6,16 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.19';
+const APP_VERSION = '1.23';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// Table status color legend — customizable in Settings, persisted on
+// floor_plan_settings.status_colors. This default mirrors the original hardcoded
+// CSS colors so nothing changes visually until someone edits a color.
+const STATUS_LABELS = { available:'Available', reserved:'Reserved', seated:'Seated', dirty:'Needs Bussing', blocked:'Blocked / Out of Service' };
+const STATUS_COLORS_DEFAULT = { available:'#16a34a', reserved:'#d97706', seated:'#dc2626', dirty:'#8492a6', blocked:'#9aa3b0' };
+function statusColors(){ return { ...STATUS_COLORS_DEFAULT, ...(state.floorPlan?.status_colors || {}) }; }
 
 // Show the version on the login screen and in the app topbar. No index.html edits
 // needed for future bumps — just change APP_VERSION above and re-upload app.js.
@@ -25,6 +32,7 @@ let _authMode = 'signin';
 let state = {
   tab: 'reservations',
   resView: 'list',
+  timelinePartySize: '', // '' = show every table; otherwise filter Timeline rows to tables that fit this many guests
   selectedDate: todayISO(),
   reservations: [],
   tables: [],
@@ -451,6 +459,7 @@ function renderReservationsTab(){
         <button class="view-toggle-btn ${state.resView!=='timeline'?'active':''}" onclick="setResView('list')">📋 List</button>
         <button class="view-toggle-btn ${state.resView==='timeline'?'active':''}" onclick="setResView('timeline')">🕐 Timeline</button>
       </div>
+      ${state.resView==='timeline' ? renderPartySizeFilterSelect() : ''}
       <input type="date" class="search-input" style="margin:0;width:auto" value="${state.selectedDate}" onchange="changeDate(this.value)"/>
       <button class="btn btn-secondary" onclick="changeDate(todayISO())">Today</button>
       <button class="btn btn-secondary" onclick="openAreaAvailabilityModal()">📅 Area Availability</button>
@@ -487,6 +496,20 @@ function renderReservationsTab(){
 }
 
 window.setResView = function(v){ state.resView = v; render(); };
+
+// Party-size filter for the Timeline: narrows the table rows down to just the ones
+// that could actually seat a party of that size, so a manager can answer "what's
+// open for a 6-top right now" at a glance instead of scanning every table.
+function renderPartySizeFilterSelect(){
+  const maxSize = Math.max(2, ...state.tables.filter(t=>t.active).map(t => Math.min(t.max_party, t.seats)));
+  const options = Array.from({length: maxSize}, (_, i) => i+1);
+  return `
+    <select class="modal-select" style="margin:0;width:auto" onchange="setTimelinePartySize(this.value)">
+      <option value="">All tables</option>
+      ${options.map(n => `<option value="${n}" ${String(n)===String(state.timelinePartySize)?'selected':''}>Fits ${n} guest${n===1?'':'s'}</option>`).join('')}
+    </select>`;
+}
+window.setTimelinePartySize = function(v){ state.timelinePartySize = v; render(); };
 
 // Per-day (and optionally per-time-window) override of an area's bookability, e.g.
 // close the Patio for rain, or block the Speakeasy 6pm-11pm only for a rented-out
@@ -664,8 +687,11 @@ function renderReservationsTimeline(list){
   const hourMarks = [];
   for (let m = Math.ceil(rangeStart/60)*60; m <= rangeEnd; m += 60) hourMarks.push(m);
 
-  const tables = state.tables.filter(t => t.active).slice().sort((a,b) => (a.section||'').localeCompare(b.section||'') || a.label.localeCompare(b.label));
-  const unassigned = list.filter(r => !r.table_id && !['cancelled'].includes(r.status));
+  const partyFilter = state.timelinePartySize ? Number(state.timelinePartySize) : null;
+  const fitsFilter = t => !partyFilter || (partyFilter >= t.min_party && partyFilter <= Math.min(t.max_party, t.seats));
+
+  const tables = state.tables.filter(t => t.active && fitsFilter(t)).slice().sort((a,b) => (a.section||'').localeCompare(b.section||'') || a.label.localeCompare(b.label));
+  const unassigned = list.filter(r => !r.table_id && !['cancelled'].includes(r.status) && (!partyFilter || r.party_size === partyFilter));
 
   const nowMin = (() => {
     const now = new Date();
@@ -717,7 +743,11 @@ function renderReservationsTimeline(list){
   const rows = (unassigned.length ? rowFor(`⚠️ Unassigned`, `${unassigned.length} to seat`, unassigned, true) : '')
     + tables.map(t => rowFor(tableDisplayLabel(t), `${t.section||''} · ${t.seats} seats`, list.filter(r => r.table_id === t.id && r.status!=='cancelled'))).join('');
 
-  const headerCells = hourMarks.map(m => `<div class="timeline-hour" style="width:${60*PX_PER_MIN}px">${fmtTime(String(Math.floor(m/60)).padStart(2,'0')+':00')}</div>`).join('');
+  // Positioned with the exact same x(m) function used for the reservation bars below
+  // (rather than laid out sequentially via flex) so the ruler can never drift out of
+  // sync with the bars — flex layout assumed each cell started exactly on the hour,
+  // but rangeStart is offset by a 30-min buffer, silently shifting every hour label.
+  const headerCells = hourMarks.map(m => `<div class="timeline-hour" style="position:absolute;left:${x(m)}px;width:${60*PX_PER_MIN}px">${fmtTime(String(Math.floor(m/60)).padStart(2,'0')+':00')}</div>`).join('');
 
   // "Now" line spans the full height of the grid — placed once on the shared
   // relatively-positioned wrapper so it isn't clipped to a single row.
@@ -725,14 +755,19 @@ function renderReservationsTimeline(list){
   const nowLine = nowMin!=null && nowMin>=rangeStart && nowMin<=rangeEnd
     ? `<div class="timeline-now-line" style="left:${LABEL_COL_W + x(nowMin)}px" title="Now"></div>` : '';
 
+  const filterNote = partyFilter
+    ? `<div class="panel-sub" style="margin-bottom:8px">Showing ${tables.length} table${tables.length===1?'':'s'} that fit${tables.length===1?'s':''} ${partyFilter} guest${partyFilter===1?'':'s'} — any open stretch on a row is free for that party size. <span class="linkBtn" style="cursor:pointer" onclick="setTimelinePartySize('')">Clear filter</span></div>`
+    : '';
+
   return `
+  ${filterNote}
   <div class="timeline-wrap">
     <div style="position:relative">
       <div class="timeline-header">
         <div class="timeline-corner"></div>
-        <div class="timeline-header-hours">${headerCells}</div>
+        <div class="timeline-header-hours" style="width:${totalW}px">${headerCells}</div>
       </div>
-      ${rows || '<div class="empty-state">No active tables to show.</div>'}
+      ${rows || '<div class="empty-state">No tables fit that party size.</div>'}
       ${nowLine}
     </div>
   </div>
@@ -813,6 +848,7 @@ window.confirmSeat = async function(id){
 window.openReservationModal = function(id){
   const r = id ? state.reservations.find(x => x.id === id) : null;
   const g = r ? guestById(r.guest_id) : null;
+  state._resDurationTouched = false; // reset so the first area/table pick can still suggest a default duration
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
     <h3>${r ? 'Edit' : 'New'} Reservation</h3>
@@ -843,18 +879,23 @@ window.openReservationModal = function(id){
     </div>
     <div class="formgrid">
       <div>
-        <label class="field-label">Duration (minutes)</label>
-        <input type="number" min="15" step="15" class="modal-input" id="resDuration" value="${r?.duration_minutes || 90}" onchange="refreshAvailability()"/>
-      </div>
-      <div>
-        <label class="field-label">Source</label>
-        <select class="modal-select" id="resSource">
-          ${['phone','walk-in','online','website','other'].map(s => `<option value="${s}" ${s===(r?.source||'phone')?'selected':''}>${s}</option>`).join('')}
+        <label class="field-label">Area <span style="font-weight:400;color:var(--gray)">(sets default duration)</span></label>
+        <select class="modal-select" id="resArea" onchange="onResAreaChange()">
+          <option value="">No preference</option>
+          ${state.areas.map(a => `<option value="${a.id}" ${(r?.table_id && tableById(r.table_id)?.area_id===a.id) ? 'selected':''}>${esc(a.name)}</option>`).join('')}
         </select>
       </div>
+      <div>
+        <label class="field-label">Duration (minutes)</label>
+        <input type="number" min="15" step="15" class="modal-input" id="resDuration" value="${r?.duration_minutes || 90}" oninput="state._resDurationTouched=true" onchange="refreshAvailability()"/>
+      </div>
     </div>
+    <label class="field-label">Source</label>
+    <select class="modal-select" id="resSource">
+      ${['phone','walk-in','online','website','other'].map(s => `<option value="${s}" ${s===(r?.source||'phone')?'selected':''}>${s}</option>`).join('')}
+    </select>
     <label class="field-label">Table</label>
-    <select class="modal-select" id="resTable" onchange="refreshAvailability()">
+    <select class="modal-select" id="resTable" onchange="onResTableChange()">
       <option value="">Unassigned — assign a table at seating (recommended)</option>
     </select>
     <div id="availabilityNote" class="panel-sub" style="margin:-4px 0 10px"></div>
@@ -869,6 +910,30 @@ window.openReservationModal = function(id){
     </div>`;
   document.getElementById('formModal').classList.remove('hidden');
   refreshAvailability(r?.table_id || '');
+};
+
+// Suggests each area's configured default duration the moment a hostess indicates
+// where the party will sit — either by picking a specific table, or just an area
+// while leaving the table Unassigned. Never overwrites a duration the hostess
+// already typed by hand (tracked via state._resDurationTouched).
+function applyAreaDefaultDuration(areaId){
+  if (state._resDurationTouched || !areaId) return;
+  const a = state.areas.find(x => x.id === areaId);
+  const el = document.getElementById('resDuration');
+  if (a && el) el.value = a.default_duration_minutes || 90;
+}
+window.onResAreaChange = function(){
+  applyAreaDefaultDuration(document.getElementById('resArea').value);
+};
+window.onResTableChange = function(){
+  const tableId = document.getElementById('resTable').value;
+  const t = tableId ? tableById(tableId) : null;
+  if (t?.area_id){
+    const areaSel = document.getElementById('resArea');
+    if (areaSel) areaSel.value = t.area_id;
+    applyAreaDefaultDuration(t.area_id);
+  }
+  refreshAvailability();
 };
 
 window.waitlistFromReservationModal = function(){
@@ -1054,15 +1119,19 @@ function renderFloorPlanTab(){
   const canvasH = state.floorPlan.canvas_height || 800;
   const bgStyle = state.floorPlan.background_image_url ? `background-image:url('${esc(state.floorPlan.background_image_url)}');background-size:100% 100%;background-position:center;` : '';
 
+  const sc = statusColors();
   const tableEls = tablesInArea.map(t => {
     const occ = activeRes.find(r => r.table_id === t.id);
     const dragAttr = state.editMode ? `onpointerdown="startDragTable(event,'${t.id}')"` : `onclick="cycleTableStatus('${t.id}')"`;
     const areaName = state.areas.find(a => a.id === t.area_id)?.name;
     const section = state.serverSections.find(s => s.id === t.server_section_id);
     const server = section ? state.staffList.find(s => s.id === section.assigned_staff_id) : null;
-    const colorStyle = state.serverView && section ? `border-color:${section.color};background:${section.color}22;` : (state.serverView ? 'opacity:.45;' : '');
+    const statusColor = sc[t.status] || STATUS_COLORS_DEFAULT.dirty;
+    const colorStyle = state.serverView
+      ? (section ? `border-color:${section.color};background:${section.color}22;` : 'opacity:.45;')
+      : `border-color:${statusColor};background:${statusColor}22;`;
     return `
-      <div id="tbl-${t.id}" class="floor-table shape-${t.shape} ${state.serverView ? '' : 'status-'+t.status}" ${dragAttr}
+      <div id="tbl-${t.id}" class="floor-table shape-${t.shape}" ${dragAttr}
            style="left:${t.pos_x}px;top:${t.pos_y}px;width:${t.width}px;height:${t.height}px;${colorStyle}">
         <div class="ft-name">${esc(t.label)}</div>
         ${state.serverView
@@ -1086,6 +1155,7 @@ function renderFloorPlanTab(){
     <div class="floor-toolbar">${toolbar}</div>
   </div>
   <div class="area-tabs" style="margin-bottom:14px">${areaTabs}</div>
+  ${renderFloorLegend(sc)}
   ${state.editMode ? `<div class="edit-mode-banner">✏️ Edit Layout is on — drag tables anywhere on the canvas. Changes save automatically.</div>` : ''}
   <div class="floor-canvas-wrap" id="floorCanvasWrap">
     <div id="floorCanvas" class="floor-canvas" style="width:${canvasW}px;height:${canvasH}px;${bgStyle}">
@@ -1093,6 +1163,17 @@ function renderFloorPlanTab(){
     </div>
   </div>
   ${!showingAll ? `<div class="panel-sub" style="margin-top:8px">🔍 Zoomed to ${area?esc(area.name):'Unassigned'}. <span class="linkBtn" style="cursor:pointer" onclick="switchArea('__all')">View full floor plan</span></div>` : ''}`;
+}
+
+// Shows what the table colors mean — the status legend normally, or a per-server
+// legend while Server View is on (since colors mean something different in that mode).
+// Colors themselves are editable in Settings > Table Status Colors.
+function renderFloorLegend(sc){
+  if (state.serverView){
+    if (!state.serverSections.length) return `<div class="panel-sub" style="margin-bottom:10px">No server sections defined yet — add some in Settings.</div>`;
+    return `<div class="floor-legend">${state.serverSections.map(s => `<span class="legend-chip"><span class="legend-swatch" style="background:${esc(s.color)}"></span>${esc(s.name)}</span>`).join('')}<span class="legend-chip"><span class="legend-swatch" style="background:#ccc;opacity:.45"></span>No section</span></div>`;
+  }
+  return `<div class="floor-legend">${Object.keys(STATUS_LABELS).map(k => `<span class="legend-chip"><span class="legend-swatch" style="background:${sc[k]}"></span>${STATUS_LABELS[k]}</span>`).join('')}<span class="panel-sub" style="margin:0 0 0 4px">Customize these in Settings → Table Status Colors.</span></div>`;
 }
 
 window.switchArea = function(id){ state.editMode = false; state.currentAreaId = id; render(); };
@@ -1225,6 +1306,9 @@ window.openAreaModal = function(id){
       <input type="checkbox" id="areaBookable" ${(a ? a.bookable : true) ? 'checked' : ''}/> Bookable through the reservation system by default
     </label>
     <p style="font-size:12px;color:var(--gray);margin-top:0">Turn this off for areas like an uncovered patio that shouldn't be offered when booking (e.g. weather-dependent). Tables here still show on the Floor Plan for walk-ins and status tracking either way. Use "📅 Area Availability" on the Reservations tab to override this for a single day (e.g. blocking a room that's rented for a private party, or opening the patio on a nice day).</p>
+    <label class="field-label">Default reservation duration (minutes)</label>
+    <input type="number" min="15" step="15" max="480" class="modal-input" id="areaDefaultDuration" value="${a?.default_duration_minutes || 90}"/>
+    <p style="font-size:12px;color:var(--gray);margin-top:-4px">Pre-fills the Duration field on new reservations once a table in this area is picked (e.g. Bar seats might turn in 60 min, a Speakeasy table might run 120). Can always be overridden per reservation.</p>
     <div class="modal-actions">
       ${a ? `<button class="modal-btn modal-btn-danger" onclick="deleteArea('${a.id}')">Delete Area</button>` : ''}
       <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
@@ -1253,16 +1337,32 @@ window.openBackgroundModal = function(){
 window.saveArea = async function(id){
   const name = document.getElementById('areaName').value.trim();
   const bookable = document.getElementById('areaBookable').checked;
+  const default_duration_minutes = Number(document.getElementById('areaDefaultDuration').value) || 90;
   if (!name){ alert('Enter an area name.'); return; }
   if (id){
-    await sb.from('floor_areas').update({ name, bookable }).eq('id', id);
+    await sb.from('floor_areas').update({ name, bookable, default_duration_minutes }).eq('id', id);
   } else {
-    const { data, error } = await sb.from('floor_areas').insert({ name, bookable, sort_order: state.areas.length }).select().single();
+    const { data, error } = await sb.from('floor_areas').insert({ name, bookable, default_duration_minutes, sort_order: state.areas.length }).select().single();
     if (error){ alert('Error: '+error.message); return; }
     state.currentAreaId = data.id;
   }
   closeModal('formModal');
   await reloadAreas();
+  render();
+};
+
+window.setAreaDefaultDuration = async function(areaId, value){
+  const minutes = Number(value);
+  if (!minutes || minutes < 15){ alert('Enter a valid duration (15 minutes or more).'); await reloadAreas(); render(); return; }
+  await sb.from('floor_areas').update({ default_duration_minutes: minutes }).eq('id', areaId);
+  await reloadAreas();
+};
+
+window.setStatusColor = async function(key, hex){
+  const updated = { ...statusColors(), [key]: hex };
+  const { error } = await sb.from('floor_plan_settings').update({ status_colors: updated }).eq('id', true);
+  if (error){ alert('Error: '+error.message); return; }
+  await reloadFloorPlanSettings();
   render();
 };
 
@@ -1665,13 +1765,32 @@ function renderSettingsTab(){
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">${state.tables.filter(t=>!t.is_combo).length} tables across ${state.areas.length} area${state.areas.length===1?'':'s'}. Add, rename, resize, delete, and drag-position tables on your floor plan sketch from the <b>Floor Plan</b> tab.</div>
     <table class="data-table">
-      <thead><tr><th>Area</th><th>Table Count</th></tr></thead>
+      <thead><tr><th>Area</th><th>Table Count</th><th>Default Duration (min)</th></tr></thead>
       <tbody>
-        ${state.areas.map(a => `<tr><td>${esc(a.name)}</td><td>${state.tables.filter(t=>t.area_id===a.id).length}</td></tr>`).join('')}
-        ${state.tables.some(t=>!t.area_id) ? `<tr><td>Unassigned</td><td>${state.tables.filter(t=>!t.area_id).length}</td></tr>` : ''}
+        ${state.areas.map(a => `<tr>
+          <td>${esc(a.name)}</td>
+          <td>${state.tables.filter(t=>t.area_id===a.id).length}</td>
+          <td><input type="number" min="15" step="15" max="480" class="modal-input" style="margin:0;width:90px;padding:4px 8px" value="${a.default_duration_minutes || 90}" onchange="setAreaDefaultDuration('${a.id}', this.value)"/></td>
+        </tr>`).join('')}
+        ${state.tables.some(t=>!t.area_id) ? `<tr><td>Unassigned</td><td>${state.tables.filter(t=>!t.area_id).length}</td><td>—</td></tr>` : ''}
       </tbody>
     </table>
+    <div class="panel-sub" style="margin-top:8px">Each area's default duration pre-fills the Duration field on a new reservation once you pick a table there — the hostess can always type over it.</div>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="setTab('floorplan')">🗺️ Open Floor Plan Editor</button></div>
+  </div>
+
+  <div class="section-heading">Table Status Colors</div>
+  <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">Define what each table color means on the Floor Plan. Tapping a table there cycles through these statuses in order: Available → Reserved → Seated → Needs Bussing → Blocked / Out of Service. The legend shown on the Floor Plan always reflects whatever colors you set here.</div>
+    <table class="data-table">
+      <thead><tr><th>Status</th><th>Color</th></tr></thead>
+      <tbody>
+        ${Object.keys(STATUS_LABELS).map(k => `<tr>
+          <td>${STATUS_LABELS[k]}</td>
+          <td><input type="color" value="${statusColors()[k]}" onchange="setStatusColor('${k}', this.value)" style="width:52px;height:32px;padding:0;border:1px solid var(--border);border-radius:6px;cursor:pointer"/></td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
   </div>
 
   <div class="section-heading">Server Sections</div>
