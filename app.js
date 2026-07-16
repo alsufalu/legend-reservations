@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.28';
+const APP_VERSION = '1.29';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -33,6 +33,9 @@ let state = {
   tab: 'reservations',
   resView: 'list',
   timelinePartySize: '', // '' = show every table; otherwise filter Timeline rows to tables that fit this many guests
+  timelineAreaFilter: null,     // Set<areaId|'__unassigned'> of checked areas
+  timelineAreaFilterSeen: null, // Set of area keys already defaulted once, so new areas auto-check without re-checking ones the user deliberately unchecked
+  timelineAreaMenuOpen: false,
   selectedDate: todayISO(),
   reservations: [],
   tables: [],
@@ -476,6 +479,7 @@ function renderReservationsTab(){
         <button class="view-toggle-btn ${state.resView==='timeline'?'active':''}" onclick="setResView('timeline')">🕐 Timeline</button>
       </div>
       ${state.resView==='timeline' ? renderPartySizeFilterSelect() : ''}
+      ${state.resView==='timeline' ? renderTimelineAreaFilter() : ''}
       <input type="date" class="search-input" style="margin:0;width:auto" value="${state.selectedDate}" onchange="changeDate(this.value)"/>
       <button class="btn btn-secondary" onclick="changeDate(todayISO())">Today</button>
       <button class="btn btn-secondary" onclick="openAreaAvailabilityModal()">📅 Area Availability</button>
@@ -526,6 +530,62 @@ function renderPartySizeFilterSelect(){
     </select>`;
 }
 window.setTimelinePartySize = function(v){ state.timelinePartySize = v; render(); };
+
+// Multi-select area filter for the Timeline (checkboxes, not a single-select) —
+// lets a manager show just one area or several at once, e.g. Bar + Main but not
+// Patio/Speakeasy. Lazily defaults to "everything checked" the first time it's
+// touched, and auto-includes any area added later.
+function timelineAreaFilterSet(){
+  if (!state.timelineAreaFilter) state.timelineAreaFilter = new Set();
+  if (!state.timelineAreaFilterSeen) state.timelineAreaFilterSeen = new Set();
+  const allKeys = state.areas.map(a => a.id).concat(state.tables.some(t => !t.area_id) ? ['__unassigned'] : []);
+  allKeys.forEach(key => {
+    if (!state.timelineAreaFilterSeen.has(key)){
+      state.timelineAreaFilterSeen.add(key);
+      state.timelineAreaFilter.add(key); // areas default to checked the first time they're seen
+    }
+  });
+  return state.timelineAreaFilter;
+}
+function renderTimelineAreaFilter(){
+  const set = timelineAreaFilterSet();
+  const hasUnassignedTables = state.tables.some(t => !t.area_id);
+  const totalOptions = state.areas.length + (hasUnassignedTables ? 1 : 0);
+  const checkedCount = [...set].filter(k => k !== '__unassigned' || hasUnassignedTables).length;
+  const label = checkedCount >= totalOptions ? 'All areas' : checkedCount === 0 ? 'No areas' : `${checkedCount} area${checkedCount===1?'':'s'}`;
+  return `
+  <div style="position:relative;display:inline-block">
+    <button type="button" class="btn btn-secondary" onclick="toggleTimelineAreaMenu()">🏙️ ${esc(label)} ▾</button>
+    ${state.timelineAreaMenuOpen ? `
+      <div class="dropdown-panel">
+        <div style="display:flex;gap:12px;margin-bottom:8px">
+          <span class="linkBtn" style="cursor:pointer" onclick="setAllTimelineAreas(true)">Select all</span>
+          <span class="linkBtn" style="cursor:pointer" onclick="setAllTimelineAreas(false)">Clear</span>
+        </div>
+        ${state.areas.map(a => `<label style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px;cursor:pointer">
+          <input type="checkbox" ${set.has(a.id)?'checked':''} onchange="toggleTimelineAreaFilter('${a.id}')"/> ${esc(a.name)}
+        </label>`).join('')}
+        ${hasUnassignedTables ? `<label style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px;cursor:pointer">
+          <input type="checkbox" ${set.has('__unassigned')?'checked':''} onchange="toggleTimelineAreaFilter('__unassigned')"/> No area
+        </label>` : ''}
+      </div>` : ''}
+  </div>`;
+}
+window.toggleTimelineAreaMenu = function(){ state.timelineAreaMenuOpen = !state.timelineAreaMenuOpen; render(); };
+window.toggleTimelineAreaFilter = function(key){
+  const set = timelineAreaFilterSet();
+  if (set.has(key)) set.delete(key); else set.add(key);
+  render();
+};
+window.setAllTimelineAreas = function(on){
+  const set = timelineAreaFilterSet();
+  set.clear();
+  if (on){
+    state.areas.forEach(a => set.add(a.id));
+    if (state.tables.some(t => !t.area_id)) set.add('__unassigned');
+  }
+  render();
+};
 
 // Per-day (and optionally per-time-window) override of an area's bookability, e.g.
 // close the Patio for rain, or block the Speakeasy 6pm-11pm only for a rented-out
@@ -705,8 +765,10 @@ function renderReservationsTimeline(list){
 
   const partyFilter = state.timelinePartySize ? Number(state.timelinePartySize) : null;
   const fitsFilter = t => !partyFilter || (partyFilter >= t.min_party && partyFilter <= Math.min(t.max_party, t.seats));
+  const areaFilter = timelineAreaFilterSet();
+  const inAreaFilter = t => areaFilter.has(t.area_id || '__unassigned');
 
-  const tables = state.tables.filter(t => t.active && fitsFilter(t)).slice().sort((a,b) => (a.section||'').localeCompare(b.section||'') || a.label.localeCompare(b.label));
+  const tables = state.tables.filter(t => t.active && fitsFilter(t) && inAreaFilter(t)).slice().sort((a,b) => (a.section||'').localeCompare(b.section||'') || a.label.localeCompare(b.label));
   const unassigned = list.filter(r => !r.table_id && !['cancelled'].includes(r.status) && (!partyFilter || r.party_size === partyFilter));
 
   const nowMin = (() => {
