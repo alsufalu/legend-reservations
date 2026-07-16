@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.26';
+const APP_VERSION = '1.28';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -51,6 +51,7 @@ let state = {
   guests: [],
   waitlist: [],
   staffList: [],
+  roster: [], // server_roster: name-only entries for section assignment, no login account
   servicePeriods: [],
   dashRange: 7,
 };
@@ -391,7 +392,7 @@ async function loadAll(){
   const statusEl = document.getElementById('syncStatus');
   setStatus(statusEl, '☁ Syncing…', '');
   try {
-    const [tablesRes, areasRes, fpRes, ssRes, comboRes, guestsRes, waitlistRes, staffRes, spRes, resRes] = await Promise.all([
+    const [tablesRes, areasRes, fpRes, ssRes, comboRes, guestsRes, waitlistRes, staffRes, rosterRes, spRes, resRes] = await Promise.all([
       sb.from('dining_tables').select('*').order('label'),
       sb.from('floor_areas').select('*').order('sort_order').order('created_at'),
       sb.from('floor_plan_settings').select('*').eq('id', true).maybeSingle(),
@@ -400,6 +401,7 @@ async function loadAll(){
       sb.from('guests').select('*').order('last_name'),
       sb.from('waitlist').select('*').eq('status','waiting').order('added_at'),
       sb.from('staff').select('*').order('created_at'),
+      sb.from('server_roster').select('*').order('name'),
       sb.from('service_periods').select('*').order('start_time'),
       sb.from('reservations').select('*').eq('reservation_date', state.selectedDate).order('reservation_time'),
     ]);
@@ -411,6 +413,7 @@ async function loadAll(){
     state.guests = guestsRes.data || [];
     state.waitlist = waitlistRes.data || [];
     state.staffList = staffRes.data || [];
+    state.roster = rosterRes.data || [];
     state.servicePeriods = spRes.data || [];
     state.reservations = resRes.data || [];
     if (!state.currentAreaId) state.currentAreaId = '__all';
@@ -992,20 +995,23 @@ window.refreshAvailability = async function(preserveSelection){
   // didn't actually choose.
   const droppedTable = (!stillValid && currentVal) ? tableById(currentVal) : null;
 
-  const blockedNote = blockedAreaNames.length ? ` (${blockedAreaNames.join(', ')} not bookable this date)` : '';
+  // Kept as a separate line (not appended inline) so "N tables available" can never
+  // read like it's contradicted by the blocked-area aside right next to it.
+  const blockedLine = blockedAreaNames.length
+    ? `<div style="color:var(--gray);margin-top:2px">ℹ️ ${esc(blockedAreaNames.join(', '))} ${blockedAreaNames.length===1?'is':'are'} not bookable on this date — excluded from the count above.</div>` : '';
   if (noteEl){
     if (droppedTable){
       noteEl.style.color = 'var(--danger)';
-      noteEl.innerHTML = `⚠️ ${esc(tableDisplayLabel(droppedTable))} no longer fits/is free for this party — cleared to Unassigned. Pick another table below or leave it Unassigned.`;
+      noteEl.innerHTML = `⚠️ ${esc(tableDisplayLabel(droppedTable))} no longer fits/is free for this party — cleared to Unassigned. Pick another table below or leave it Unassigned.` + blockedLine;
     } else if (!fitting.length){
       noteEl.style.color = 'var(--danger)';
-      noteEl.textContent = `No bookable tables fit a party of ${partySize}${blockedNote}.`;
+      noteEl.innerHTML = `No bookable tables fit a party of ${partySize}.` + blockedLine;
     } else if (!freeFitting.length){
       noteEl.style.color = 'var(--warn)';
-      noteEl.innerHTML = `⚠️ Fully booked for a party of ${partySize} at that time${esc(blockedNote)}. <span class="linkBtn" style="cursor:pointer" onclick="waitlistFromReservationModal()">Add to Waitlist instead</span>`;
+      noteEl.innerHTML = `⚠️ Fully booked for a party of ${partySize} at that time. <span class="linkBtn" style="cursor:pointer" onclick="waitlistFromReservationModal()">Add to Waitlist instead</span>` + blockedLine;
     } else {
       noteEl.style.color = 'var(--success)';
-      noteEl.textContent = `${freeFitting.length} table${freeFitting.length===1?'':'s'} available for this party size at this time${blockedNote}.`;
+      noteEl.innerHTML = `${freeFitting.length} table${freeFitting.length===1?'':'s'} available for this party size at this time.` + blockedLine;
     }
   }
 };
@@ -1120,6 +1126,18 @@ async function reloadServerSections(){
   const { data } = await sb.from('server_sections').select('*').order('sort_order').order('created_at');
   state.serverSections = data || [];
 }
+async function reloadRoster(){
+  const { data } = await sb.from('server_roster').select('*').order('name');
+  state.roster = data || [];
+}
+// A server section's assignee can be either a lightweight roster entry (name only,
+// no login) or a real staff login account — exactly one of assigned_roster_id /
+// assigned_staff_id is set. This resolves either into a display name.
+function sectionAssigneeName(s){
+  if (s.assigned_roster_id) return state.roster.find(r => r.id === s.assigned_roster_id)?.name || null;
+  if (s.assigned_staff_id) return state.staffList.find(st => st.id === s.assigned_staff_id)?.name || null;
+  return null;
+}
 function currentArea(){ return state.areas.find(a => a.id === state.currentAreaId); }
 
 function renderFloorPlanTab(){
@@ -1170,13 +1188,13 @@ function renderFloorPlanTab(){
       dragAttr = state.editMode ? `onpointerdown="startDragTable(event,'${t.id}')"` : `onclick="cycleTableStatus('${t.id}')"`;
       const areaName = state.areas.find(a => a.id === t.area_id)?.name;
       const section = state.serverSections.find(s => s.id === t.server_section_id);
-      const server = section ? state.staffList.find(s => s.id === section.assigned_staff_id) : null;
+      const serverName = section ? sectionAssigneeName(section) : null;
       const statusColor = sc[t.status] || STATUS_COLORS_DEFAULT.dirty;
       colorStyle = state.serverView
         ? (section ? `border-color:${section.color};background:${section.color}22;` : 'opacity:.45;')
         : `border-color:${statusColor};background:${statusColor}22;`;
       metaHtml = state.serverView
-        ? `<div class="ft-meta">${section ? esc(section.name) : 'No section'}</div>${server ? `<div class="ft-meta">${esc(server.name)}</div>` : ''}`
+        ? `<div class="ft-meta">${section ? esc(section.name) : 'No section'}</div>${serverName ? `<div class="ft-meta">${esc(serverName)}</div>` : ''}`
         : `<div class="ft-meta">${t.seats} seats</div>${showingAll && areaName ? `<div class="ft-meta">${esc(areaName)}</div>` : ''}${occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>` : ''}`;
     }
 
@@ -1598,7 +1616,7 @@ window.openCanvasTableModal = function(id){
     <label class="field-label">Server Section</label>
     <select class="modal-select" id="ctServerSection">
       <option value="">No section</option>
-      ${state.serverSections.map(s => `<option value="${s.id}" ${s.id===t.server_section_id?'selected':''}>${esc(s.name)}${s.assigned_staff_id ? ' — '+esc(state.staffList.find(st=>st.id===s.assigned_staff_id)?.name||'') : ''}</option>`).join('')}
+      ${state.serverSections.map(s => { const an = sectionAssigneeName(s); return `<option value="${s.id}" ${s.id===t.server_section_id?'selected':''}>${esc(s.name)}${an ? ' — '+esc(an) : ''}</option>`; }).join('')}
     </select>
     <div class="modal-actions">
       <button class="modal-btn modal-btn-danger" onclick="deleteCanvasTable('${t.id}')">Delete Table</button>
@@ -1926,9 +1944,21 @@ function renderSettingsTab(){
     </table>
   </div>
 
+  <div class="section-heading">Servers Roster</div>
+  <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">Quick list of server names for assigning to sections below — no login account needed. Most servers never need to sign into this app, so they don't need "Request Access" or Staff Access approval; that's only for people who'll actually use the software (hosts, managers, you). If a server is later promoted and needs real access, add them via Request Access on the login screen and approve them in Staff Access below instead.</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+      ${state.roster.length ? state.roster.map(r => `<span class="area-chip" style="cursor:default">${esc(r.name)} <span class="linkBtn" style="cursor:pointer;color:var(--danger);margin-left:4px" onclick="deleteRosterServer('${r.id}')">×</span></span>`).join('') : '<span class="panel-sub" style="margin:0">No servers added yet.</span>'}
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input type="text" class="modal-input" id="newRosterName" placeholder="Server name" style="margin:0;max-width:240px" onkeydown="if(event.key==='Enter')addRosterServer()"/>
+      <button class="btn btn-primary btn-sm" onclick="addRosterServer()">+ Add Server</button>
+    </div>
+  </div>
+
   <div class="section-heading">Server Sections</div>
   <div class="card">
-    <div class="panel-sub" style="margin-bottom:10px">Group tables into color-coded sections and assign a server to each. Turn on "🎨 Server View" on the Floor Plan tab to see the floor colored by section instead of table status. Assign individual tables to a section from the table's edit panel on the Floor Plan tab.</div>
+    <div class="panel-sub" style="margin-bottom:10px">Group tables into color-coded sections and assign a server (or staff member) to each. Turn on "🎨 Server View" on the Floor Plan tab to see the floor colored by section instead of table status. Assign individual tables to a section from the table's edit panel on the Floor Plan tab.</div>
     <table class="data-table">
       <thead><tr><th>Color</th><th>Section</th><th>Assigned Server</th><th>Tables</th><th></th></tr></thead>
       <tbody>
@@ -1937,8 +1967,7 @@ function renderSettingsTab(){
           <td>${esc(s.name)}</td>
           <td>
             <select class="modal-select" style="margin:0;padding:4px 8px" onchange="setSectionServer('${s.id}', this.value)">
-              <option value="">Unassigned</option>
-              ${state.staffList.filter(st=>st.active).map(st => `<option value="${st.id}" ${st.id===s.assigned_staff_id?'selected':''}>${esc(st.name)}</option>`).join('')}
+              ${assigneeOptionsHtml(s.assigned_roster_id, s.assigned_staff_id)}
             </select>
           </td>
           <td>${state.tables.filter(t=>t.server_section_id===s.id).length}</td>
@@ -2001,6 +2030,18 @@ function renderSettingsTab(){
   </div>` : ''}`;
 }
 
+// Assignee dropdown covers two very different kinds of people: lightweight roster
+// entries (just a name, no login — most servers) and real staff login accounts
+// (rare for a server, common for hosts/managers). Encoded as "roster:<id>" /
+// "staff:<id>" in the option value so one dropdown can offer both.
+function assigneeOptionsHtml(selectedRosterId, selectedStaffId){
+  const rosterOpts = state.roster.map(r => `<option value="roster:${r.id}" ${selectedRosterId===r.id?'selected':''}>${esc(r.name)}</option>`).join('');
+  const staffOpts = state.staffList.filter(st=>st.active).map(st => `<option value="staff:${st.id}" ${selectedStaffId===st.id?'selected':''}>${esc(st.name)} (login account)</option>`).join('');
+  return `<option value="">Unassigned</option>`
+    + (rosterOpts ? `<optgroup label="Servers">${rosterOpts}</optgroup>` : '')
+    + (staffOpts ? `<optgroup label="Staff Accounts">${staffOpts}</optgroup>` : '');
+}
+
 window.openServerSectionModal = function(){
   const box = document.getElementById('formModalBox');
   const defaultColors = ['#0070f2','#dc2626','#16a34a','#d97706','#7c3aed','#0891b2','#db2777','#65a30d'];
@@ -2012,10 +2053,8 @@ window.openServerSectionModal = function(){
     <label class="field-label">Color</label>
     <input type="color" class="modal-input" id="ssColor" value="${nextColor}" style="padding:4px;height:42px"/>
     <label class="field-label">Assign server</label>
-    <select class="modal-select" id="ssStaff">
-      <option value="">Unassigned</option>
-      ${state.staffList.filter(st=>st.active).map(st => `<option value="${st.id}">${esc(st.name)}</option>`).join('')}
-    </select>
+    <select class="modal-select" id="ssAssignee">${assigneeOptionsHtml(null, null)}</select>
+    ${!state.roster.length ? `<p style="font-size:12px;color:var(--gray);margin-top:-4px">No servers in your roster yet — add one in the "Servers Roster" card below.</p>` : ''}
     <div class="modal-actions">
       <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
       <button class="modal-btn modal-btn-primary" onclick="saveServerSection()">Save</button>
@@ -2024,10 +2063,12 @@ window.openServerSectionModal = function(){
 };
 
 window.saveServerSection = async function(){
+  const [kind, subId] = (document.getElementById('ssAssignee').value || '').split(':');
   const payload = {
     name: document.getElementById('ssName').value.trim() || 'Section',
     color: document.getElementById('ssColor').value,
-    assigned_staff_id: document.getElementById('ssStaff').value || null,
+    assigned_roster_id: kind==='roster' ? subId : null,
+    assigned_staff_id: kind==='staff' ? subId : null,
     sort_order: state.serverSections.length,
   };
   const { error } = await sb.from('server_sections').insert(payload);
@@ -2037,9 +2078,31 @@ window.saveServerSection = async function(){
   render();
 };
 
-window.setSectionServer = async function(id, staffId){
-  await sb.from('server_sections').update({ assigned_staff_id: staffId || null }).eq('id', id);
+window.setSectionServer = async function(id, value){
+  const [kind, subId] = (value || '').split(':');
+  await sb.from('server_sections').update({
+    assigned_roster_id: kind==='roster' ? subId : null,
+    assigned_staff_id: kind==='staff' ? subId : null,
+  }).eq('id', id);
   await reloadServerSections();
+};
+
+window.addRosterServer = async function(){
+  const input = document.getElementById('newRosterName');
+  const name = input.value.trim();
+  if (!name){ alert('Enter a name.'); return; }
+  const { error } = await sb.from('server_roster').insert({ name });
+  if (error){ alert('Error: '+error.message); return; }
+  input.value = '';
+  await reloadRoster();
+  render();
+};
+
+window.deleteRosterServer = async function(id){
+  if (!confirm('Remove this server from the roster? Any section they\'re assigned to will become Unassigned.')) return;
+  await sb.from('server_roster').delete().eq('id', id);
+  await Promise.all([reloadRoster(), reloadServerSections()]);
+  render();
 };
 
 window.deleteServerSection = async function(id){
