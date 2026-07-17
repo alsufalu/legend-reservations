@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.29';
+const APP_VERSION = '1.30';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -184,6 +184,15 @@ function tablesFittingParty(partySize, blockedAreaIds){
   // A table's actual seat count is always the hard ceiling, even if max_party
   // was set higher than seats by mistake when the table was configured.
   return state.tables.filter(t => t.active && isTableBookable(t, blocked) && partySize >= t.min_party && partySize <= Math.min(t.max_party, t.seats));
+}
+// Joining tables (a predefined combo) is only ever a fallback for a party too
+// big for any single table — never offered as a choice when a lone table can
+// already hold the party. If at least one single physical table is in the
+// list, combos are dropped from it entirely; only when every remaining option
+// is a combo (no single table qualifies) do combos surface at all.
+function preferSingles(tables){
+  const singles = tables.filter(t => !t.is_combo);
+  return singles.length ? singles : tables;
 }
 
 // ---- Auto-Assign: suggest tables for every still-Unassigned reservation on a date ----
@@ -859,6 +868,10 @@ function resActionButtons(r){
   if (r.status === 'seated') btns.push(`<button class="btn btn-sm btn-secondary" onclick="updateReservationStatus('${r.id}','completed')">Complete</button>`);
   if (['pending','confirmed'].includes(r.status)) btns.push(`<button class="btn btn-sm btn-danger" onclick="updateReservationStatus('${r.id}','no_show')">No-Show</button>`);
   if (!['completed','cancelled','no_show'].includes(r.status)) btns.push(`<button class="btn btn-sm btn-danger" onclick="updateReservationStatus('${r.id}','cancelled')">Cancel</button>`);
+  // Cancel keeps the record (status history, no-show/cancel-rate stats on the
+  // Dashboard); Delete permanently removes the row — kept as a visually
+  // distinct, separate button so the two aren't confused for one action.
+  btns.push(`<button class="btn btn-sm btn-secondary" style="color:var(--danger);border-color:var(--danger)" onclick="deleteReservation('${r.id}')">🗑️ Delete</button>`);
   return btns.join('');
 }
 
@@ -884,7 +897,7 @@ window.openSeatModal = function(id){
   const r = state.reservations.find(x => x.id === id);
   const physicallyFree = state.tables.filter(t => t.active && ['available','reserved'].includes(t.status));
   const capFits = t => r.party_size >= t.min_party && r.party_size <= Math.min(t.max_party, t.seats);
-  const fits = physicallyFree.filter(capFits);
+  const fits = preferSingles(physicallyFree.filter(capFits));
   const tooSmallOrBig = physicallyFree.filter(t => !capFits(t));
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
@@ -1042,7 +1055,7 @@ window.refreshAvailability = async function(preserveSelection){
   const fitting = tablesFittingParty(partySize, blockedAreaIds);
   const dateReservations = date ? await fetchDateReservations(date, excludeId) : [];
   const stillFree = new Set(simulateAvailability(dateReservations, time, duration, excludeId, blockedAreaIds).map(t => t.id));
-  const freeFitting = fitting.filter(t => stillFree.has(t.id));
+  const freeFitting = preferSingles(fitting.filter(t => stillFree.has(t.id)));
   const busyFitting = fitting.filter(t => !stillFree.has(t.id));
   const blockedAreaNames = state.areas.filter(a => blockedAreaIds.has(a.id)).map(a => a.name);
 
