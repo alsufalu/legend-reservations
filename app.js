@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.30';
+const APP_VERSION = '1.31';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -165,7 +165,7 @@ function simulateAvailability(dateReservations, time, duration, excludeId, block
 
   const consumed = new Set();
   overlapping.filter(r => r.table_id).forEach(r => {
-    conflictingTableIds(r.table_id).forEach(id => consumed.add(id));
+    occupiedByBooking(r.table_id).forEach(id => consumed.add(id));
   });
 
   const fits = (t, partySize) => partySize >= t.min_party && partySize <= Math.min(t.max_party, t.seats);
@@ -174,7 +174,7 @@ function simulateAvailability(dateReservations, time, duration, excludeId, block
     const candidate = state.tables
       .filter(t => t.active && isTableBookable(t, blocked) && !consumed.has(t.id) && fits(t, r.party_size))
       .sort((a,b) => a.seats - b.seats)[0];
-    if (candidate) conflictingTableIds(candidate.id).forEach(id => consumed.add(id));
+    if (candidate) occupiedByBooking(candidate.id).forEach(id => consumed.add(id));
   });
 
   return state.tables.filter(t => t.active && isTableBookable(t, blocked) && !consumed.has(t.id));
@@ -212,7 +212,7 @@ async function computeAutoAssignPlan(date){
   // reservations that already have a hard table assignment, then grown as we plan.
   const consumed = {};
   const block = (tableId, start, end) => {
-    conflictingTableIds(tableId).forEach(id => (consumed[id] = consumed[id] || []).push({ start, end }));
+    occupiedByBooking(tableId).forEach(id => (consumed[id] = consumed[id] || []).push({ start, end }));
   };
   dayReservations.filter(r => r.table_id).forEach(r => {
     const start = timeToMinutes(r.reservation_time);
@@ -249,30 +249,35 @@ async function reloadCombos(){
   const { data } = await sb.from('table_combo_members').select('*');
   buildComboMaps(data || []);
 }
-// A table and its combo partners can't be double-booked against each other —
-// e.g. booking the "3+4" combo must also block Table 3 and Table 4 individually.
-function conflictingTableIds(tableId){
-  // Full transitive closure over the combo<->member graph: if two combos share
-  // a physical table, the whole connected group is mutually exclusive, not just
-  // each combo's immediate members (mirrors the DB trigger's recursive check).
-  const ids = new Set([tableId]);
-  const queue = [tableId];
-  while (queue.length){
-    const cur = queue.pop();
-    const neighbors = [...(state.comboMembers[cur] || []), ...(state.memberOfCombos[cur] || [])];
-    neighbors.forEach(n => { if (!ids.has(n)){ ids.add(n); queue.push(n); } });
-  }
-  return ids;
+// Booking `bookedId` (a single table OR a predefined combo) physically seats
+// every one of that combo's member tables — occupation propagates DOWN from
+// a combo into its members. It does NOT propagate back OUT from a member to
+// that member's other combo partners: if table M1 alone is booked, the
+// "M1+M2" combo can no longer be formed (so it's marked unavailable too),
+// but table M2 itself is a separate, still-empty physical table and stays
+// bookable on its own. Only booking a combo directly seats all of its
+// members; booking one member of a combo never seats that combo's *other*
+// members. This is what keeps a single-table reservation from cascading
+// into "reserved" across every table that happens to share a combo chain.
+function occupiedByBooking(bookedId){
+  const occupied = new Set([bookedId]);
+  (state.comboMembers[bookedId] || []).forEach(id => occupied.add(id));
+  Object.keys(state.comboMembers).forEach(comboId => {
+    if (occupied.has(comboId)) return;
+    const members = state.comboMembers[comboId] || [];
+    if (members.some(m => occupied.has(m))) occupied.add(comboId);
+  });
+  return occupied;
 }
 
 function isTableBusy(tableId, timeStr, durationMinutes, dateReservations){
   const start = timeToMinutes(timeStr), end = start + (Number(durationMinutes)||90);
-  const conflictSet = conflictingTableIds(tableId);
   return dateReservations.some(r => {
-    if (!conflictSet.has(r.table_id)) return false;
+    if (!r.table_id) return false;
     const rStart = timeToMinutes(r.reservation_time);
     const rEnd = rStart + (r.duration_minutes||90);
-    return rangesOverlap(start, end, rStart, rEnd);
+    if (!rangesOverlap(start, end, rStart, rEnd)) return false;
+    return occupiedByBooking(r.table_id).has(tableId);
   });
 }
 function guestName(g){
@@ -1378,7 +1383,7 @@ async function loadFloorPreview(){
     const start = timeToMinutes(r.reservation_time);
     const end = start + (r.duration_minutes || 90);
     if (targetMin >= start && targetMin < end){
-      conflictingTableIds(r.table_id).forEach(id => {
+      occupiedByBooking(r.table_id).forEach(id => {
         // If a combo's member tables are each individually double-booked somehow,
         // keep whichever reservation actually starts soonest relative to now.
         const existing = busyByTable.get(id);
