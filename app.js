@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.31';
+const APP_VERSION = '1.32';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -92,6 +92,19 @@ function timeToMinutes(t){
 function minutesToTimeStr(mins){
   const h = Math.floor(mins/60) % 24, m = mins % 60;
   return String(h).padStart(2,'0') + ':' + String(m).padStart(2,'0');
+}
+// Builds a full-day <option> list in 15-minute increments (12am–11:45pm) for
+// any time <select>. Snaps the currently-set value to the nearest 15-minute
+// mark so a value like "now" (which can land on an odd minute) still shows
+// as selected instead of silently matching nothing.
+function timeOptionsHtml(selectedTime){
+  const selMin = Math.round(timeToMinutes(selectedTime) / 15) * 15;
+  let html = '';
+  for (let m = 0; m < 24*60; m += 15){
+    const val = minutesToTimeStr(m);
+    html += `<option value="${val}" ${m===selMin?'selected':''}>${fmtTime(val)}</option>`;
+  }
+  return html;
 }
 function rangesOverlap(startA, endA, startB, endB){
   return startA < endB && startB < endA;
@@ -1300,7 +1313,7 @@ function renderFloorPlanTab(){
     <div class="floor-toolbar" style="margin-bottom:12px;background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:10px 12px;">
       <span style="font-weight:700;font-size:13px;">🕐 Checking availability for:</span>
       <input type="date" class="modal-input" style="margin:0;width:auto" value="${state.previewDate}" onchange="setPreviewDateTime('date', this.value)"/>
-      <input type="time" class="modal-input" style="margin:0;width:auto" value="${state.previewTime}" onchange="setPreviewDateTime('time', this.value)"/>
+      <select class="modal-select" style="margin:0;width:auto" onchange="setPreviewDateTime('time', this.value)">${timeOptionsHtml(state.previewTime)}</select>
       <button class="btn btn-secondary btn-sm" onclick="jumpPreviewToNow()">Now</button>
       <span class="panel-sub" style="margin:0">Green = free, red = reserved, gray = area not bookable that date. Tap a free table to book it, tap a reserved one to see/edit that reservation.</span>
     </div>` : '';
