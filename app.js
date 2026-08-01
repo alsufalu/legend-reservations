@@ -6,15 +6,15 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.32';
+const APP_VERSION = '1.34';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // Table status color legend — customizable in Settings, persisted on
 // floor_plan_settings.status_colors. This default mirrors the original hardcoded
 // CSS colors so nothing changes visually until someone edits a color.
-const STATUS_LABELS = { available:'Available', reserved:'Reserved', seated:'Seated', dirty:'Needs Bussing', blocked:'Blocked / Out of Service' };
-const STATUS_COLORS_DEFAULT = { available:'#16a34a', reserved:'#d97706', seated:'#dc2626', dirty:'#8492a6', blocked:'#9aa3b0' };
+const STATUS_LABELS = { available:'Available', reserved:'Reserved', assigned:'Assigned (Pre-Seated)', seated:'Seated', dirty:'Needs Bussing', blocked:'Blocked / Out of Service' };
+const STATUS_COLORS_DEFAULT = { available:'#16a34a', reserved:'#d97706', assigned:'#7c3aed', seated:'#dc2626', dirty:'#8492a6', blocked:'#9aa3b0' };
 function statusColors(){ return { ...STATUS_COLORS_DEFAULT, ...(state.floorPlan?.status_colors || {}) }; }
 
 // Show the version on the login screen and in the app topbar. No index.html edits
@@ -239,8 +239,12 @@ async function computeAutoAssignPlan(date){
     const start = timeToMinutes(r.reservation_time);
     const end = start + (r.duration_minutes || 90);
     const blockedAreaIds = await getBlockedAreaIds(r.reservation_date, r.reservation_time);
+    // A reservation left Unassigned still carries the Area the hostess picked
+    // (preferred_area_id) — Auto-Assign must stay inside that area rather than
+    // reaching for the first open table anywhere in the restaurant.
     const candidates = state.tables
-      .filter(t => t.active && isTableBookable(t, blockedAreaIds) && fits(t, r.party_size) && isFree(t.id, start, end))
+      .filter(t => t.active && isTableBookable(t, blockedAreaIds) && fits(t, r.party_size) && isFree(t.id, start, end)
+        && (!r.preferred_area_id || t.area_id === r.preferred_area_id))
       .sort((a,b) => (a.is_combo === b.is_combo ? a.seats - b.seats : (a.is_combo ? 1 : -1))); // single tables before combos, then smallest-fit
     const chosen = candidates[0] || null;
     if (chosen) block(chosen.id, start, end);
@@ -722,11 +726,15 @@ function renderAutoAssignModal(plan){
     const g = guestById(p.reservation.guest_id);
     const r = p.reservation;
     if (!p.table){
+      const areaName = r.preferred_area_id ? state.areas.find(a => a.id === r.preferred_area_id)?.name : null;
+      const reason = areaName
+        ? `⚠️ No table or combo in ${esc(areaName)} fits ${r.party_size} guests (that area tops out below this party size, or is fully booked) — leave Unassigned, seat manually, or pick a different area on the reservation.`
+        : `⚠️ No table or combo currently fits/free — leave Unassigned or seat manually.`;
       return `
       <div class="card-row" style="padding:8px 0;border-bottom:1px solid var(--border);opacity:.7">
         <div>
-          <strong>${fmtTime(r.reservation_time)} · ${esc(guestName(g))}</strong> · ${r.party_size} guests
-          <div class="panel-sub" style="margin:0;color:var(--warn)">⚠️ No table or combo currently fits/free — leave Unassigned or seat manually.</div>
+          <strong>${fmtTime(r.reservation_time)} · ${esc(guestName(g))}</strong> · ${r.party_size} guests${areaName ? ` · wants ${esc(areaName)}` : ''}
+          <div class="panel-sub" style="margin:0;color:var(--warn)">${reason}</div>
         </div>
       </div>`;
     }
@@ -988,13 +996,13 @@ window.openReservationModal = function(id, prefill){
     </div>
     <div class="formgrid">
       <div>
-        <label class="field-label">Area <span style="font-weight:400;color:var(--gray)">(sets default duration)</span></label>
+        <label class="field-label">Area <span style="font-weight:400;color:var(--gray)">(sets default duration; scopes Table list below)</span></label>
         <select class="modal-select" id="resArea" onchange="onResAreaChange()">
           <option value="">No preference</option>
-          ${state.areas.map(a => {
-            const preselectedAreaId = (r?.table_id && tableById(r.table_id)?.area_id) || (prefill?.tableId && tableById(prefill.tableId)?.area_id);
-            return `<option value="${a.id}" ${preselectedAreaId===a.id ? 'selected':''}>${esc(a.name)}</option>`;
-          }).join('')}
+          ${(() => {
+            const preselectedAreaId = (r?.table_id && tableById(r.table_id)?.area_id) || (prefill?.tableId && tableById(prefill.tableId)?.area_id) || r?.preferred_area_id || '';
+            return state.areas.map(a => `<option value="${a.id}" ${preselectedAreaId===a.id ? 'selected':''}>${esc(a.name)}</option>`).join('');
+          })()}
         </select>
       </div>
       <div>
@@ -1069,8 +1077,16 @@ window.refreshAvailability = async function(preserveSelection){
   const currentVal = preserveSelection !== undefined ? preserveSelection : sel.value;
   const excludeId = document.getElementById('resId')?.value || null;
 
+  const areaId = document.getElementById('resArea')?.value || '';
+  const areaName = areaId ? (state.areas.find(a => a.id === areaId)?.name || '') : '';
+
   const blockedAreaIds = date ? await getBlockedAreaIds(date, time) : new Set();
-  const fitting = tablesFittingParty(partySize, blockedAreaIds);
+  const fittingAll = tablesFittingParty(partySize, blockedAreaIds);
+  // When an Area is picked, the Table list is scoped to just that area — this is
+  // what makes Auto-Assign's area handling meaningful in the first place: without
+  // this, a hostess could pick "Speakeasy" here and still see (and pick) a Main
+  // table, which is exactly the confusion that led to Auto-Assign ignoring area.
+  const fitting = areaId ? fittingAll.filter(t => t.area_id === areaId) : fittingAll;
   const dateReservations = date ? await fetchDateReservations(date, excludeId) : [];
   const stillFree = new Set(simulateAvailability(dateReservations, time, duration, excludeId, blockedAreaIds).map(t => t.id));
   const freeFitting = preferSingles(fitting.filter(t => stillFree.has(t.id)));
@@ -1098,7 +1114,9 @@ window.refreshAvailability = async function(preserveSelection){
       noteEl.innerHTML = `⚠️ ${esc(tableDisplayLabel(droppedTable))} no longer fits/is free for this party — cleared to Unassigned. Pick another table below or leave it Unassigned.` + blockedLine;
     } else if (!fitting.length){
       noteEl.style.color = 'var(--danger)';
-      noteEl.innerHTML = `No bookable tables fit a party of ${partySize}.` + blockedLine;
+      const areaHint = (areaId && fittingAll.length)
+        ? ` ${fittingAll.length} table${fittingAll.length===1?'':'s'} elsewhere would fit — clear the Area filter above to see them.` : '';
+      noteEl.innerHTML = (areaId ? `No bookable tables in ${esc(areaName)} fit a party of ${partySize}.` : `No bookable tables fit a party of ${partySize}.`) + areaHint + blockedLine;
     } else if (!freeFitting.length){
       noteEl.style.color = 'var(--warn)';
       noteEl.innerHTML = `⚠️ Fully booked for a party of ${partySize} at that time. <span class="linkBtn" style="cursor:pointer" onclick="waitlistFromReservationModal()">Add to Waitlist instead</span>` + blockedLine;
@@ -1172,6 +1190,10 @@ window.saveReservation = async function(id){
     reservation_time: time,
     duration_minutes: duration,
     table_id: tableId,
+    // Kept even when a table IS assigned (it'll just match that table's area) so
+    // Auto-Assign still knows the intended area if the table is ever cleared back
+    // to Unassigned later.
+    preferred_area_id: document.getElementById('resArea').value || null,
     source: document.getElementById('resSource').value,
     occasion: document.getElementById('resOccasion').value.trim() || null,
     special_requests: document.getElementById('resNotes').value.trim() || null,
@@ -1235,6 +1257,10 @@ function currentArea(){ return state.areas.find(a => a.id === state.currentAreaI
 
 function renderFloorPlanTab(){
   const activeRes = state.reservations.filter(r => r.status === 'seated');
+  // For a manually-marked Assigned or Reserved table, show which upcoming
+  // reservation is actually holding it (if any) — otherwise the status is just
+  // a colored dot with no way to tell who it's being held for.
+  const heldRes = state.reservations.filter(r => ['pending','confirmed'].includes(r.status));
   const area = currentArea();
   const unassignedCount = state.tables.filter(t => !t.area_id).length;
   const showingAll = state.currentAreaId === '__all';
@@ -1286,9 +1312,14 @@ function renderFloorPlanTab(){
       colorStyle = state.serverView
         ? (section ? `border-color:${section.color};background:${section.color}22;` : 'opacity:.45;')
         : `border-color:${statusColor};background:${statusColor}22;`;
+      const held = (!occ && ['assigned','reserved'].includes(t.status))
+        ? heldRes.filter(r => r.table_id === t.id).sort((a,b) => a.reservation_time.localeCompare(b.reservation_time))[0]
+        : null;
       metaHtml = state.serverView
         ? `<div class="ft-meta">${section ? esc(section.name) : 'No section'}</div>${serverName ? `<div class="ft-meta">${esc(serverName)}</div>` : ''}`
-        : `<div class="ft-meta">${t.seats} seats</div>${showingAll && areaName ? `<div class="ft-meta">${esc(areaName)}</div>` : ''}${occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>` : ''}`;
+        : `<div class="ft-meta">${t.seats} seats</div>${showingAll && areaName ? `<div class="ft-meta">${esc(areaName)}</div>` : ''}`
+          + (occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>`
+            : held ? `<div class="ft-meta">${esc(guestName(guestById(held.guest_id)))} · ${fmtTime(held.reservation_time)}</div>` : '');
     }
 
     return `
@@ -1462,7 +1493,7 @@ function getCanvasScale(){
 
 window.cycleTableStatus = async function(id){
   const t = tableById(id);
-  const order = ['available','reserved','seated','dirty','blocked'];
+  const order = ['available','reserved','assigned','seated','dirty','blocked'];
   const next = order[(order.indexOf(t.status)+1) % order.length];
   await sb.from('dining_tables').update({ status: next }).eq('id', id);
   await reloadTables();
@@ -2025,7 +2056,7 @@ function renderSettingsTab(){
 
   <div class="section-heading">Table Status Colors</div>
   <div class="card">
-    <div class="panel-sub" style="margin-bottom:10px">Define what each table color means on the Floor Plan. Tapping a table there cycles through these statuses in order: Available → Reserved → Seated → Needs Bussing → Blocked / Out of Service. The legend shown on the Floor Plan always reflects whatever colors you set here.</div>
+    <div class="panel-sub" style="margin-bottom:10px">Define what each table color means on the Floor Plan. Tapping a table there cycles through these statuses in order: Available → Reserved → Assigned (Pre-Seated) → Seated → Needs Bussing → Blocked / Out of Service. "Assigned" is for a table held for a specific walk-in or reservation that hasn't sat down yet. The legend shown on the Floor Plan always reflects whatever colors you set here.</div>
     <table class="data-table">
       <thead><tr><th>Status</th><th>Color</th></tr></thead>
       <tbody>
