@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.35';
+const APP_VERSION = '1.36';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -534,10 +534,26 @@ function render(){
   const c = document.getElementById('content');
   if (state.tab === 'reservations') c.innerHTML = renderReservationsTab();
   else if (state.tab === 'floorplan') { c.innerHTML = renderFloorPlanTab(); fitFloorCanvasView(); }
+  else if (state.tab === 'split') { c.innerHTML = renderSplitViewTab(); fitFloorCanvasView(); }
   else if (state.tab === 'waitlist') c.innerHTML = renderWaitlistTab();
   else if (state.tab === 'guests') c.innerHTML = renderGuestsTab();
   else if (state.tab === 'dashboard') { c.innerHTML = renderDashboardTab(); loadDashboard(); }
   else if (state.tab === 'settings') c.innerHTML = renderSettingsTab();
+}
+
+// Shows the Reservations panel and the Floor Plan panel side by side — same
+// two panels as their standalone tabs (still available separately for a
+// narrower phone/tablet screen), just composed together so a table can be
+// tapped on the floor plan while checking who's up next on the list, without
+// switching tabs back and forth. Below ~900px wide the two panes stack
+// vertically instead (see .split-view in styles.css) rather than squeezing
+// both down to an unusable width.
+function renderSplitViewTab(){
+  return `
+  <div class="split-view">
+    <div class="split-pane">${renderReservationsTab()}</div>
+    <div class="split-pane split-pane-right">${renderFloorPlanTab()}</div>
+  </div>`;
 }
 
 // ============================================================================

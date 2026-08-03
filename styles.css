@@ -203,6 +203,15 @@ table.data-table td{padding:10px 12px;border-top:1px solid var(--border);font-si
 .timeline-tight-gap{position:absolute;top:4px;width:5px;border-radius:3px;background:repeating-linear-gradient(45deg,#f59e0b,#f59e0b 3px,#fff 3px,#fff 6px);}
 .timeline-now-line{position:absolute;top:0;bottom:0;width:2px;background:var(--danger);z-index:2;}
 
+/* ===== SPLIT VIEW (Reservations + Floor Plan side by side) ===== */
+.split-view{display:flex;gap:20px;align-items:flex-start;}
+.split-pane{flex:1 1 50%;min-width:0;}
+.split-pane-right{border-left:1px solid var(--border);padding-left:20px;}
+@media (max-width:900px){
+  .split-view{flex-direction:column;}
+  .split-pane-right{border-left:none;padding-left:0;border-top:1px solid var(--border);padding-top:16px;}
+}
+
 /* ===== FLOOR PLAN EDITOR ===== */
 .area-tabs{display:flex;gap:6px;flex-wrap:wrap;align-items:center;}
 .area-chip{padding:7px 14px;border-radius:20px;font-size:12px;font-weight:700;background:var(--bg-alt);border:1px solid var(--border);cursor:pointer;white-space:nowrap;}
