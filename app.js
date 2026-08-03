@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.34';
+const APP_VERSION = '1.35';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -16,6 +16,55 @@ const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 const STATUS_LABELS = { available:'Available', reserved:'Reserved', assigned:'Assigned (Pre-Seated)', seated:'Seated', dirty:'Needs Bussing', blocked:'Blocked / Out of Service' };
 const STATUS_COLORS_DEFAULT = { available:'#16a34a', reserved:'#d97706', assigned:'#7c3aed', seated:'#dc2626', dirty:'#8492a6', blocked:'#9aa3b0' };
 function statusColors(){ return { ...STATUS_COLORS_DEFAULT, ...(state.floorPlan?.status_colors || {}) }; }
+
+// ---- "Now" override — lets staff simulate a different current date/time than
+// the device clock for off-hours testing, without touching any real table or
+// reservation data. Once set, it ticks forward at real speed from whatever
+// moment it was set (rather than freezing), so elapsed-time displays like the
+// Timeline "now" line and waitlist wait counters still behave naturally.
+// Persisted in localStorage so it survives a page refresh — which is exactly
+// why a loud, un-missable banner is shown across the whole app while it's
+// active: an override left on by accident should never be silently forgotten
+// before real service starts.
+const NOW_OVERRIDE_KEY = 'legendResNowOverride';
+function loadNowOverride(){
+  try {
+    const raw = localStorage.getItem(NOW_OVERRIDE_KEY);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    return (o && o.targetMs && o.epochMs) ? o : null;
+  } catch(e){ return null; }
+}
+let nowOverride = loadNowOverride();
+function getNow(){
+  return nowOverride ? new Date(nowOverride.targetMs + (Date.now() - nowOverride.epochMs)) : new Date();
+}
+window.setNowOverride = function(dateStr, timeStr){
+  if (!dateStr || !timeStr){ alert('Pick both a date and a time.'); return; }
+  const target = new Date(`${dateStr}T${timeStr}:00`);
+  if (isNaN(target.getTime())){ alert('Invalid date/time.'); return; }
+  nowOverride = { targetMs: target.getTime(), epochMs: Date.now() };
+  localStorage.setItem(NOW_OVERRIDE_KEY, JSON.stringify(nowOverride));
+  renderNowBanner();
+  render();
+};
+window.clearNowOverride = function(){
+  nowOverride = null;
+  localStorage.removeItem(NOW_OVERRIDE_KEY);
+  renderNowBanner();
+  render();
+};
+function renderNowBanner(){
+  const el = document.getElementById('nowOverrideBanner');
+  if (!el) return;
+  if (!nowOverride){ el.innerHTML = ''; return; }
+  const label = getNow().toLocaleString(undefined, { weekday:'short', month:'short', day:'numeric', hour:'numeric', minute:'2-digit' });
+  el.innerHTML = `<div style="background:#7c3aed;color:#fff;padding:8px 16px;display:flex;align-items:center;gap:10px;font-weight:700;font-size:13px;">
+    🧪 TEST MODE — app thinks it's <span style="text-decoration:underline">${esc(label)}</span>, not the real time.
+    <button class="btn btn-sm" style="background:#fff;color:#7c3aed;margin-left:auto;border:none" onclick="clearNowOverride()">Exit Test Mode</button>
+  </div>`;
+}
+setInterval(() => { if (nowOverride) renderNowBanner(); }, 60000);
 
 // Show the version on the login screen and in the app topbar. No index.html edits
 // needed for future bumps — just change APP_VERSION above and re-upload app.js.
@@ -62,7 +111,7 @@ let state = {
 // ============================================================================
 // UTILITIES
 // ============================================================================
-function todayISO(){ return new Date().toISOString().slice(0,10); }
+function todayISO(){ return getNow().toISOString().slice(0,10); }
 function uuid(){ return crypto.randomUUID(); }
 function esc(s){ return (s==null?'':String(s)).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function fmtTime(t){
@@ -78,7 +127,7 @@ function fmtDateHuman(iso){
 }
 function minutesAgo(iso){
   if(!iso) return 0;
-  return Math.max(0, Math.round((Date.now() - new Date(iso).getTime())/60000));
+  return Math.max(0, Math.round((getNow().getTime() - new Date(iso).getTime())/60000));
 }
 
 // ============================================================================
@@ -481,6 +530,7 @@ window.setTab = function(tab){
 };
 
 function render(){
+  renderNowBanner();
   const c = document.getElementById('content');
   if (state.tab === 'reservations') c.innerHTML = renderReservationsTab();
   else if (state.tab === 'floorplan') { c.innerHTML = renderFloorPlanTab(); fitFloorCanvasView(); }
@@ -807,7 +857,7 @@ function renderReservationsTimeline(list){
   const unassigned = list.filter(r => !r.table_id && !['cancelled'].includes(r.status) && (!partyFilter || r.party_size === partyFilter));
 
   const nowMin = (() => {
-    const now = new Date();
+    const now = getNow();
     const todayStr = now.toISOString().slice(0,10);
     if (state.selectedDate !== todayStr) return null;
     return now.getHours()*60 + now.getMinutes();
@@ -909,9 +959,9 @@ window.changeDate = async function(d){
 
 window.updateReservationStatus = async function(id, status){
   const patch = { status };
-  if (status === 'seated') patch.seated_at = new Date().toISOString();
-  if (status === 'completed') patch.completed_at = new Date().toISOString();
-  if (status === 'cancelled') patch.cancelled_at = new Date().toISOString();
+  if (status === 'seated') patch.seated_at = getNow().toISOString();
+  if (status === 'completed') patch.completed_at = getNow().toISOString();
+  if (status === 'cancelled') patch.cancelled_at = getNow().toISOString();
   const { error } = await sb.from('reservations').update(patch).eq('id', id);
   if (error){ alert('Error: '+error.message); return; }
   await logActivity('status_change','reservation', id, {status});
@@ -945,7 +995,7 @@ window.openSeatModal = function(id){
 
 window.confirmSeat = async function(id){
   const tableId = document.getElementById('seatTableSelect').value || null;
-  const { error } = await sb.from('reservations').update({ status:'seated', seated_at: new Date().toISOString(), table_id: tableId }).eq('id', id);
+  const { error } = await sb.from('reservations').update({ status:'seated', seated_at: getNow().toISOString(), table_id: tableId }).eq('id', id);
   if (error){
     if (error.code === '23P01' || error.message?.includes('TABLE_COMBO_CONFLICT')) alert('That table was just taken for an overlapping reservation — pick a different table.');
     else alert('Error: '+error.message);
@@ -1394,7 +1444,7 @@ window.toggleServerView = function(){ state.serverView = !state.serverView; rend
 // data + combo-conflict + area-bookability logic as the booking engine itself, so
 // this always agrees with what the Reservations tab would actually offer.
 function nowHHMM(){
-  const d = new Date();
+  const d = getNow();
   return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
 }
 window.togglePreviewMode = async function(){
@@ -1854,11 +1904,11 @@ window.removeFromWaitlist = async function(id, status){
 
 window.seatFromWaitlist = async function(id){
   const w = state.waitlist.find(x => x.id === id);
-  await sb.from('waitlist').update({ status:'seated', seated_at: new Date().toISOString() }).eq('id', id);
+  await sb.from('waitlist').update({ status:'seated', seated_at: getNow().toISOString() }).eq('id', id);
   await sb.from('reservations').insert({
     guest_id: w.guest_id, party_size: w.party_size, reservation_date: todayISO(),
-    reservation_time: new Date().toTimeString().slice(0,5), status:'seated',
-    source:'walk-in', seated_at: new Date().toISOString(), created_by: currentStaff.id,
+    reservation_time: getNow().toTimeString().slice(0,5), status:'seated',
+    source:'walk-in', seated_at: getNow().toISOString(), created_by: currentStaff.id,
   });
   await Promise.all([reloadWaitlist(), reloadReservationsForDate()]);
   render();
@@ -1971,8 +2021,8 @@ function renderDashboardTab(){
 window.setDashRange = function(n){ state.dashRange = n; render(); };
 
 async function loadDashboard(){
-  const end = new Date();
-  const start = new Date();
+  const end = getNow();
+  const start = getNow();
   start.setDate(end.getDate() - (state.dashRange - 1));
   const startISO = start.toISOString().slice(0,10);
   const endISO = end.toISOString().slice(0,10);
@@ -2035,6 +2085,20 @@ function renderSettingsTab(){
   const isAdmin = currentStaff.role === 'admin';
   return `
   <div class="panel-header"><h2 class="panel-title">Settings</h2></div>
+
+  ${isAdmin ? `
+  <div class="section-heading">Testing: Override "Now"</div>
+  <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">For testing off-hours (e.g. checking what a Friday 7pm dinner rush looks like at 3am): make the whole app believe it's a different date/time than your device clock. This affects Today's default date, the Floor Plan's live status view, the Timeline "now" line, waitlist wait counters, and every seated/completed/cancelled timestamp — all without touching any real reservation data. It ticks forward normally from whatever you set, and persists until you clear it, even across a page refresh — a purple banner stays up across the whole app the entire time it's active so it's never accidentally left on.</div>
+    <div class="formgrid">
+      <div><label class="field-label">Date</label><input type="date" class="modal-input" id="nowOvDate" value="${todayISO()}"/></div>
+      <div><label class="field-label">Time</label><select class="modal-select" id="nowOvTime">${timeOptionsHtml(nowHHMM())}</select></div>
+    </div>
+    <div class="modal-actions" style="padding-top:10px;justify-content:flex-start">
+      <button class="btn btn-primary" onclick="setNowOverride(document.getElementById('nowOvDate').value, document.getElementById('nowOvTime').value)">Set Test Time</button>
+      ${nowOverride ? `<button class="btn btn-secondary" onclick="clearNowOverride()">Exit Test Mode (use real time)</button>` : ''}
+    </div>
+  </div>` : ''}
 
   <div class="section-heading">Dining Tables &amp; Floor Plan</div>
   <div class="card">
