@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.37';
+const APP_VERSION = '1.38';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -165,7 +165,7 @@ async function fetchDateReservations(dateStr, excludeId){
   // needs the full picture to know how many of the fitting tables are already
   // spoken for by other pending bookings, not just ones with a table locked in.
   let q = sb.from('reservations')
-    .select('id,table_id,reservation_time,duration_minutes,party_size,guest_id,status')
+    .select('id,table_id,reservation_time,duration_minutes,party_size,guest_id,status,preferred_area_id')
     .eq('reservation_date', dateStr)
     .in('status', ['pending','confirmed','seated']);
   if (excludeId) q = q.neq('id', excludeId);
@@ -233,8 +233,15 @@ function simulateAvailability(dateReservations, time, duration, excludeId, block
   const fits = (t, partySize) => partySize >= t.min_party && partySize <= Math.min(t.max_party, t.seats);
   const unassigned = overlapping.filter(r => !r.table_id).sort((a,b) => b.party_size - a.party_size);
   unassigned.forEach(r => {
+    // Mirrors Auto-Assign's area handling: an Unassigned party that requested a
+    // specific area can only ever project as consuming a table in that area — a
+    // party that wants the Speakeasy (and might not even fit there) must never
+    // be simulated as grabbing the smallest open table anywhere else in the
+    // restaurant, or every other area's capacity count gets wrongly deflated by
+    // a reservation that could never actually land there.
     const candidate = state.tables
-      .filter(t => t.active && isTableBookable(t, blocked) && !consumed.has(t.id) && fits(t, r.party_size))
+      .filter(t => t.active && isTableBookable(t, blocked) && !consumed.has(t.id) && fits(t, r.party_size)
+        && (!r.preferred_area_id || t.area_id === r.preferred_area_id))
       .sort((a,b) => a.seats - b.seats)[0];
     if (candidate) occupiedByBooking(candidate.id).forEach(id => consumed.add(id));
   });
