@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.43';
+const APP_VERSION = '1.44';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -64,7 +64,20 @@ function renderNowBanner(){
     <button class="btn btn-sm" style="background:#fff;color:#7c3aed;margin-left:auto;border:none" onclick="clearNowOverride()">Exit Test Mode</button>
   </div>`;
 }
-setInterval(() => { if (nowOverride) renderNowBanner(); }, 60000);
+// A host needs to know what time it actually is to make any of the app's
+// time-sensitive calls (pacing, the upcoming-reservation warning, whether
+// someone's late) — but nothing on screen ever showed it outside of Test
+// Mode. This is a small always-on clock in the topbar, visible on every tab,
+// using getNow() so it correctly shows the Now Override time while testing
+// and real local time otherwise. Formatting via toLocaleString(undefined, …)
+// uses the browser's own locale/timezone automatically — no hardcoded
+// timezone needed, it'll read correctly wherever the app is actually opened.
+function renderTopbarClock(){
+  const el = document.getElementById('topbarClock');
+  if (!el) return;
+  el.textContent = getNow().toLocaleString(undefined, { weekday:'short', month:'short', day:'numeric', hour:'numeric', minute:'2-digit' });
+}
+setInterval(() => { renderTopbarClock(); if (nowOverride) renderNowBanner(); }, 30000);
 
 // Show the version on the login screen and in the app topbar. No index.html edits
 // needed for future bumps — just change APP_VERSION above and re-upload app.js.
@@ -582,6 +595,7 @@ window.setTab = function(tab){
 
 function render(){
   renderNowBanner();
+  renderTopbarClock();
   const c = document.getElementById('content');
   if (state.tab === 'reservations') c.innerHTML = renderReservationsTab();
   else if (state.tab === 'floorplan') { c.innerHTML = renderFloorPlanTab(); fitFloorCanvasView(); }
