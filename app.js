@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.42';
+const APP_VERSION = '1.43';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -2049,6 +2049,13 @@ window.saveWaitlist = async function(){
     phone: document.getElementById('wlPhone').value.trim(),
     party_size: Number(document.getElementById('wlParty').value)||1,
     quoted_wait_minutes: Number(document.getElementById('wlWait').value)||0,
+    // Stamped explicitly with the app's own "now" (real or Now-Override)
+    // instead of leaving it to the added_at column's `now()` default, which
+    // is the database server's real clock — under Now Override those two
+    // diverge, and the "waiting Xm" badge (minutesAgo, which correctly uses
+    // getNow()) would measure against a real timestamp instead of a
+    // simulated one, producing a nonsense elapsed count.
+    added_at: getNow().toISOString(),
   };
   const { error } = await sb.from('waitlist').insert(payload);
   if (error){ alert('Error: '+error.message); return; }
