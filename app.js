@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.38';
+const APP_VERSION = '1.39';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -209,6 +209,39 @@ async function getBlockedAreaIds(date, time){
 }
 function isTableBookable(t, blockedAreaIds){
   return !t.area_id || !blockedAreaIds.has(t.area_id);
+}
+
+// ---- Pacing / flow control -------------------------------------------------
+// Caps how many covers (guests) can arrive into any single 15-minute window
+// per area, independent of which physical table they end up at. This is what
+// keeps a hostess from booking more reservations than the kitchen/floor can
+// actually absorb — separate from (and on top of) the per-table conflict
+// check saveReservation already does, which only stops two parties sharing
+// one physical table at the same time. A reservation counts toward an area's
+// pacing total if it's hard-assigned to a table in that area, or if it
+// carries that area as its preferred_area_id; reservations with neither are
+// area-agnostic and don't count against — or get blocked by — any area's cap.
+const PACING_SLOT_MINUTES = 15;
+function pacingSlotStart(timeMinutes){
+  return Math.floor(timeMinutes / PACING_SLOT_MINUTES) * PACING_SLOT_MINUTES;
+}
+function pacingSlotLabel(timeMinutes){
+  const s = pacingSlotStart(timeMinutes);
+  return `${fmtTime(minutesToTimeStr(s))}–${fmtTime(minutesToTimeStr(s + PACING_SLOT_MINUTES))}`;
+}
+function reservationAreaId(r){
+  return (r.table_id && tableById(r.table_id)?.area_id) || r.preferred_area_id || null;
+}
+// dateReservations: rows from fetchDateReservations (already scoped to the
+// date and to active statuses). Sums party sizes already booked into the
+// same 15-minute slot as timeMinutes, for the given area, excluding excludeId
+// (the reservation being edited, if any) so editing in place doesn't double-count.
+function coversInSlot(dateReservations, areaId, timeMinutes, excludeId){
+  const target = pacingSlotStart(timeMinutes);
+  return dateReservations
+    .filter(r => r.id !== excludeId && reservationAreaId(r) === areaId)
+    .filter(r => pacingSlotStart(timeToMinutes(r.reservation_time)) === target)
+    .reduce((sum, r) => sum + (r.party_size || 0), 0);
 }
 
 // Simulates seating every other reservation that overlaps this time window (hard
@@ -1182,6 +1215,20 @@ window.refreshAvailability = async function(preserveSelection){
   // read like it's contradicted by the blocked-area aside right next to it.
   const blockedLine = blockedAreaNames.length
     ? `<div style="color:var(--gray);margin-top:2px">ℹ️ ${esc(blockedAreaNames.join(', '))} ${blockedAreaNames.length===1?'is':'are'} not bookable on this date — excluded from the count above.</div>` : '';
+
+  // Pacing/flow-control readout: only meaningful once an Area is picked (or a
+  // specific table implies one) and that area has a cap configured.
+  let pacingLine = '';
+  const pacingArea = areaId ? state.areas.find(a => a.id === areaId) : null;
+  if (pacingArea && pacingArea.max_covers_per_slot && date && time){
+    const timeMin = timeToMinutes(time);
+    const already = coversInSlot(dateReservations, areaId, timeMin, excludeId);
+    const projected = already + partySize;
+    const cap = pacingArea.max_covers_per_slot;
+    const over = projected > cap;
+    pacingLine = `<div style="margin-top:2px;color:${over ? 'var(--danger)' : 'var(--gray)'}">${over ? '⚠️' : '📊'} Pacing: ${esc(pacingArea.name)} ${pacingSlotLabel(timeMin)} would be ${projected}/${cap} covers${over ? ' — over cap, you’ll be asked to confirm on Save.' : '.'}</div>`;
+  }
+
   if (noteEl){
     if (droppedTable){
       noteEl.style.color = 'var(--danger)';
@@ -1198,6 +1245,7 @@ window.refreshAvailability = async function(preserveSelection){
       noteEl.style.color = 'var(--success)';
       noteEl.innerHTML = `${freeFitting.length} table${freeFitting.length===1?'':'s'} available for this party size at this time.` + blockedLine;
     }
+    noteEl.innerHTML += pacingLine;
   }
 };
 
@@ -1239,6 +1287,8 @@ window.saveReservation = async function(id){
   const time = document.getElementById('resTime').value;
   const duration = Number(document.getElementById('resDuration').value) || 90;
 
+  const dateReservations = await fetchDateReservations(date, id);
+
   // Hard-assignment defense in depth: re-check the chosen table right before saving
   // (the DB exclusion constraint is the ultimate backstop for race conditions).
   if (tableId){
@@ -1249,11 +1299,31 @@ window.saveReservation = async function(id){
       refreshAvailability(tableId);
       return;
     }
-    const dateReservations = await fetchDateReservations(date, id);
     if (isTableBusy(tableId, time, duration, dateReservations)){
       alert('That table just got booked for an overlapping time — pick a different table or leave it Unassigned.');
       refreshAvailability(tableId);
       return;
+    }
+  }
+
+  // Pacing/flow control: soft-block if this booking would push the area over its
+  // configured covers-per-15-minute-slot cap. This is a warning the hostess can
+  // override (e.g. deliberately banking on no-shows), not a hard stop — matching
+  // how real-world flow-control systems (OpenTable, Resy) behave. It's checked
+  // here rather than only in Auto-Assign so the overbooking never gets created
+  // in the first place, instead of being discovered as an unhonored reservation
+  // days later.
+  const pacingAreaId = (tableId && tableById(tableId)?.area_id) || document.getElementById('resArea')?.value || null;
+  if (pacingAreaId){
+    const pacingArea = state.areas.find(a => a.id === pacingAreaId);
+    if (pacingArea && pacingArea.max_covers_per_slot){
+      const timeMin = timeToMinutes(time);
+      const already = coversInSlot(dateReservations, pacingAreaId, timeMin, id);
+      const projected = already + partySize;
+      if (projected > pacingArea.max_covers_per_slot){
+        const ok = confirm(`⚠️ Pacing cap: ${pacingArea.name} is set to ${pacingArea.max_covers_per_slot} covers per 15-minute slot.\n\nBooking this party would bring the ${pacingSlotLabel(timeMin)} window to ${projected} covers — over cap.\n\nBook anyway?`);
+        if (!ok) return;
+      }
     }
   }
 
@@ -1706,6 +1776,17 @@ window.setAreaDefaultDuration = async function(areaId, value){
   await sb.from('floor_areas').update({ default_duration_minutes: minutes }).eq('id', areaId);
   await reloadAreas();
 };
+// A blank field means "no cap" (unrestricted, the default) — stored as NULL.
+window.setAreaMaxCovers = async function(areaId, value){
+  const trimmed = String(value).trim();
+  let covers = null;
+  if (trimmed !== ''){
+    covers = Number(trimmed);
+    if (!covers || covers < 1){ alert('Enter a valid cap (1 or more), or leave it blank for no cap.'); await reloadAreas(); render(); return; }
+  }
+  await sb.from('floor_areas').update({ max_covers_per_slot: covers }).eq('id', areaId);
+  await reloadAreas();
+};
 
 window.setStatusColor = async function(key, hex){
   const updated = { ...statusColors(), [key]: hex };
@@ -2128,17 +2209,18 @@ function renderSettingsTab(){
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">${state.tables.filter(t=>!t.is_combo).length} tables across ${state.areas.length} area${state.areas.length===1?'':'s'}. Add, rename, resize, delete, and drag-position tables on your floor plan sketch from the <b>Floor Plan</b> tab.</div>
     <table class="data-table">
-      <thead><tr><th>Area</th><th>Table Count</th><th>Default Duration (min)</th></tr></thead>
+      <thead><tr><th>Area</th><th>Table Count</th><th>Default Duration (min)</th><th>Pacing Cap (covers / 15 min)</th></tr></thead>
       <tbody>
         ${state.areas.map(a => `<tr>
           <td>${esc(a.name)}</td>
           <td>${state.tables.filter(t=>t.area_id===a.id).length}</td>
           <td><input type="number" min="15" step="15" max="480" class="modal-input" style="margin:0;width:90px;padding:4px 8px" value="${a.default_duration_minutes || 90}" onchange="setAreaDefaultDuration('${a.id}', this.value)"/></td>
+          <td><input type="number" min="1" step="1" class="modal-input" style="margin:0;width:90px;padding:4px 8px" placeholder="No cap" value="${a.max_covers_per_slot || ''}" onchange="setAreaMaxCovers('${a.id}', this.value)"/></td>
         </tr>`).join('')}
-        ${state.tables.some(t=>!t.area_id) ? `<tr><td>Unassigned</td><td>${state.tables.filter(t=>!t.area_id).length}</td><td>—</td></tr>` : ''}
+        ${state.tables.some(t=>!t.area_id) ? `<tr><td>Unassigned</td><td>${state.tables.filter(t=>!t.area_id).length}</td><td>—</td><td>—</td></tr>` : ''}
       </tbody>
     </table>
-    <div class="panel-sub" style="margin-top:8px">Each area's default duration pre-fills the Duration field on a new reservation once you pick a table there — the hostess can always type over it.</div>
+    <div class="panel-sub" style="margin-top:8px">Each area's default duration pre-fills the Duration field on a new reservation once you pick a table there — the hostess can always type over it. The Pacing Cap limits how many total covers (guests) can be booked into any single 15-minute arrival window for that area — it warns and asks for confirmation before saving a reservation that would go over, rather than blocking it outright. Leave it blank for no cap.</div>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="setTab('floorplan')">🗺️ Open Floor Plan Editor</button></div>
   </div>
 
