@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.40';
+const APP_VERSION = '1.42';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -111,7 +111,18 @@ let state = {
 // ============================================================================
 // UTILITIES
 // ============================================================================
-function todayISO(){ return getNow().toISOString().slice(0,10); }
+// `.toISOString().slice(0,10)` looks like a harmless way to get "today's date"
+// but it isn't: toISOString() always converts to UTC first. Anywhere west of
+// UTC, that silently rolls the date forward for every evening hour that's
+// already "tomorrow" in UTC even though it's still today locally — exactly
+// what broke the Floor Plan preview's "Now" button and would have quietly
+// broken Timeline's now-line and the Dashboard's date range the same way.
+// This builds the date string from the LOCAL calendar fields instead, same
+// as nowHHMM() already correctly does for the time-of-day part.
+function toLocalISODate(d){
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+function todayISO(){ return toLocalISODate(getNow()); }
 function uuid(){ return crypto.randomUUID(); }
 function esc(s){ return (s==null?'':String(s)).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function fmtTime(t){
@@ -914,7 +925,7 @@ function renderReservationsTimeline(list){
 
   const nowMin = (() => {
     const now = getNow();
-    const todayStr = now.toISOString().slice(0,10);
+    const todayStr = toLocalISODate(now);
     if (state.selectedDate !== todayStr) return null;
     return now.getHours()*60 + now.getMinutes();
   })();
@@ -1419,6 +1430,29 @@ function pickHeldReservation(candidates){
   return stillRelevant[0] || sorted[sorted.length - 1];
 }
 
+// A table's live color only reflects whatever a human last manually tapped it
+// to — it has no built-in awareness that a reservation is about to need that
+// exact table. That's fine once a host has proactively marked it Reserved/
+// Assigned ahead of time, but nothing forces that to happen, and a table that
+// still reads Available can silently have a party arriving in minutes. This
+// surfaces a heads-up directly on the tile — independent of its manual status
+// — for any table with a reservation starting soon, so a host deciding
+// whether to seat a walk-in there sees the collision before it happens rather
+// than after. Only meaningful when viewing today (real or Now-Override), same
+// as pickHeldReservation.
+const UPCOMING_SOON_MINUTES = 45;
+function upcomingSoonReservation(tableReservations){
+  if (state.selectedDate !== todayISO()) return null;
+  const nowMin = timeToMinutes(nowHHMM());
+  const soon = tableReservations
+    .filter(r => {
+      const start = timeToMinutes(r.reservation_time);
+      return start >= nowMin && start - nowMin <= UPCOMING_SOON_MINUTES;
+    })
+    .sort((a,b) => a.reservation_time.localeCompare(b.reservation_time));
+  return soon[0] || null;
+}
+
 function renderFloorPlanTab(){
   const activeRes = state.reservations.filter(r => r.status === 'seated');
   // For a manually-marked Assigned or Reserved table, show which upcoming
@@ -1473,17 +1507,24 @@ function renderFloorPlanTab(){
       const section = state.serverSections.find(s => s.id === t.server_section_id);
       const serverName = section ? sectionAssigneeName(section) : null;
       const statusColor = sc[t.status] || STATUS_COLORS_DEFAULT.dirty;
-      colorStyle = state.serverView
-        ? (section ? `border-color:${section.color};background:${section.color}22;` : 'opacity:.45;')
-        : `border-color:${statusColor};background:${statusColor}22;`;
       const held = (!occ && ['assigned','reserved'].includes(t.status))
         ? pickHeldReservation(heldRes.filter(r => r.table_id === t.id))
         : null;
+      // Only worth flagging when the table isn't already showing a held
+      // reservation's name/time via `held` (that already covers it) or
+      // actually occupied by the matching seated party via `occ`.
+      const upcoming = (!state.serverView && !occ && !held)
+        ? upcomingSoonReservation(heldRes.filter(r => r.table_id === t.id))
+        : null;
+      colorStyle = state.serverView
+        ? (section ? `border-color:${section.color};background:${section.color}22;` : 'opacity:.45;')
+        : `border-color:${statusColor};background:${statusColor}22;${upcoming ? 'box-shadow:inset 0 0 0 3px #f59e0b;' : ''}`;
       metaHtml = state.serverView
         ? `<div class="ft-meta">${section ? esc(section.name) : 'No section'}</div>${serverName ? `<div class="ft-meta">${esc(serverName)}</div>` : ''}`
         : `<div class="ft-meta">${t.seats} seats</div>${showingAll && areaName ? `<div class="ft-meta">${esc(areaName)}</div>` : ''}`
           + (occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>`
-            : held ? `<div class="ft-meta">${esc(guestName(guestById(held.guest_id)))} · ${fmtTime(held.reservation_time)}</div>` : '');
+            : held ? `<div class="ft-meta">${esc(guestName(guestById(held.guest_id)))} · ${fmtTime(held.reservation_time)}</div>`
+            : upcoming ? `<div class="ft-meta" style="color:#b45309;font-weight:600">⏰ ${esc(guestName(guestById(upcoming.guest_id)))} in ${timeToMinutes(upcoming.reservation_time) - timeToMinutes(nowHHMM())}m (${fmtTime(upcoming.reservation_time)})</div>` : '');
     }
 
     return `
@@ -1545,7 +1586,7 @@ function renderFloorLegend(sc){
     if (!state.serverSections.length) return `<div class="panel-sub" style="margin-bottom:10px">No server sections defined yet — add some in Settings.</div>`;
     return `<div class="floor-legend">${state.serverSections.map(s => `<span class="legend-chip"><span class="legend-swatch" style="background:${esc(s.color)}"></span>${esc(s.name)}</span>`).join('')}<span class="legend-chip"><span class="legend-swatch" style="background:#ccc;opacity:.45"></span>No section</span></div>`;
   }
-  return `<div class="floor-legend">${Object.keys(STATUS_LABELS).map(k => `<span class="legend-chip"><span class="legend-swatch" style="background:${sc[k]}"></span>${STATUS_LABELS[k]}</span>`).join('')}<span class="panel-sub" style="margin:0 0 0 4px">Customize these in Settings → Table Status Colors.</span></div>`;
+  return `<div class="floor-legend">${Object.keys(STATUS_LABELS).map(k => `<span class="legend-chip"><span class="legend-swatch" style="background:${sc[k]}"></span>${STATUS_LABELS[k]}</span>`).join('')}<span class="legend-chip"><span class="legend-swatch" style="background:#fff;box-shadow:inset 0 0 0 3px #f59e0b"></span>⏰ Reservation arriving soon</span><span class="panel-sub" style="margin:0 0 0 4px">Customize the status colors in Settings → Table Status Colors.</span></div>`;
 }
 
 window.switchArea = function(id){ state.editMode = false; state.currentAreaId = id; render(); };
@@ -2149,8 +2190,8 @@ async function loadDashboard(){
   const end = getNow();
   const start = getNow();
   start.setDate(end.getDate() - (state.dashRange - 1));
-  const startISO = start.toISOString().slice(0,10);
-  const endISO = end.toISOString().slice(0,10);
+  const startISO = toLocalISODate(start);
+  const endISO = toLocalISODate(end);
 
   const [{ data: kpiRows }, { data: allRes }] = await Promise.all([
     sb.from('kpi_daily').select('*').gte('day', startISO).lte('day', endISO),
