@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.39';
+const APP_VERSION = '1.40';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -1399,6 +1399,26 @@ function sectionAssigneeName(s){
 }
 function currentArea(){ return state.areas.find(a => a.id === state.currentAreaId); }
 
+// A Reserved/Assigned table should show what it's actually being held for
+// right now, not just the earliest reservation that happens to exist on it
+// that day. Without this, a table with an early lunch reservation and a
+// separate later dinner reservation would keep showing the (already long
+// over) lunch guest's name all evening, since the old logic only sorted by
+// time-of-day and never dropped reservations whose window had already
+// passed. Prefers whichever reservation is currently in its window or still
+// upcoming; only falls back to the day's most recent past reservation if
+// every one of them has already ended. "Now" respects the Now Override
+// testing tool. On any date other than today (real or overridden), there's
+// no meaningful "now" to compare against, so it just shows the day's first.
+function pickHeldReservation(candidates){
+  if (!candidates.length) return null;
+  const sorted = candidates.slice().sort((a,b) => a.reservation_time.localeCompare(b.reservation_time));
+  if (state.selectedDate !== todayISO()) return sorted[0];
+  const nowMin = timeToMinutes(nowHHMM());
+  const stillRelevant = sorted.filter(r => timeToMinutes(r.reservation_time) + (r.duration_minutes || 90) >= nowMin);
+  return stillRelevant[0] || sorted[sorted.length - 1];
+}
+
 function renderFloorPlanTab(){
   const activeRes = state.reservations.filter(r => r.status === 'seated');
   // For a manually-marked Assigned or Reserved table, show which upcoming
@@ -1457,7 +1477,7 @@ function renderFloorPlanTab(){
         ? (section ? `border-color:${section.color};background:${section.color}22;` : 'opacity:.45;')
         : `border-color:${statusColor};background:${statusColor}22;`;
       const held = (!occ && ['assigned','reserved'].includes(t.status))
-        ? heldRes.filter(r => r.table_id === t.id).sort((a,b) => a.reservation_time.localeCompare(b.reservation_time))[0]
+        ? pickHeldReservation(heldRes.filter(r => r.table_id === t.id))
         : null;
       metaHtml = state.serverView
         ? `<div class="ft-meta">${section ? esc(section.name) : 'No section'}</div>${serverName ? `<div class="ft-meta">${esc(serverName)}</div>` : ''}`
