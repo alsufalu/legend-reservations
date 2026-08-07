@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.44';
+const APP_VERSION = '1.45';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -597,7 +597,7 @@ function render(){
   renderNowBanner();
   renderTopbarClock();
   const c = document.getElementById('content');
-  if (state.tab === 'reservations') c.innerHTML = renderReservationsTab();
+  if (state.tab === 'reservations') { c.innerHTML = renderReservationsTab(); if (state.resView === 'timeline') scrollTimelineToNow(); }
   else if (state.tab === 'floorplan') { c.innerHTML = renderFloorPlanTab(); fitFloorCanvasView(); }
   else if (state.tab === 'split') { c.innerHTML = renderSplitViewTab(); fitFloorCanvasView(); }
   else if (state.tab === 'waitlist') c.innerHTML = renderWaitlistTab();
@@ -644,6 +644,7 @@ function renderReservationsTab(){
       ${state.resView==='timeline' ? renderTimelineAreaFilter() : ''}
       <input type="date" class="search-input" style="margin:0;width:auto" value="${state.selectedDate}" onchange="changeDate(this.value)"/>
       <button class="btn btn-secondary" onclick="changeDate(todayISO())">Today</button>
+      ${state.resView==='timeline' ? `<button class="btn btn-secondary" onclick="scrollTimelineToNow()">🕐 Now</button>` : ''}
       <button class="btn btn-secondary" onclick="openAreaAvailabilityModal()">📅 Area Availability</button>
       <button class="btn btn-secondary" onclick="openAutoAssignModal()">🪄 Auto-Assign</button>
       <button class="btn btn-primary" onclick="openReservationModal()">+ New Reservation</button>
@@ -997,7 +998,7 @@ function renderReservationsTimeline(list){
   // relatively-positioned wrapper so it isn't clipped to a single row.
   const LABEL_COL_W = 130;
   const nowLine = nowMin!=null && nowMin>=rangeStart && nowMin<=rangeEnd
-    ? `<div class="timeline-now-line" style="left:${LABEL_COL_W + x(nowMin)}px" title="Now"></div>` : '';
+    ? `<div id="timelineNowLine" class="timeline-now-line" style="left:${LABEL_COL_W + x(nowMin)}px" title="Now"></div>` : '';
 
   const filterNote = partyFilter
     ? `<div class="panel-sub" style="margin-bottom:8px">Showing ${tables.length} table${tables.length===1?'':'s'} that fit${tables.length===1?'s':''} ${partyFilter} guest${partyFilter===1?'':'s'} — any open stretch on a row is free for that party size. <span class="linkBtn" style="cursor:pointer" onclick="setTimelinePartySize('')">Clear filter</span></div>`
@@ -1017,6 +1018,21 @@ function renderReservationsTimeline(list){
   </div>
   <div class="panel-sub" style="margin-top:8px">🟠 Dashed marker = less than 20 min to turn a table between reservations. Tap any bar to edit.</div>`;
 }
+
+// The Timeline can easily be wide enough that reaching the current time means
+// real horizontal scrolling — and .timeline-wrap's own scrollbar sits at the
+// bottom of a box up to 70vh tall, which can end up below the fold with no
+// visible hint it's there. Rather than rely on a host discovering a scrollbar
+// (or a trackpad gesture) on their own, this scrolls the now-line into view
+// automatically every time the Timeline renders, and the "Now" button lets
+// them jump back to it on demand after scrolling elsewhere. Quietly no-ops if
+// there's no now-line to find (viewing a different date, or "now" falls
+// outside the visible service-period range).
+window.scrollTimelineToNow = function(){
+  const line = document.getElementById('timelineNowLine');
+  if (!line) return;
+  line.scrollIntoView({ inline: 'center', block: 'nearest' });
+};
 
 function resActionButtons(r){
   const btns = [];
