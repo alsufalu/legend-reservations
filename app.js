@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.45';
+const APP_VERSION = '1.46';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -1584,9 +1584,21 @@ function renderFloorPlanTab(){
       <span class="panel-sub" style="margin:0">Green = free, red = reserved, gray = area not bookable that date. Tap a free table to book it, tap a reserved one to see/edit that reservation.</span>
     </div>` : '';
 
+  // The live Floor Plan's held-reservation names and upcoming-arrival warning
+  // are both scoped to whichever date is currently loaded (state.selectedDate,
+  // set from the Reservations tab's date picker) — a separate control from
+  // Now Override's simulated clock. Nothing here previously showed which date
+  // that was, so a host (or tester) could change Now Override without
+  // realizing the Floor Plan was still showing a different day's reservations,
+  // and get confusing stale-looking results with no explanation why.
+  const viewingToday = state.selectedDate === todayISO();
+  const dateNote = state.previewMode ? '' : `<div class="panel-sub" style="margin-top:2px${viewingToday ? '' : ';color:var(--danger);font-weight:600'}">${viewingToday
+    ? `Viewing ${fmtDateHuman(state.selectedDate)} (today).`
+    : `⚠️ Viewing ${fmtDateHuman(state.selectedDate)} — not today (${fmtDateHuman(todayISO())}). Held-reservation names and the upcoming-arrival warning only compare against "now" when viewing today's date. <span class="linkBtn" style="cursor:pointer" onclick="changeDate(todayISO())">Jump to today</span>`}</div>`;
+
   return `
   <div class="panel-header">
-    <div><h2 class="panel-title">Floor Plan</h2><div class="panel-sub">${state.previewMode ? 'Availability preview — tap a table to book or view its reservation.' : state.editMode ? 'Drag tables to reposition. Tap a table to rename, resize, or delete.' : 'Tap a table to cycle its status.'}</div></div>
+    <div><h2 class="panel-title">Floor Plan</h2><div class="panel-sub">${state.previewMode ? 'Availability preview — tap a table to book or view its reservation.' : state.editMode ? 'Drag tables to reposition. Tap a table to rename, resize, or delete.' : 'Tap a table to cycle its status.'}</div>${dateNote}</div>
     <div class="floor-toolbar">${toolbar}</div>
   </div>
   <div class="area-tabs" style="margin-bottom:14px">${areaTabs}</div>
