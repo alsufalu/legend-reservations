@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.46';
+const APP_VERSION = '1.47';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -119,6 +119,9 @@ let state = {
   roster: [], // server_roster: name-only entries for section assignment, no login account
   servicePeriods: [],
   dashRange: 7,
+  loyaltyTiers: [],    // club/society/founders terms — editable in Settings, not hardcoded
+  loyaltyMembers: [],  // one row per enrolled guest (guests.id -> loyalty_members.guest_id)
+  priorityHolidays: [], // dates where Founder's Circle gets the extended 14-day booking lead
 };
 
 // ============================================================================
@@ -268,6 +271,69 @@ function coversInSlot(dateReservations, areaId, timeMinutes, excludeId){
     .reduce((sum, r) => sum + (r.party_size || 0), 0);
 }
 
+// ---- Vault / Speakeasy priority booking (loyalty program) -----------------
+// An area with member_priority_seats set (Speakeasy) reserves that many
+// seats for active loyalty members until member_priority_release_hours
+// before service, and — on designated priority holidays only — restricts how
+// far ahead a non-Founder's booking can even be made. Regular (non-holiday)
+// nights are gated purely by the capacity carve-out below, not a date gate;
+// the date gate exists specifically for the highest-demand nights (NYE,
+// Valentine's, etc.) where advance date access is itself the perk.
+function daysUntilDate(dateStr){
+  if (!dateStr) return 0;
+  const target = new Date(dateStr + 'T00:00:00');
+  const today = new Date(toLocalISODate(getNow()) + 'T00:00:00');
+  return Math.round((target - today) / 86400000);
+}
+function isPriorityHoliday(dateStr){
+  return state.priorityHolidays.some(h => h.holiday_date === dateStr);
+}
+// Sums party sizes of reservations in `areaId` whose time window overlaps
+// [start,end) — full-duration overlap, not a 15-min pacing slot, since this
+// is asking "how many physical Vault seats are occupied at this moment,"
+// not "how many covers arrive in this quarter-hour."
+function vaultOverlapCovers(dateReservations, areaId, start, end, excludeId){
+  return dateReservations
+    .filter(r => r.id !== excludeId && reservationAreaId(r) === areaId)
+    .filter(r => { const rs = timeToMinutes(r.reservation_time); return rangesOverlap(start, end, rs, rs + (r.duration_minutes || 90)); })
+    .reduce((sum, r) => sum + (r.party_size || 0), 0);
+}
+// Returns a human-readable reason string if a non-Founder's booking on a
+// priority-holiday date is too early, or null if it's allowed.
+function vaultHolidayWindowReason(areaId, dateStr, guestId){
+  const area = state.areas.find(a => a.id === areaId);
+  if (!area || area.member_priority_seats == null || !isPriorityHoliday(dateStr)) return null;
+  const member = guestId && hasActivePriorityAccess(guestId) ? activeLoyaltyMember(guestId) : null;
+  const tier = member ? loyaltyTierByKey(member.tier_key) : null;
+  const window = tier?.key === 'founders' ? 14 : 3;
+  const days = daysUntilDate(dateStr);
+  if (days <= window) return null;
+  const label = state.priorityHolidays.find(h => h.holiday_date === dateStr)?.label || 'This date';
+  return tier?.key === 'founders'
+    ? `${label} opens for Founder's Circle booking ${window} days out — that's still ${days} days away.`
+    : `${label} is a priority holiday. Booking opens ${window} days out for everyone except Founder's Circle (14 days) — that's still ${days} days away.`;
+}
+// Returns a human-readable reason string if this party would eat into the
+// seats reserved for member priority, or null if it's fine (member, or
+// enough non-reserved capacity remains, or within the release window).
+function vaultCapacityReason(areaId, dateStr, timeStr, durationMin, partySize, guestId, dateReservations, excludeId){
+  const area = state.areas.find(a => a.id === areaId);
+  if (!area || area.member_priority_seats == null) return null;
+  if (guestId && hasActivePriorityAccess(guestId)) return null;
+  if (dateStr === todayISO()){
+    const nowMin = timeToMinutes(nowHHMM());
+    if (timeToMinutes(timeStr) - nowMin <= area.member_priority_release_hours * 60) return null;
+  }
+  const totalSeats = state.tables.filter(t => t.area_id === areaId && !t.is_combo).reduce((s,t) => s + t.seats, 0);
+  const start = timeToMinutes(timeStr), end = start + (Number(durationMin) || 90);
+  const already = vaultOverlapCovers(dateReservations, areaId, start, end, excludeId);
+  const openToPublic = totalSeats - area.member_priority_seats;
+  if (already + partySize > openToPublic){
+    return `The Vault holds ${area.member_priority_seats} of its ${totalSeats} seats for loyalty-member priority until ${area.member_priority_release_hours}h before service — the ${openToPublic} non-member seats are full for this time.`;
+  }
+  return null;
+}
+
 // Simulates seating every other reservation that overlaps this time window (hard
 // assignments first, then a greedy smallest-fit assignment for Unassigned ones)
 // to figure out how many tables are genuinely still free for a NEW party — so a
@@ -415,6 +481,55 @@ function guestName(g){
   return `${g.first_name||''} ${g.last_name||''}`.trim() || g.phone || 'Guest';
 }
 function guestById(id){ return state.guests.find(g => g.id === id); }
+
+// ---- Loyalty program -------------------------------------------------------
+function loyaltyTierByKey(key){ return state.loyaltyTiers.find(t => t.key === key); }
+function loyaltyMemberByGuestId(guestId){ return state.loyaltyMembers.find(m => m.guest_id === guestId); }
+// Only an 'active' (not cancelled) membership counts for perks/priority — a
+// cancelled member still has a row (for history) but gets treated as a
+// regular guest everywhere else in the app.
+function activeLoyaltyMember(guestId){
+  const m = loyaltyMemberByGuestId(guestId);
+  return m && m.status === 'active' ? m : null;
+}
+// Same as activeLoyaltyMember, but returns false while a no-show suspension
+// is in effect — used only for the Vault priority-booking gates, so a
+// suspended member still keeps their tier, perks, and redemptions.
+function hasActivePriorityAccess(guestId){
+  const m = activeLoyaltyMember(guestId);
+  if (!m) return false;
+  if (m.priority_suspended_until && m.priority_suspended_until >= todayISO()) return false;
+  return true;
+}
+function currentMonthKey(){ const d = getNow(); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0'); }
+function currentQuarterKey(){ const d = getNow(); return d.getFullYear() + '-Q' + (Math.floor(d.getMonth()/3)+1); }
+// Redemption counters reset lazily on first read of a new period rather than
+// a scheduled job — if the stored period_key doesn't match "now", the member
+// simply hasn't used anything yet this period.
+function cocktailsRemaining(member){
+  const tier = loyaltyTierByKey(member.tier_key);
+  if (!tier) return 0;
+  const used = member.cocktails_period_key === currentMonthKey() ? member.cocktails_used_period : 0;
+  return Math.max(0, tier.cocktails_per_month - used);
+}
+function creditRemaining(member){
+  const tier = loyaltyTierByKey(member.tier_key);
+  if (!tier) return 0;
+  const used = member.credit_period_key === currentQuarterKey() ? member.credit_used_period : 0;
+  return Math.max(0, tier.credit_per_quarter - used);
+}
+async function reloadLoyaltyMembers(){
+  const { data } = await sb.from('loyalty_members').select('*');
+  state.loyaltyMembers = data || [];
+}
+async function reloadLoyaltyTiers(){
+  const { data } = await sb.from('loyalty_tiers').select('*').order('sort_order');
+  state.loyaltyTiers = data || [];
+}
+async function reloadPriorityHolidays(){
+  const { data } = await sb.from('priority_holidays').select('*').order('holiday_date');
+  state.priorityHolidays = data || [];
+}
 function tableById(id){ return state.tables.find(t => t.id === id); }
 function tableDisplayLabel(t){
   if (!t?.is_combo) return t?.label || '';
@@ -539,7 +654,7 @@ async function loadAll(){
   const statusEl = document.getElementById('syncStatus');
   setStatus(statusEl, '☁ Syncing…', '');
   try {
-    const [tablesRes, areasRes, fpRes, ssRes, comboRes, guestsRes, waitlistRes, staffRes, rosterRes, spRes, resRes] = await Promise.all([
+    const [tablesRes, areasRes, fpRes, ssRes, comboRes, guestsRes, waitlistRes, staffRes, rosterRes, spRes, resRes, loyaltyTiersRes, loyaltyMembersRes, holidaysRes] = await Promise.all([
       sb.from('dining_tables').select('*').order('label'),
       sb.from('floor_areas').select('*').order('sort_order').order('created_at'),
       sb.from('floor_plan_settings').select('*').eq('id', true).maybeSingle(),
@@ -551,6 +666,9 @@ async function loadAll(){
       sb.from('server_roster').select('*').order('name'),
       sb.from('service_periods').select('*').order('start_time'),
       sb.from('reservations').select('*').eq('reservation_date', state.selectedDate).order('reservation_time'),
+      sb.from('loyalty_tiers').select('*').order('sort_order'),
+      sb.from('loyalty_members').select('*'),
+      sb.from('priority_holidays').select('*').order('holiday_date'),
     ]);
     state.tables = tablesRes.data || [];
     state.areas = areasRes.data || [];
@@ -563,6 +681,9 @@ async function loadAll(){
     state.roster = rosterRes.data || [];
     state.servicePeriods = spRes.data || [];
     state.reservations = resRes.data || [];
+    state.loyaltyTiers = loyaltyTiersRes.data || [];
+    state.loyaltyMembers = loyaltyMembersRes.data || [];
+    state.priorityHolidays = holidaysRes.data || [];
     if (!state.currentAreaId) state.currentAreaId = '__all';
     setStatus(statusEl, '☁ Synced', 'synced');
   } catch(e){
@@ -1062,9 +1183,36 @@ window.updateReservationStatus = async function(id, status){
   const { error } = await sb.from('reservations').update(patch).eq('id', id);
   if (error){ alert('Error: '+error.message); return; }
   await logActivity('status_change','reservation', id, {status});
+  if (status === 'no_show') await checkLoyaltyNoShowSuspension(id);
   await reloadReservationsForDate();
   render();
 };
+
+// Two no-shows by an active loyalty member within a rolling 90-day window
+// suspend their Vault priority booking (not their membership, perks, or
+// redemptions) for 60 days — protects the seats held back for members
+// without punishing a dues-paying member over a single missed reservation.
+async function checkLoyaltyNoShowSuspension(reservationId){
+  let r = state.reservations.find(x => x.id === reservationId);
+  if (!r){
+    const { data } = await sb.from('reservations').select('id, guest_id').eq('id', reservationId).maybeSingle();
+    r = data;
+  }
+  if (!r || !r.guest_id) return;
+  const member = activeLoyaltyMember(r.guest_id);
+  if (!member) return;
+  const cutoff = new Date(getNow()); cutoff.setDate(cutoff.getDate() - 90);
+  const { data: recentNoShows } = await sb.from('reservations')
+    .select('id')
+    .eq('guest_id', r.guest_id)
+    .eq('status', 'no_show')
+    .gte('reservation_date', toLocalISODate(cutoff));
+  if ((recentNoShows?.length || 0) >= 2){
+    const until = new Date(getNow()); until.setDate(until.getDate() + 60);
+    await sb.from('loyalty_members').update({ priority_suspended_until: toLocalISODate(until) }).eq('id', member.id);
+    await reloadLoyaltyMembers();
+  }
+}
 
 window.openSeatModal = function(id){
   const r = state.reservations.find(x => x.id === id);
@@ -1270,6 +1418,16 @@ window.refreshAvailability = async function(preserveSelection){
     pacingLine = `<div style="margin-top:2px;color:${over ? 'var(--danger)' : 'var(--gray)'}">${over ? '⚠️' : '📊'} Pacing: ${esc(pacingArea.name)} ${pacingSlotLabel(timeMin)} would be ${projected}/${cap} covers${over ? ' — over cap, you’ll be asked to confirm on Save.' : '.'}</div>`;
   }
 
+  // Loyalty Vault priority: only meaningful once an Area with a member
+  // priority carve-out is picked (Speakeasy) — informs the hostess up front
+  // rather than only at Save time, same pattern as pacing above.
+  let vaultLine = '';
+  if (areaId && date && time){
+    const guestId = document.getElementById('resGuestId')?.value || null;
+    const reason = vaultHolidayWindowReason(areaId, date, guestId) || vaultCapacityReason(areaId, date, time, duration, partySize, guestId, dateReservations, excludeId);
+    if (reason) vaultLine = `<div style="margin-top:2px;color:var(--danger)">🗝️ ${esc(reason)} You'll be asked to confirm on Save.</div>`;
+  }
+
   if (noteEl){
     if (droppedTable){
       noteEl.style.color = 'var(--danger)';
@@ -1286,7 +1444,7 @@ window.refreshAvailability = async function(preserveSelection){
       noteEl.style.color = 'var(--success)';
       noteEl.innerHTML = `${freeFitting.length} table${freeFitting.length===1?'':'s'} available for this party size at this time.` + blockedLine;
     }
-    noteEl.innerHTML += pacingLine;
+    noteEl.innerHTML += pacingLine + vaultLine;
   }
 };
 
@@ -1365,6 +1523,20 @@ window.saveReservation = async function(id){
         const ok = confirm(`⚠️ Pacing cap: ${pacingArea.name} is set to ${pacingArea.max_covers_per_slot} covers per 15-minute slot.\n\nBooking this party would bring the ${pacingSlotLabel(timeMin)} window to ${projected} covers — over cap.\n\nBook anyway?`);
         if (!ok) return;
       }
+    }
+  }
+
+  // Loyalty Vault priority: soft-block a non-member (or a member outside
+  // their allowed lead time) booking into the Speakeasy's reserved capacity
+  // or ahead of their priority-holiday window — same override-with-confirm
+  // pattern as pacing, since staff sometimes have a legitimate reason to
+  // seat someone there anyway (a VIP walk-in, a manager's call).
+  const vaultAreaId = (tableId && tableById(tableId)?.area_id) || document.getElementById('resArea')?.value || null;
+  if (vaultAreaId){
+    const reason = vaultHolidayWindowReason(vaultAreaId, date, guestId) || vaultCapacityReason(vaultAreaId, date, time, duration, partySize, guestId, dateReservations, id);
+    if (reason){
+      const ok = confirm(`🗝️ Vault priority: ${reason}\n\nBook anyway?`);
+      if (!ok) return;
     }
   }
 
@@ -1890,6 +2062,55 @@ window.setAreaMaxCovers = async function(areaId, value){
   await sb.from('floor_areas').update({ max_covers_per_slot: covers }).eq('id', areaId);
   await reloadAreas();
 };
+// A blank field means "no Vault carve-out for this area" — stored as NULL.
+window.setAreaMemberPrioritySeats = async function(areaId, value){
+  const trimmed = String(value).trim();
+  let seats = null;
+  if (trimmed !== ''){
+    seats = Number(trimmed);
+    if (isNaN(seats) || seats < 0){ alert('Enter a valid seat count (0 or more), or leave it blank for no Vault carve-out.'); await reloadAreas(); render(); return; }
+  }
+  await sb.from('floor_areas').update({ member_priority_seats: seats }).eq('id', areaId);
+  await reloadAreas();
+};
+window.setAreaMemberPriorityReleaseHours = async function(areaId, value){
+  const hours = Number(value);
+  if (isNaN(hours) || hours < 0){ alert('Enter a valid number of hours (0 or more).'); await reloadAreas(); render(); return; }
+  await sb.from('floor_areas').update({ member_priority_release_hours: hours }).eq('id', areaId);
+  await reloadAreas();
+};
+
+window.setLoyaltyTierField = async function(tierKey, field, value){
+  let payload;
+  if (field === 'vault_access'){
+    payload = { vault_access: !!value };
+  } else {
+    const num = Number(value);
+    if (isNaN(num) || num < 0){ alert('Enter a valid number.'); await reloadLoyaltyTiers(); render(); return; }
+    payload = { [field]: num };
+  }
+  const { error } = await sb.from('loyalty_tiers').update(payload).eq('key', tierKey);
+  if (error){ alert('Error: '+error.message); }
+  await reloadLoyaltyTiers();
+};
+
+window.addPriorityHoliday = async function(){
+  const dateEl = document.getElementById('newHolidayDate');
+  const labelEl = document.getElementById('newHolidayLabel');
+  const date = dateEl?.value;
+  const label = (labelEl?.value || '').trim();
+  if (!date || !label){ alert('Enter both a date and a label.'); return; }
+  const { error } = await sb.from('priority_holidays').insert({ holiday_date: date, label });
+  if (error){ alert('Error: '+error.message); return; }
+  await reloadPriorityHolidays();
+  render();
+};
+window.deletePriorityHoliday = async function(id){
+  if (!confirm('Remove this priority holiday?')) return;
+  await sb.from('priority_holidays').delete().eq('id', id);
+  await reloadPriorityHolidays();
+  render();
+};
 
 window.setStatusColor = async function(key, hex){
   const updated = { ...statusColors(), [key]: hex };
@@ -2136,14 +2357,18 @@ let _guestSearch = '';
 function renderGuestsTab(){
   const q = _guestSearch.toLowerCase();
   const list = state.guests.filter(g => !q || guestName(g).toLowerCase().includes(q) || (g.phone||'').includes(q)).slice(0,60);
-  const items = list.length ? list.map(g => `
+  const items = list.length ? list.map(g => {
+    const member = activeLoyaltyMember(g.id);
+    const tier = member ? loyaltyTierByKey(member.tier_key) : null;
+    return `
     <div class="guest-item" onclick="openGuestModal('${g.id}')">
       <div>
-        <div class="res-name">${esc(guestName(g))} ${g.vip ? '<span class="badge badge-vip">VIP</span>':''}</div>
+        <div class="res-name">${esc(guestName(g))} ${g.vip ? '<span class="badge badge-vip">VIP</span>':''} ${tier ? `<span class="badge badge-vip" style="background:#122b22">${esc(tier.name)}</span>`:''}</div>
         <div class="res-meta">${esc(g.phone||'no phone')} · ${g.visit_count} visits${g.no_show_count ? ' · '+g.no_show_count+' no-shows':''}</div>
       </div>
       <div>${(g.tags||[]).map(t=>`<span class="badge badge-confirmed">${esc(t)}</span>`).join(' ')}</div>
-    </div>`).join('') : `<div class="empty-state"><div class="empty-state-icon">👥</div>No guests found.</div>`;
+    </div>`;
+  }).join('') : `<div class="empty-state"><div class="empty-state-icon">👥</div>No guests found.</div>`;
 
   return `
   <div class="panel-header">
@@ -2182,12 +2407,132 @@ window.openGuestModal = function(id){
     ${g ? `<div class="modal-section"><h4>Stats</h4><div class="res-meta">${g.visit_count} visits · ${g.no_show_count} no-shows · last visit ${g.last_visit_at ? new Date(g.last_visit_at).toLocaleDateString() : 'never'}</div>
       ${history.length ? `<div style="margin-top:8px">${history.map(r=>`<div class="res-meta">${r.reservation_date} ${fmtTime(r.reservation_time)} — ${r.status}</div>`).join('')}</div>`:''}
       </div>` : ''}
+    ${g ? renderLoyaltySection(g) : ''}
     <div class="modal-actions">
       ${g ? `<button class="modal-btn modal-btn-danger" onclick="deleteGuest('${g.id}')">Delete</button>` : ''}
       <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
       <button class="modal-btn modal-btn-primary" onclick="saveGuest(${g ? `'${g.id}'` : 'null'})">Save</button>
     </div>`;
   document.getElementById('formModal').classList.remove('hidden');
+};
+
+// ---- Loyalty membership management (inside the Guest modal) ---------------
+function renderLoyaltySection(g){
+  const member = loyaltyMemberByGuestId(g.id);
+  const tierOptions = state.loyaltyTiers.map(t => `<option value="${t.key}">${esc(t.name)} — $${t.monthly_price}/mo</option>`).join('');
+
+  if (!member){
+    return `<div class="modal-section"><h4>Loyalty Membership</h4>
+      <div class="res-meta" style="margin-bottom:8px">Not enrolled.</div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <select class="modal-select" style="margin:0" id="loyaltyEnrollTier">${tierOptions}</select>
+        <button class="btn btn-sm btn-primary" onclick="enrollLoyalty('${g.id}')">Enroll</button>
+      </div>
+    </div>`;
+  }
+
+  const tier = loyaltyTierByKey(member.tier_key);
+  const cocktailsLeft = cocktailsRemaining(member);
+  const creditLeft = creditRemaining(member);
+  const suspended = member.priority_suspended_until && member.priority_suspended_until >= todayISO();
+
+  if (member.status === 'cancelled'){
+    return `<div class="modal-section"><h4>Loyalty Membership</h4>
+      <div class="res-meta">${esc(tier?.name||member.tier_key)} — cancelled ${member.cancelled_at ? 'on '+new Date(member.cancelled_at).toLocaleDateString() : ''}</div>
+      <div class="modal-actions" style="padding-top:10px;justify-content:flex-start">
+        <button class="btn btn-sm btn-primary" onclick="reactivateLoyalty('${member.id}')">Re-enroll (new 12-month term)</button>
+      </div>
+    </div>`;
+  }
+
+  return `<div class="modal-section"><h4>Loyalty Membership</h4>
+    <div class="res-meta"><b>${esc(tier?.name||member.tier_key)}</b> · joined ${new Date(member.joined_at).toLocaleDateString()} · commitment through ${member.commitment_end_at ? new Date(member.commitment_end_at).toLocaleDateString() : '—'}</div>
+    <div class="res-meta" style="margin-top:4px">🍸 ${cocktailsLeft} of ${tier?.cocktails_per_month||0} featured cocktails left this month</div>
+    <div class="res-meta">💳 $${creditLeft.toFixed(2)} of $${(tier?.credit_per_quarter||0).toFixed(2)} credit left this quarter (min. check $${tier?.credit_min_check||0})</div>
+    ${tier?.vault_access ? `<div class="res-meta">🗝️ Vault access — member + ${tier.vault_guest_allowance} guest${tier.vault_guest_allowance===1?'':'s'}</div>` : `<div class="res-meta">No Vault access at this tier.</div>`}
+    ${suspended ? `<div class="res-meta" style="color:var(--danger);font-weight:600">⚠️ Priority booking suspended until ${new Date(member.priority_suspended_until).toLocaleDateString()} (no-show policy)</div>` : ''}
+    <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap;">
+      <button class="btn btn-sm btn-secondary" onclick="redeemLoyaltyCocktail('${member.id}')" ${cocktailsLeft<=0?'disabled':''}>Log cocktail redemption</button>
+      <button class="btn btn-sm btn-secondary" onclick="redeemLoyaltyCredit('${member.id}')" ${creditLeft<=0?'disabled':''}>Log credit redemption</button>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:10px;">
+      <select class="modal-select" style="margin:0" id="loyaltyChangeTier-${member.id}">${state.loyaltyTiers.map(t=>`<option value="${t.key}" ${t.key===member.tier_key?'selected':''}>${esc(t.name)}</option>`).join('')}</select>
+      <button class="btn btn-sm btn-secondary" onclick="changeLoyaltyTier('${member.id}')">Change tier</button>
+      <button class="btn btn-sm btn-danger" onclick="cancelLoyaltyMembership('${member.id}')">Cancel membership</button>
+    </div>
+  </div>`;
+}
+
+window.enrollLoyalty = async function(guestId){
+  const tierKey = document.getElementById('loyaltyEnrollTier').value;
+  const joined = todayISO();
+  const end = new Date(joined); end.setFullYear(end.getFullYear()+1);
+  const { error } = await sb.from('loyalty_members').insert({
+    guest_id: guestId, tier_key: tierKey, status: 'active', joined_at: joined,
+    commitment_end_at: toLocalISODate(end),
+  });
+  if (error){ alert('Error: '+error.message); return; }
+  await reloadLoyaltyMembers();
+  openGuestModal(guestId);
+};
+
+window.changeLoyaltyTier = async function(memberId){
+  const tierKey = document.getElementById('loyaltyChangeTier-'+memberId).value;
+  await sb.from('loyalty_members').update({ tier_key: tierKey }).eq('id', memberId);
+  await reloadLoyaltyMembers();
+  const m = state.loyaltyMembers.find(x=>x.id===memberId);
+  await reloadGuests();
+  if (m) openGuestModal(m.guest_id);
+};
+
+window.cancelLoyaltyMembership = async function(memberId){
+  if (!confirm('Cancel this membership? Unused credit/cocktails for the current period will be forfeited per the membership terms.')) return;
+  const m = state.loyaltyMembers.find(x=>x.id===memberId);
+  await sb.from('loyalty_members').update({ status:'cancelled', cancelled_at: todayISO() }).eq('id', memberId);
+  await reloadLoyaltyMembers();
+  await reloadGuests();
+  if (m) openGuestModal(m.guest_id);
+};
+
+window.reactivateLoyalty = async function(memberId){
+  const joined = todayISO();
+  const end = new Date(joined); end.setFullYear(end.getFullYear()+1);
+  const m = state.loyaltyMembers.find(x=>x.id===memberId);
+  await sb.from('loyalty_members').update({
+    status:'active', joined_at: joined, commitment_end_at: toLocalISODate(end), cancelled_at: null,
+    cocktails_used_period: 0, cocktails_period_key: null, credit_used_period: 0, credit_period_key: null,
+  }).eq('id', memberId);
+  await reloadLoyaltyMembers();
+  await reloadGuests();
+  if (m) openGuestModal(m.guest_id);
+};
+
+window.redeemLoyaltyCocktail = async function(memberId){
+  const m = state.loyaltyMembers.find(x=>x.id===memberId);
+  if (!m) return;
+  const period = currentMonthKey();
+  const used = (m.cocktails_period_key === period ? m.cocktails_used_period : 0) + 1;
+  await sb.from('loyalty_members').update({ cocktails_used_period: used, cocktails_period_key: period }).eq('id', memberId);
+  await sb.from('loyalty_redemptions').insert({ loyalty_member_id: memberId, type:'cocktail', amount: 1 });
+  await reloadLoyaltyMembers();
+  openGuestModal(m.guest_id);
+};
+
+window.redeemLoyaltyCredit = async function(memberId){
+  const m = state.loyaltyMembers.find(x=>x.id===memberId);
+  if (!m) return;
+  const tier = loyaltyTierByKey(m.tier_key);
+  const remaining = creditRemaining(m);
+  const input = prompt(`Amount to redeem (up to $${remaining.toFixed(2)} left this quarter):`, remaining.toFixed(2));
+  const amount = Number(input);
+  if (!input || !amount || amount <= 0){ return; }
+  if (amount > remaining){ alert(`That's more than the $${remaining.toFixed(2)} remaining this quarter.`); return; }
+  const period = currentQuarterKey();
+  const used = (m.credit_period_key === period ? m.credit_used_period : 0) + amount;
+  await sb.from('loyalty_members').update({ credit_used_period: used, credit_period_key: period }).eq('id', memberId);
+  await sb.from('loyalty_redemptions').insert({ loyalty_member_id: memberId, type:'credit', amount });
+  await reloadLoyaltyMembers();
+  openGuestModal(m.guest_id);
 };
 
 window.saveGuest = async function(id){
@@ -2206,10 +2551,13 @@ window.saveGuest = async function(id){
     : await sb.from('guests').insert(payload);
   if (error){ alert('Error: '+error.message); return; }
   closeModal('formModal');
-  const { data } = await sb.from('guests').select('*').order('last_name');
-  state.guests = data || [];
+  await reloadGuests();
   render();
 };
+async function reloadGuests(){
+  const { data } = await sb.from('guests').select('*').order('last_name');
+  state.guests = data || [];
+}
 
 window.deleteGuest = async function(id){
   if (!confirm('Delete this guest record?')) return;
@@ -2319,19 +2667,53 @@ function renderSettingsTab(){
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">${state.tables.filter(t=>!t.is_combo).length} tables across ${state.areas.length} area${state.areas.length===1?'':'s'}. Add, rename, resize, delete, and drag-position tables on your floor plan sketch from the <b>Floor Plan</b> tab.</div>
     <table class="data-table">
-      <thead><tr><th>Area</th><th>Table Count</th><th>Default Duration (min)</th><th>Pacing Cap (covers / 15 min)</th></tr></thead>
+      <thead><tr><th>Area</th><th>Table Count</th><th>Default Duration (min)</th><th>Pacing Cap (covers / 15 min)</th><th>Vault Seats Reserved for Members</th><th>Release (hrs before service)</th></tr></thead>
       <tbody>
         ${state.areas.map(a => `<tr>
           <td>${esc(a.name)}</td>
           <td>${state.tables.filter(t=>t.area_id===a.id).length}</td>
           <td><input type="number" min="15" step="15" max="480" class="modal-input" style="margin:0;width:90px;padding:4px 8px" value="${a.default_duration_minutes || 90}" onchange="setAreaDefaultDuration('${a.id}', this.value)"/></td>
           <td><input type="number" min="1" step="1" class="modal-input" style="margin:0;width:90px;padding:4px 8px" placeholder="No cap" value="${a.max_covers_per_slot || ''}" onchange="setAreaMaxCovers('${a.id}', this.value)"/></td>
+          <td><input type="number" min="0" step="1" class="modal-input" style="margin:0;width:90px;padding:4px 8px" placeholder="None" value="${a.member_priority_seats ?? ''}" onchange="setAreaMemberPrioritySeats('${a.id}', this.value)"/></td>
+          <td><input type="number" min="0" step="1" class="modal-input" style="margin:0;width:90px;padding:4px 8px" value="${a.member_priority_release_hours ?? 2}" onchange="setAreaMemberPriorityReleaseHours('${a.id}', this.value)"/></td>
         </tr>`).join('')}
-        ${state.tables.some(t=>!t.area_id) ? `<tr><td>Unassigned</td><td>${state.tables.filter(t=>!t.area_id).length}</td><td>—</td><td>—</td></tr>` : ''}
+        ${state.tables.some(t=>!t.area_id) ? `<tr><td>Unassigned</td><td>${state.tables.filter(t=>!t.area_id).length}</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>` : ''}
       </tbody>
     </table>
-    <div class="panel-sub" style="margin-top:8px">Each area's default duration pre-fills the Duration field on a new reservation once you pick a table there — the hostess can always type over it. The Pacing Cap limits how many total covers (guests) can be booked into any single 15-minute arrival window for that area — it warns and asks for confirmation before saving a reservation that would go over, rather than blocking it outright. Leave it blank for no cap.</div>
+    <div class="panel-sub" style="margin-top:8px">Each area's default duration pre-fills the Duration field on a new reservation once you pick a table there — the hostess can always type over it. The Pacing Cap limits how many total covers (guests) can be booked into any single 15-minute arrival window for that area. "Vault Seats Reserved for Members" holds that many seats back for active loyalty members until the release window before service — leave blank for areas with no loyalty carve-out (only the Speakeasy has one by default). All of these warn and ask for confirmation rather than blocking outright.</div>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="setTab('floorplan')">🗺️ Open Floor Plan Editor</button></div>
+  </div>
+
+  <div class="section-heading">Loyalty Program</div>
+  <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">Membership tier terms. Changing a number here only affects future redemption counting and new enrollments — it does not retroactively change what a member has already used this period.</div>
+    <table class="data-table">
+      <thead><tr><th>Tier</th><th>Price/mo</th><th>Cocktails/mo</th><th>Credit/qtr</th><th>Min. check</th><th>Vault access</th><th>Vault guests</th><th>Event discount %</th></tr></thead>
+      <tbody>
+        ${state.loyaltyTiers.map(t => `<tr>
+          <td><b>${esc(t.name)}</b></td>
+          <td>$<input type="number" min="0" step="1" class="modal-input" style="margin:0;width:70px;padding:4px 8px;display:inline-block" value="${t.monthly_price}" onchange="setLoyaltyTierField('${t.key}','monthly_price',this.value)"/></td>
+          <td><input type="number" min="0" step="1" class="modal-input" style="margin:0;width:60px;padding:4px 8px" value="${t.cocktails_per_month}" onchange="setLoyaltyTierField('${t.key}','cocktails_per_month',this.value)"/></td>
+          <td>$<input type="number" min="0" step="1" class="modal-input" style="margin:0;width:70px;padding:4px 8px;display:inline-block" value="${t.credit_per_quarter}" onchange="setLoyaltyTierField('${t.key}','credit_per_quarter',this.value)"/></td>
+          <td>$<input type="number" min="0" step="1" class="modal-input" style="margin:0;width:70px;padding:4px 8px;display:inline-block" value="${t.credit_min_check}" onchange="setLoyaltyTierField('${t.key}','credit_min_check',this.value)"/></td>
+          <td><input type="checkbox" ${t.vault_access?'checked':''} onchange="setLoyaltyTierField('${t.key}','vault_access',this.checked)"/></td>
+          <td><input type="number" min="0" step="1" class="modal-input" style="margin:0;width:60px;padding:4px 8px" value="${t.vault_guest_allowance}" onchange="setLoyaltyTierField('${t.key}','vault_guest_allowance',this.value)"/></td>
+          <td><input type="number" min="0" max="100" step="1" class="modal-input" style="margin:0;width:60px;padding:4px 8px" value="${t.discount_pct}" onchange="setLoyaltyTierField('${t.key}','discount_pct',this.value)"/></td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    <div class="panel-sub" style="margin-top:14px;margin-bottom:8px"><b>Priority Holidays</b> — Founder's Circle gets a 14-day booking lead on these dates (everyone else, including Society, gets the standard 3 days). Doesn't apply to regular nights.</div>
+    <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px">
+      ${state.priorityHolidays.map(h => `<div style="display:flex;align-items:center;gap:10px;font-size:13px">
+        <span style="min-width:110px">${esc(fmtDateHuman(h.holiday_date))}</span><span style="flex:1">${esc(h.label)}</span>
+        <span class="linkBtn" style="cursor:pointer;color:var(--danger)" onclick="deletePriorityHoliday('${h.id}')">Remove</span>
+      </div>`).join('') || '<span class="panel-sub" style="margin:0">No priority holidays added yet.</span>'}
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input type="date" class="modal-input" style="margin:0;width:auto" id="newHolidayDate"/>
+      <input type="text" class="modal-input" style="margin:0" id="newHolidayLabel" placeholder="Label (e.g. New Year's Eve)"/>
+      <button class="btn btn-secondary btn-sm" onclick="addPriorityHoliday()">Add</button>
+    </div>
   </div>
 
   <div class="section-heading">Table Status Colors</div>
