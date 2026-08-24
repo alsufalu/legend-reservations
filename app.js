@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.47';
+const APP_VERSION = '1.48';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -499,6 +499,8 @@ function hasActivePriorityAccess(guestId){
   const m = activeLoyaltyMember(guestId);
   if (!m) return false;
   if (m.priority_suspended_until && m.priority_suspended_until >= todayISO()) return false;
+  const vaultAccess = m.locked_vault_access ?? loyaltyTierByKey(m.tier_key)?.vault_access ?? false;
+  if (!vaultAccess) return false;
   return true;
 }
 function currentMonthKey(){ const d = getNow(); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0'); }
@@ -506,17 +508,28 @@ function currentQuarterKey(){ const d = getNow(); return d.getFullYear() + '-Q' 
 // Redemption counters reset lazily on first read of a new period rather than
 // a scheduled job — if the stored period_key doesn't match "now", the member
 // simply hasn't used anything yet this period.
+// Reads from the price/benefit snapshot locked in at enrollment (or last tier
+// change) rather than the live loyalty_tiers row, so editing tier terms in
+// Settings only affects new enrollments — not members already signed up.
+function lockedCocktailsPerMonth(member){
+  return member.locked_cocktails_per_month ?? loyaltyTierByKey(member.tier_key)?.cocktails_per_month ?? 0;
+}
+function lockedCreditPerQuarter(member){
+  return member.locked_credit_per_quarter ?? loyaltyTierByKey(member.tier_key)?.credit_per_quarter ?? 0;
+}
 function cocktailsRemaining(member){
-  const tier = loyaltyTierByKey(member.tier_key);
-  if (!tier) return 0;
   const used = member.cocktails_period_key === currentMonthKey() ? member.cocktails_used_period : 0;
-  return Math.max(0, tier.cocktails_per_month - used);
+  return Math.max(0, lockedCocktailsPerMonth(member) - used);
 }
 function creditRemaining(member){
-  const tier = loyaltyTierByKey(member.tier_key);
-  if (!tier) return 0;
   const used = member.credit_period_key === currentQuarterKey() ? member.credit_used_period : 0;
-  return Math.max(0, tier.credit_per_quarter - used);
+  return Math.max(0, lockedCreditPerQuarter(member) - used);
+}
+function nextBillingDue(member){
+  const base = member.last_billed_at || member.joined_at;
+  if (!base) return null;
+  const d = new Date(base + 'T00:00:00'); d.setMonth(d.getMonth()+1);
+  return toLocalISODate(d);
 }
 async function reloadLoyaltyMembers(){
   const { data } = await sb.from('loyalty_members').select('*');
@@ -723,6 +736,7 @@ function render(){
   else if (state.tab === 'split') { c.innerHTML = renderSplitViewTab(); fitFloorCanvasView(); }
   else if (state.tab === 'waitlist') c.innerHTML = renderWaitlistTab();
   else if (state.tab === 'guests') c.innerHTML = renderGuestsTab();
+  else if (state.tab === 'loyalty') c.innerHTML = renderLoyaltyTab();
   else if (state.tab === 'dashboard') { c.innerHTML = renderDashboardTab(); loadDashboard(); }
   else if (state.tab === 'settings') c.innerHTML = renderSettingsTab();
 }
@@ -2354,16 +2368,74 @@ window.seatFromWaitlist = async function(id){
 // GUESTS TAB
 // ============================================================================
 let _guestSearch = '';
+let _loyaltySearch = '';
+let _loyaltyStatusFilter = 'active';
+
+// ---- Loyalty Members roster (all members, one row each) -------------------
+function renderLoyaltyTab(){
+  const q = _loyaltySearch.toLowerCase();
+  let list = state.loyaltyMembers.map(m => ({ m, g: guestById(m.guest_id) }))
+    .filter(x => x.g);
+  if (_loyaltyStatusFilter !== 'all') list = list.filter(x => x.m.status === _loyaltyStatusFilter);
+  if (q) list = list.filter(x => guestName(x.g).toLowerCase().includes(q));
+  list.sort((a,b) => guestName(a.g).localeCompare(guestName(b.g)));
+
+  const activeMembers = state.loyaltyMembers.filter(m => m.status === 'active');
+  const mrr = activeMembers.reduce((s,m) => s + Number(m.locked_monthly_price ?? loyaltyTierByKey(m.tier_key)?.monthly_price ?? 0), 0);
+  const byTier = {};
+  activeMembers.forEach(m => { byTier[m.tier_key] = (byTier[m.tier_key]||0) + 1; });
+  const tierSummary = state.loyaltyTiers.map(t => `${t.name}: ${byTier[t.key]||0}`).join(' · ');
+
+  const rows = list.map(({m,g}) => {
+    const tierName = m.locked_tier_name || loyaltyTierByKey(m.tier_key)?.name || m.tier_key;
+    const suspended = m.priority_suspended_until && m.priority_suspended_until >= todayISO();
+    const nextDue = nextBillingDue(m);
+    const statusBadge = m.status === 'cancelled'
+      ? `<span class="badge badge-cancelled">Cancelled</span>`
+      : suspended ? `<span class="badge badge-no_show">Suspended</span>` : `<span class="badge badge-confirmed">Active</span>`;
+    return `<tr style="cursor:pointer" onclick="openGuestModal('${g.id}')">
+      <td>${esc(guestName(g))}</td>
+      <td>${esc(tierName)}</td>
+      <td>${statusBadge}</td>
+      <td>${m.status==='cancelled' ? '—' : `${cocktailsRemaining(m)} / ${lockedCocktailsPerMonth(m)}`}</td>
+      <td>${m.status==='cancelled' ? '—' : `$${creditRemaining(m).toFixed(2)} / $${lockedCreditPerQuarter(m).toFixed(2)}`}</td>
+      <td>${new Date(m.joined_at).toLocaleDateString()}</td>
+      <td>${m.commitment_end_at ? new Date(m.commitment_end_at).toLocaleDateString() : '—'}</td>
+      <td>${m.last_billed_at ? new Date(m.last_billed_at).toLocaleDateString() : 'never'}</td>
+      <td>${m.status==='cancelled' ? '—' : (nextDue ? new Date(nextDue).toLocaleDateString() : '—')}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+  <div class="panel-header">
+    <div><h2 class="panel-title">Loyalty Members</h2><div class="panel-sub">${activeMembers.length} active members · $${mrr.toFixed(2)}/mo recurring · ${tierSummary}</div></div>
+  </div>
+  <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+    <input type="text" class="search-input" style="margin:0;flex:1;min-width:200px" placeholder="Search by name…" value="${esc(_loyaltySearch)}" oninput="searchLoyalty(this.value)"/>
+    <select class="modal-select" style="margin:0;width:auto" onchange="filterLoyaltyStatus(this.value)">
+      <option value="active" ${_loyaltyStatusFilter==='active'?'selected':''}>Active only</option>
+      <option value="cancelled" ${_loyaltyStatusFilter==='cancelled'?'selected':''}>Cancelled only</option>
+      <option value="all" ${_loyaltyStatusFilter==='all'?'selected':''}>All</option>
+    </select>
+  </div>
+  ${list.length ? `<table class="data-table">
+    <thead><tr><th>Guest</th><th>Tier</th><th>Status</th><th>Cocktails left/mo</th><th>Credit left/qtr</th><th>Joined</th><th>Commitment ends</th><th>Last billed</th><th>Next due</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>` : `<div class="empty-state"><div class="empty-state-icon">💳</div>No members match.</div>`}
+  <div class="panel-sub" style="margin-top:10px">Click a row to open that guest's profile and manage their membership. Billing dates are logged manually here — this app doesn't charge cards.</div>`;
+}
+window.searchLoyalty = function(v){ _loyaltySearch = v; render(); };
+window.filterLoyaltyStatus = function(v){ _loyaltyStatusFilter = v; render(); };
 function renderGuestsTab(){
   const q = _guestSearch.toLowerCase();
   const list = state.guests.filter(g => !q || guestName(g).toLowerCase().includes(q) || (g.phone||'').includes(q)).slice(0,60);
   const items = list.length ? list.map(g => {
     const member = activeLoyaltyMember(g.id);
-    const tier = member ? loyaltyTierByKey(member.tier_key) : null;
+    const memberTierName = member ? (member.locked_tier_name || loyaltyTierByKey(member.tier_key)?.name) : null;
     return `
     <div class="guest-item" onclick="openGuestModal('${g.id}')">
       <div>
-        <div class="res-name">${esc(guestName(g))} ${g.vip ? '<span class="badge badge-vip">VIP</span>':''} ${tier ? `<span class="badge badge-vip" style="background:#122b22">${esc(tier.name)}</span>`:''}</div>
+        <div class="res-name">${esc(guestName(g))} ${g.vip ? '<span class="badge badge-vip">VIP</span>':''} ${memberTierName ? `<span class="badge badge-vip" style="background:#122b22">${esc(memberTierName)}</span>`:''}</div>
         <div class="res-meta">${esc(g.phone||'no phone')} · ${g.visit_count} visits${g.no_show_count ? ' · '+g.no_show_count+' no-shows':''}</div>
       </div>
       <div>${(g.tags||[]).map(t=>`<span class="badge badge-confirmed">${esc(t)}</span>`).join(' ')}</div>
@@ -2432,13 +2504,19 @@ function renderLoyaltySection(g){
   }
 
   const tier = loyaltyTierByKey(member.tier_key);
+  const tierName = member.locked_tier_name || tier?.name || member.tier_key;
+  const price = member.locked_monthly_price ?? tier?.monthly_price;
+  const vaultAccess = member.locked_vault_access ?? tier?.vault_access ?? false;
+  const vaultGuests = member.locked_vault_guest_allowance ?? tier?.vault_guest_allowance ?? 0;
+  const creditMin = member.locked_credit_min_check ?? tier?.credit_min_check ?? 0;
   const cocktailsLeft = cocktailsRemaining(member);
   const creditLeft = creditRemaining(member);
   const suspended = member.priority_suspended_until && member.priority_suspended_until >= todayISO();
+  const nextDue = nextBillingDue(member);
 
   if (member.status === 'cancelled'){
     return `<div class="modal-section"><h4>Loyalty Membership</h4>
-      <div class="res-meta">${esc(tier?.name||member.tier_key)} — cancelled ${member.cancelled_at ? 'on '+new Date(member.cancelled_at).toLocaleDateString() : ''}</div>
+      <div class="res-meta">${esc(tierName)} — cancelled ${member.cancelled_at ? 'on '+new Date(member.cancelled_at).toLocaleDateString() : ''}</div>
       <div class="modal-actions" style="padding-top:10px;justify-content:flex-start">
         <button class="btn btn-sm btn-primary" onclick="reactivateLoyalty('${member.id}')">Re-enroll (new 12-month term)</button>
       </div>
@@ -2446,21 +2524,37 @@ function renderLoyaltySection(g){
   }
 
   return `<div class="modal-section"><h4>Loyalty Membership</h4>
-    <div class="res-meta"><b>${esc(tier?.name||member.tier_key)}</b> · joined ${new Date(member.joined_at).toLocaleDateString()} · commitment through ${member.commitment_end_at ? new Date(member.commitment_end_at).toLocaleDateString() : '—'}</div>
-    <div class="res-meta" style="margin-top:4px">🍸 ${cocktailsLeft} of ${tier?.cocktails_per_month||0} featured cocktails left this month</div>
-    <div class="res-meta">💳 $${creditLeft.toFixed(2)} of $${(tier?.credit_per_quarter||0).toFixed(2)} credit left this quarter (min. check $${tier?.credit_min_check||0})</div>
-    ${tier?.vault_access ? `<div class="res-meta">🗝️ Vault access — member + ${tier.vault_guest_allowance} guest${tier.vault_guest_allowance===1?'':'s'}</div>` : `<div class="res-meta">No Vault access at this tier.</div>`}
+    <div class="res-meta"><b>${esc(tierName)}</b> — $${(price??0).toFixed(2)}/mo (locked in at signup) · joined ${new Date(member.joined_at).toLocaleDateString()} · commitment through ${member.commitment_end_at ? new Date(member.commitment_end_at).toLocaleDateString() : '—'}</div>
+    <div class="res-meta" style="margin-top:4px">🍸 ${cocktailsLeft} of ${lockedCocktailsPerMonth(member)} featured cocktails left this month</div>
+    <div class="res-meta">💳 $${creditLeft.toFixed(2)} of $${lockedCreditPerQuarter(member).toFixed(2)} credit left this quarter (min. check $${creditMin})</div>
+    ${vaultAccess ? `<div class="res-meta">🗝️ Vault access — member + ${vaultGuests} guest${vaultGuests===1?'':'s'}</div>` : `<div class="res-meta">No Vault access at this tier.</div>`}
+    <div class="res-meta">💵 Last billed ${member.last_billed_at ? new Date(member.last_billed_at).toLocaleDateString() : 'never logged'} · next due ${nextDue ? new Date(nextDue).toLocaleDateString() : '—'}</div>
     ${suspended ? `<div class="res-meta" style="color:var(--danger);font-weight:600">⚠️ Priority booking suspended until ${new Date(member.priority_suspended_until).toLocaleDateString()} (no-show policy)</div>` : ''}
     <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap;">
       <button class="btn btn-sm btn-secondary" onclick="redeemLoyaltyCocktail('${member.id}')" ${cocktailsLeft<=0?'disabled':''}>Log cocktail redemption</button>
       <button class="btn btn-sm btn-secondary" onclick="redeemLoyaltyCredit('${member.id}')" ${creditLeft<=0?'disabled':''}>Log credit redemption</button>
+      <button class="btn btn-sm btn-secondary" onclick="logLoyaltyBilling('${member.id}')">Log billing charge</button>
     </div>
     <div style="display:flex;gap:8px;align-items:center;margin-top:10px;">
-      <select class="modal-select" style="margin:0" id="loyaltyChangeTier-${member.id}">${state.loyaltyTiers.map(t=>`<option value="${t.key}" ${t.key===member.tier_key?'selected':''}>${esc(t.name)}</option>`).join('')}</select>
+      <select class="modal-select" style="margin:0" id="loyaltyChangeTier-${member.id}">${state.loyaltyTiers.map(t=>`<option value="${t.key}" ${t.key===member.tier_key?'selected':''}>${esc(t.name)} — $${t.monthly_price}/mo</option>`).join('')}</select>
       <button class="btn btn-sm btn-secondary" onclick="changeLoyaltyTier('${member.id}')">Change tier</button>
       <button class="btn btn-sm btn-danger" onclick="cancelLoyaltyMembership('${member.id}')">Cancel membership</button>
     </div>
+    <div class="panel-sub" style="margin-top:6px">Changing tier re-locks pricing and benefits to that tier's current terms.</div>
   </div>`;
+}
+
+// Snapshots a tier's current price/benefits so future edits in Settings
+// don't retroactively reprice a member already locked into these terms.
+function lockedFieldsForTier(tierKey){
+  const t = loyaltyTierByKey(tierKey);
+  if (!t) return {};
+  return {
+    locked_tier_name: t.name, locked_monthly_price: t.monthly_price,
+    locked_cocktails_per_month: t.cocktails_per_month, locked_credit_per_quarter: t.credit_per_quarter,
+    locked_credit_min_check: t.credit_min_check, locked_vault_access: t.vault_access,
+    locked_vault_guest_allowance: t.vault_guest_allowance, locked_discount_pct: t.discount_pct,
+  };
 }
 
 window.enrollLoyalty = async function(guestId){
@@ -2469,7 +2563,7 @@ window.enrollLoyalty = async function(guestId){
   const end = new Date(joined); end.setFullYear(end.getFullYear()+1);
   const { error } = await sb.from('loyalty_members').insert({
     guest_id: guestId, tier_key: tierKey, status: 'active', joined_at: joined,
-    commitment_end_at: toLocalISODate(end),
+    commitment_end_at: toLocalISODate(end), ...lockedFieldsForTier(tierKey),
   });
   if (error){ alert('Error: '+error.message); return; }
   await reloadLoyaltyMembers();
@@ -2478,10 +2572,18 @@ window.enrollLoyalty = async function(guestId){
 
 window.changeLoyaltyTier = async function(memberId){
   const tierKey = document.getElementById('loyaltyChangeTier-'+memberId).value;
-  await sb.from('loyalty_members').update({ tier_key: tierKey }).eq('id', memberId);
+  if (!confirm('Changing tier re-locks this member into the new tier\'s current price and benefits. Continue?')) return;
+  await sb.from('loyalty_members').update({ tier_key: tierKey, ...lockedFieldsForTier(tierKey) }).eq('id', memberId);
   await reloadLoyaltyMembers();
   const m = state.loyaltyMembers.find(x=>x.id===memberId);
   await reloadGuests();
+  if (m) openGuestModal(m.guest_id);
+};
+
+window.logLoyaltyBilling = async function(memberId){
+  await sb.from('loyalty_members').update({ last_billed_at: todayISO() }).eq('id', memberId);
+  await reloadLoyaltyMembers();
+  const m = state.loyaltyMembers.find(x=>x.id===memberId);
   if (m) openGuestModal(m.guest_id);
 };
 
@@ -2501,6 +2603,7 @@ window.reactivateLoyalty = async function(memberId){
   await sb.from('loyalty_members').update({
     status:'active', joined_at: joined, commitment_end_at: toLocalISODate(end), cancelled_at: null,
     cocktails_used_period: 0, cocktails_period_key: null, credit_used_period: 0, credit_period_key: null,
+    last_billed_at: null, ...(m ? lockedFieldsForTier(m.tier_key) : {}),
   }).eq('id', memberId);
   await reloadLoyaltyMembers();
   await reloadGuests();
