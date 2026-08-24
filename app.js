@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.48';
+const APP_VERSION = '1.50';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -2455,7 +2455,6 @@ window.searchGuests = function(v){ _guestSearch = v; render(); };
 
 window.openGuestModal = function(id){
   const g = id ? guestById(id) : null;
-  const history = id ? state.reservations.filter(r => r.guest_id === id) : [];
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
     <h3>${g ? 'Edit Guest' : 'New Guest'}</h3>
@@ -2476,9 +2475,8 @@ window.openGuestModal = function(id){
     <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px;">
       <input type="checkbox" id="gVip" ${g?.vip ? 'checked':''}/> VIP guest
     </label>
-    ${g ? `<div class="modal-section"><h4>Stats</h4><div class="res-meta">${g.visit_count} visits · ${g.no_show_count} no-shows · last visit ${g.last_visit_at ? new Date(g.last_visit_at).toLocaleDateString() : 'never'}</div>
-      ${history.length ? `<div style="margin-top:8px">${history.map(r=>`<div class="res-meta">${r.reservation_date} ${fmtTime(r.reservation_time)} — ${r.status}</div>`).join('')}</div>`:''}
-      </div>` : ''}
+    ${g ? `<div class="modal-section"><h4>Stats</h4><div class="res-meta">${g.visit_count} visits · ${g.no_show_count} no-shows · last visit ${g.last_visit_at ? new Date(g.last_visit_at).toLocaleDateString() : 'never'}</div></div>` : ''}
+    ${g ? `<div class="modal-section"><h4>Visit History</h4><div id="guestVisitHistory"><div class="panel-sub" style="margin:0">Loading…</div></div></div>` : ''}
     ${g ? renderLoyaltySection(g) : ''}
     <div class="modal-actions">
       ${g ? `<button class="modal-btn modal-btn-danger" onclick="deleteGuest('${g.id}')">Delete</button>` : ''}
@@ -2486,7 +2484,35 @@ window.openGuestModal = function(id){
       <button class="modal-btn modal-btn-primary" onclick="saveGuest(${g ? `'${g.id}'` : 'null'})">Save</button>
     </div>`;
   document.getElementById('formModal').classList.remove('hidden');
+  if (g) loadGuestVisitHistory(g.id);
 };
+
+// Every reservation row (walk-in or booked ahead) is guest-linked, so this
+// table doubles as the full visit log — fetched fresh from the DB each time
+// the modal opens rather than from whatever date happens to be loaded in
+// state.reservations, so it shows a guest's entire history, not just today's.
+async function loadGuestVisitHistory(guestId){
+  const el = document.getElementById('guestVisitHistory');
+  const { data, error } = await sb.from('reservations')
+    .select('reservation_date, reservation_time, party_size, status, source, table_id')
+    .eq('guest_id', guestId)
+    .order('reservation_date', { ascending: false })
+    .order('reservation_time', { ascending: false })
+    .limit(50);
+  if (!el) return; // modal was closed before this resolved
+  if (error){ el.innerHTML = `<div class="panel-sub" style="margin:0">Couldn't load visit history.</div>`; return; }
+  const rows = data || [];
+  if (!rows.length){ el.innerHTML = `<div class="panel-sub" style="margin:0">No visits on record yet.</div>`; return; }
+  const statusLabels = { completed:'Completed', no_show:'No-show', cancelled:'Cancelled', seated:'Seated', confirmed:'Upcoming', pending:'Upcoming' };
+  el.innerHTML = `<div style="max-height:220px;overflow-y:auto">${rows.map(r => {
+    const t = tableById(r.table_id);
+    return `<div class="res-meta" style="display:flex;justify-content:space-between;gap:10px;padding:3px 0">
+      <span>${fmtDateHuman(r.reservation_date)} ${fmtTime(r.reservation_time)} · ${r.party_size} guests${t ? ' · '+esc(tableDisplayLabel(t)) : ''} <span style="color:var(--gray)">(${esc(r.source||'phone')})</span></span>
+      <span class="badge badge-${r.status}">${statusLabels[r.status] || r.status}</span>
+    </div>`;
+  }).join('')}</div>
+  ${rows.length === 50 ? `<div class="panel-sub" style="margin:6px 0 0">Showing the 50 most recent.</div>` : ''}`;
+}
 
 // ---- Loyalty membership management (inside the Guest modal) ---------------
 function renderLoyaltySection(g){
@@ -2531,7 +2557,7 @@ function renderLoyaltySection(g){
     <div class="res-meta">💵 Last billed ${member.last_billed_at ? new Date(member.last_billed_at).toLocaleDateString() : 'never logged'} · next due ${nextDue ? new Date(nextDue).toLocaleDateString() : '—'}</div>
     ${suspended ? `<div class="res-meta" style="color:var(--danger);font-weight:600">⚠️ Priority booking suspended until ${new Date(member.priority_suspended_until).toLocaleDateString()} (no-show policy)</div>` : ''}
     <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap;">
-      <button class="btn btn-sm btn-secondary" onclick="redeemLoyaltyCocktail('${member.id}')" ${cocktailsLeft<=0?'disabled':''}>Log cocktail redemption</button>
+      <button class="btn btn-sm btn-secondary" onclick="openLogCocktailModal('${member.id}')" ${cocktailsLeft<=0?'disabled':''}>Log cocktail redemption</button>
       <button class="btn btn-sm btn-secondary" onclick="redeemLoyaltyCredit('${member.id}')" ${creditLeft<=0?'disabled':''}>Log credit redemption</button>
       <button class="btn btn-sm btn-secondary" onclick="logLoyaltyBilling('${member.id}')">Log billing charge</button>
     </div>
@@ -2610,13 +2636,37 @@ window.reactivateLoyalty = async function(memberId){
   if (m) openGuestModal(m.guest_id);
 };
 
-window.redeemLoyaltyCocktail = async function(memberId){
-  const m = state.loyaltyMembers.find(x=>x.id===memberId);
+// Swaps the guest modal's content for a small confirm form (same pattern as
+// openSeatModal) rather than logging immediately on click — lets a host pick
+// how many cocktails to log in one go and confirm before it's saved.
+window.openLogCocktailModal = function(memberId){
+  const m = state.loyaltyMembers.find(x => x.id === memberId);
   if (!m) return;
+  const g = guestById(m.guest_id);
+  const remaining = cocktailsRemaining(m);
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Log Cocktail Redemption</h3>
+    <p class="modal-user-email">${esc(guestName(g))} — ${remaining} of ${lockedCocktailsPerMonth(m)} left this month</p>
+    <label class="field-label">Number of cocktails to log</label>
+    <select class="modal-select" id="cocktailLogQty">
+      ${Array.from({length: Math.max(remaining,1)}, (_,i) => i+1).map(n => `<option value="${n}">${n}</option>`).join('')}
+    </select>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="openGuestModal('${g.id}')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="confirmLogCocktails('${memberId}')">Log Selected</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+
+window.confirmLogCocktails = async function(memberId){
+  const qty = Number(document.getElementById('cocktailLogQty').value);
+  const m = state.loyaltyMembers.find(x=>x.id===memberId);
+  if (!m || !qty || qty < 1) return;
   const period = currentMonthKey();
-  const used = (m.cocktails_period_key === period ? m.cocktails_used_period : 0) + 1;
+  const used = (m.cocktails_period_key === period ? m.cocktails_used_period : 0) + qty;
   await sb.from('loyalty_members').update({ cocktails_used_period: used, cocktails_period_key: period }).eq('id', memberId);
-  await sb.from('loyalty_redemptions').insert({ loyalty_member_id: memberId, type:'cocktail', amount: 1 });
+  await sb.from('loyalty_redemptions').insert({ loyalty_member_id: memberId, type:'cocktail', amount: qty });
   await reloadLoyaltyMembers();
   openGuestModal(m.guest_id);
 };
