@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.65';
+const APP_VERSION = '1.67';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -89,6 +89,7 @@ setInterval(() => { renderTopbarClock(); if (nowOverride) renderNowBanner(); }, 
 
 let currentUser = null;
 let currentStaff = null;
+const TERMINAL_TOKEN_KEY = 'legend_clock_terminal_token';
 let _authMode = 'signin';
 
 let state = {
@@ -123,7 +124,7 @@ let state = {
   loyaltyMembers: [],  // one row per enrolled guest (guests.id -> loyalty_members.guest_id)
   priorityHolidays: [], // dates where Founder's Circle gets the extended 14-day booking lead
   scheduleShifts: [], myPermissions: null, permissions: [], rolePermissions: [], staffOverrides: [],
-  timeClockEntries: [], timeOffRequests: [],
+  timeClockEntries: [], timeOffRequests: [], clockTerminals: [],
   staffGroups: [], staffGroupMembers: [], messageThreads: [], threadParticipants: [], messages: [], shiftSwapRequests: [],
   ticketDestinations: [], ingredientCategories: [], ingredients: [], menuCategories: [], menuItems: [],
   itemIngredients: [], modifierGroups: [], modifierOptions: [], menuItemModifierGroups: [],
@@ -717,14 +718,18 @@ async function loadAll(){
       sb.from('modifier_options').select('*').order('sort_order'),
       sb.from('menu_item_modifier_groups').select('*'),
     ]);
-    const [vendorsRes, poRes, poItemsRes] = await Promise.all([
+    const [vendorsRes, poRes, poItemsRes, terminalsRes, clockRes] = await Promise.all([
       sb.from('vendors').select('*').order('name'),
       sb.from('purchase_orders').select('*').order('created_at', { ascending: false }),
       sb.from('purchase_order_items').select('*'),
+      sb.from('clock_terminals').select('*').order('created_at'),
+      sb.from('time_clock_entries').select('*').order('clock_in_at', { ascending: false }).limit(300),
     ]);
     state.vendors = vendorsRes.data || [];
     state.purchaseOrders = poRes.data || [];
     state.purchaseOrderItems = poItemsRes.data || [];
+    state.clockTerminals = terminalsRes.data || [];
+    state.timeClockEntries = clockRes.data || [];
     state.tables = tablesRes.data || [];
     state.areas = areasRes.data || [];
     if (fpRes.data) state.floorPlan = fpRes.data;
@@ -841,9 +846,23 @@ const PERMISSION_CATEGORIES = {
   view_reports: 'Staff & Reports',
 };
 const PERMISSION_CATEGORY_ORDER = ['Orders & Payments','Gift Cards','Kitchen & Expo','Menu & Inventory','Reservations & Loyalty','Schedule & Time','Messaging','Staff & Reports'];
+// Frontline roles must be on the clock to touch guest-facing/job-function screens — this keeps
+// someone from working a shift (and being on a check as the server, etc.) without ever punching in.
+// Managers/admins are exempt: they often need to approve things or step in without being "on shift."
+const CLOCK_GATED_ROLES = new Set(['host','waiter','bartender','kitchen','expo']);
+const CLOCK_GATED_TABS = new Set(['reservations','floorplan','split','waitlist','guests','loyalty','orders','kitchen','expo']);
+function isClockedIn(){
+  return !!currentStaff && state.timeClockEntries.some(e => e.staff_id === currentStaff.id && !e.clock_out_at);
+}
+function needsClockGate(){
+  return !!currentStaff && CLOCK_GATED_ROLES.has(currentStaff.role) && !isClockedIn();
+}
 function canSeeTab(tab){
   const need = TAB_PERMISSIONS[tab];
-  return !need ? true : need.some(p => can(p));
+  const permitted = !need ? true : need.some(p => can(p));
+  if (!permitted) return false;
+  if (CLOCK_GATED_TABS.has(tab) && needsClockGate()) return false;
+  return true;
 }
 // Hides nav buttons the current employee has no permission for, and bumps
 // them off a tab they've lost access to (or never had) onto the first one
@@ -3816,7 +3835,7 @@ async function loadScheduleData(){
   const today = todayISO();
   const from = toLocalISODate(new Date(new Date(today+'T00:00:00').getTime() - 7*86400000));
   const to = toLocalISODate(new Date(new Date(today+'T00:00:00').getTime() + 30*86400000));
-  const [shiftsRes, clockRes, offRes, groupsRes, groupMembersRes, threadsRes, participantsRes, messagesRes, swapsRes] = await Promise.all([
+  const [shiftsRes, clockRes, offRes, groupsRes, groupMembersRes, threadsRes, participantsRes, messagesRes, swapsRes, terminalsRes] = await Promise.all([
     sb.from('schedule_shifts').select('*').gte('shift_date', from).lte('shift_date', to).order('shift_date').order('scheduled_start'),
     sb.from('time_clock_entries').select('*').order('clock_in_at', { ascending: false }).limit(300),
     sb.from('time_off_requests').select('*').order('requested_at', { ascending: false }),
@@ -3826,6 +3845,7 @@ async function loadScheduleData(){
     sb.from('thread_participants').select('*'),
     sb.from('messages').select('*').order('created_at', { ascending: false }).limit(300),
     sb.from('shift_swap_requests').select('*').order('created_at', { ascending: false }),
+    sb.from('clock_terminals').select('*').order('created_at'),
   ]);
   state.scheduleShifts = shiftsRes.data || [];
   state.timeClockEntries = clockRes.data || [];
@@ -3836,6 +3856,7 @@ async function loadScheduleData(){
   state.threadParticipants = participantsRes.data || [];
   state.messages = messagesRes.data || [];
   state.shiftSwapRequests = swapsRes.data || [];
+  state.clockTerminals = terminalsRes.data || [];
   render();
 }
 
@@ -3850,7 +3871,7 @@ function renderScheduleTab(){
     ${myOpenEntry
       ? `<div class="res-meta">Clocked in since ${new Date(myOpenEntry.clock_in_at).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}${myOpenEntry.status==='late'?' <span class="badge badge-pending">late</span>':''}</div>
          <div class="modal-actions" style="padding-top:10px;justify-content:flex-start"><button class="btn btn-danger" onclick="clockOut()">Clock Out</button></div>`
-      : `<div class="panel-sub" style="margin:0 0 10px">Not clocked in.</div>
+      : `<div class="panel-sub" style="margin:0 0 10px">Not clocked in.${CLOCK_GATED_ROLES.has(currentStaff.role)?' Clock in below to unlock the rest of the app.':''}</div>
          <div class="modal-actions" style="padding-top:0;justify-content:flex-start"><button class="btn btn-primary" onclick="clockIn()">Clock In</button></div>`}
   </div>` : '';
 
@@ -3875,7 +3896,7 @@ function renderScheduleTab(){
   ${can('use_messaging') ? renderMessagesSection() : ''}
   ${can('manage_broadcasts') ? renderGroupsSection() : ''}
   ${can('manage_schedule') ? renderScheduleBuilder() : ''}
-  ${can('manage_timecards') ? renderTimecardManagement() : ''}`;
+  ${can('manage_timecards') ? renderTimecardManagement() + renderClockTerminalsSection() : ''}`;
 }
 
 // ---- Messaging: threads, groups, shift swaps -------------------------------
@@ -4244,6 +4265,58 @@ function renderTimecardManagement(){
   </div>` : ''}`;
 }
 
+function renderClockTerminalsSection(){
+  const myToken = localStorage.getItem(TERMINAL_TOKEN_KEY);
+  return `
+  <div class="section-heading">Clock-In Terminals</div>
+  <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">Only devices registered here can process clock in/out — this keeps staff from punching in on a personal phone. Pull up the app on the physical terminal or tablet (e.g. a waiter station) you want to use for punches, then register it below.</div>
+    <table class="data-table">
+      <thead><tr><th>Name</th><th>Registered</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        ${state.clockTerminals.map(t => `<tr>
+          <td>${esc(t.name)}${myToken===t.device_token?' <span class="badge badge-confirmed">this device</span>':''}</td>
+          <td>${fmtDateHuman(t.created_at.slice(0,10))}</td>
+          <td>${t.active?'<span class="badge badge-confirmed">active</span>':'<span class="badge badge-pending">inactive</span>'}</td>
+          <td style="display:flex;gap:6px">
+            <button class="btn btn-sm btn-secondary" onclick="renameClockTerminal('${t.id}')">Rename</button>
+            <button class="btn btn-sm ${t.active?'btn-danger':'btn-success'}" onclick="toggleClockTerminalActive('${t.id}', ${!t.active})">${t.active?'Deactivate':'Reactivate'}</button>
+            <button class="btn btn-sm btn-danger" onclick="deleteClockTerminal('${t.id}')">Delete</button>
+          </td>
+        </tr>`).join('') || `<tr><td colspan="4"><span class="panel-sub">No terminals registered yet — punches are blocked everywhere until you register at least one.</span></td></tr>`}
+      </tbody>
+    </table>
+    <div class="modal-actions" style="padding-top:14px">
+      <button class="btn btn-primary" onclick="registerThisDeviceAsTerminal()">+ Register This Device</button>
+    </div>
+  </div>`;
+}
+window.registerThisDeviceAsTerminal = async function(){
+  const name = prompt('Name for this terminal (e.g. "Waiter Station 1", "Host Stand iPad"):');
+  if (!name || !name.trim()) return;
+  const { data, error } = await sb.from('clock_terminals').insert({ name: name.trim(), created_by: currentStaff.id }).select().single();
+  if (error){ alert('Error: '+error.message); return; }
+  localStorage.setItem(TERMINAL_TOKEN_KEY, data.device_token);
+  await loadScheduleData();
+  alert(`"${data.name}" is now a registered clock-in terminal — staff can punch in/out on this device.`);
+};
+window.renameClockTerminal = async function(id){
+  const t = state.clockTerminals.find(x=>x.id===id);
+  const name = prompt('Terminal name:', t?.name||'');
+  if (!name || !name.trim()) return;
+  await sb.from('clock_terminals').update({ name: name.trim() }).eq('id', id);
+  await loadScheduleData();
+};
+window.toggleClockTerminalActive = async function(id, active){
+  await sb.from('clock_terminals').update({ active }).eq('id', id);
+  await loadScheduleData();
+};
+window.deleteClockTerminal = async function(id){
+  if (!confirm('Delete this terminal? If this is the device using it, punches on this device will stop working until it\'s registered again.')) return;
+  await sb.from('clock_terminals').delete().eq('id', id);
+  await loadScheduleData();
+};
+
 window.clockIn = async function(){
   const pin = prompt('Enter your PIN to clock in:');
   if (!pin) return;
@@ -4264,8 +4337,9 @@ window.clockIn = async function(){
     }
   }
   const status = shift && now.getTime() > new Date(today+'T'+shift.scheduled_start).getTime() ? 'late' : 'on_time';
-  const { error } = await sb.from('time_clock_entries').insert({ staff_id: currentStaff.id, shift_id: shift?.id || null, clock_in_at: now.toISOString(), status });
-  if (error){ alert('Error: '+error.message); return; }
+  const deviceToken = localStorage.getItem(TERMINAL_TOKEN_KEY);
+  const { error } = await sb.rpc('punch_clock_in', { p_device_token: deviceToken, p_shift_id: shift?.id || null, p_status: status });
+  if (error){ alert(error.message); return; }
   await loadScheduleData();
 };
 
@@ -4280,8 +4354,9 @@ window.clockOut = async function(){
   if (cashTipsInput === null) return;
   const cashTips = Number(cashTipsInput);
   if (isNaN(cashTips) || cashTips < 0){ alert('Enter a valid dollar amount.'); return; }
-  const { error } = await sb.from('time_clock_entries').update({ clock_out_at: getNow().toISOString(), declared_cash_tips: cashTips }).eq('id', entry.id);
-  if (error){ alert('Error: '+error.message); return; }
+  const deviceToken = localStorage.getItem(TERMINAL_TOKEN_KEY);
+  const { error } = await sb.rpc('punch_clock_out', { p_device_token: deviceToken, p_cash_tips: cashTips });
+  if (error){ alert(error.message); return; }
   await loadScheduleData();
 };
 
@@ -4680,19 +4755,34 @@ function renderIngredientsSection(){
   <div class="section-heading">Ingredients &amp; Costing</div>
   <div class="card">
     <table class="data-table">
-      <thead><tr><th>Ingredient</th><th>Category</th><th>Unit</th><th>Cost / Unit</th><th></th></tr></thead>
+      <thead><tr><th>Ingredient</th><th>Brand</th><th>Category</th><th>Unit</th><th>ABV</th><th>Cost / Unit</th><th></th></tr></thead>
       <tbody>
         ${state.ingredients.map(ing => `<tr>
           <td>${esc(ing.name)}</td>
+          <td>${esc(ing.brand||'—')}</td>
           <td>${esc(state.ingredientCategories.find(c=>c.id===ing.category_id)?.name || '—')}</td>
           <td>${esc(ing.unit)}</td>
+          <td>${ing.abv_percent!=null ? ing.abv_percent+'%' : '—'}</td>
           <td>$<input type="number" min="0" step="0.01" class="modal-input" style="margin:0;width:80px;padding:4px 8px;display:inline-block" value="${ing.cost_per_unit}" onchange="setIngredientCost('${ing.id}', this.value)"/></td>
-          <td><button class="btn btn-sm btn-danger" onclick="deleteIngredient('${ing.id}')">Delete</button></td>
-        </tr>`).join('') || `<tr><td colspan="5"><span class="panel-sub">No ingredients yet.</span></td></tr>`}
+          <td style="display:flex;gap:6px"><button class="btn btn-sm btn-secondary" onclick="openIngredientModal('${ing.id}')">Edit</button><button class="btn btn-sm btn-danger" onclick="deleteIngredient('${ing.id}')">Delete</button></td>
+        </tr>`).join('') || `<tr><td colspan="7"><span class="panel-sub">No ingredients yet.</span></td></tr>`}
       </tbody>
     </table>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openIngredientModal()">+ Add Ingredient</button></div>
   </div>`;
+}
+const INGREDIENT_UNIT_GROUPS = {
+  'Bar / Cocktail': ['oz','dash','splash','barspoon','part','cube','sprig','wedge','twist','slice'],
+  'Volume': ['ml','l','cup','tbsp','tsp','pint','quart','gallon'],
+  'Weight': ['g','kg','lb'],
+  'Count': ['each','bottle','can','case','bunch'],
+};
+function ingredientUnitSelectHtml(selected){
+  const flat = Object.values(INGREDIENT_UNIT_GROUPS).flat();
+  const customOpt = selected && !flat.includes(selected) ? `<option value="${esc(selected)}" selected>${esc(selected)} (custom)</option>` : '';
+  return customOpt + Object.entries(INGREDIENT_UNIT_GROUPS).map(([label, units]) =>
+    `<optgroup label="${esc(label)}">${units.map(u=>`<option value="${u}" ${u===selected?'selected':''}>${u}</option>`).join('')}</optgroup>`
+  ).join('');
 }
 window.addIngredientCategory = async function(){
   const input = document.getElementById('newIngCategory');
@@ -4708,31 +4798,43 @@ window.deleteIngredientCategory = async function(id){
   await sb.from('ingredient_categories').delete().eq('id', id);
   await reloadMenuData();
 };
-window.openIngredientModal = function(){
+window.openIngredientModal = function(ingredientId){
+  const ing = ingredientId ? state.ingredients.find(x=>x.id===ingredientId) : null;
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
-    <h3>Add Ingredient</h3>
+    <h3>${ing ? 'Edit' : 'Add'} Ingredient</h3>
     <label class="field-label">Name</label>
-    <input type="text" class="modal-input" id="ingName"/>
+    <input type="text" class="modal-input" id="ingName" value="${esc(ing?.name||'')}"/>
+    <label class="field-label">Brand</label>
+    <input type="text" class="modal-input" id="ingBrand" value="${esc(ing?.brand||'')}" placeholder="e.g. Tito's, Heinz…"/>
     <div class="formgrid">
-      <div><label class="field-label">Category</label><select class="modal-select" id="ingCategory"><option value="">—</option>${state.ingredientCategories.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></div>
-      <div><label class="field-label">Unit</label><input type="text" class="modal-input" id="ingUnit" value="oz" placeholder="oz, lb, each…"/></div>
+      <div><label class="field-label">Category</label><select class="modal-select" id="ingCategory"><option value="">—</option>${state.ingredientCategories.map(c=>`<option value="${c.id}" ${ing?.category_id===c.id?'selected':''}>${esc(c.name)}</option>`).join('')}</select></div>
+      <div><label class="field-label">Unit</label><select class="modal-select" id="ingUnit">${ingredientUnitSelectHtml(ing?.unit||'oz')}</select></div>
     </div>
+    <label class="field-label">ABV % <span class="panel-sub" style="margin:0">(alcoholic ingredients only — leave blank otherwise)</span></label>
+    <input type="number" min="0" max="100" step="0.1" class="modal-input" id="ingAbv" value="${ing?.abv_percent!=null?ing.abv_percent:''}" placeholder="e.g. 40"/>
     <label class="field-label">Cost per unit ($)</label>
-    <input type="number" min="0" step="0.01" class="modal-input" id="ingCost" value="0"/>
+    <input type="number" min="0" step="0.01" class="modal-input" id="ingCost" value="${ing?.cost_per_unit!=null?ing.cost_per_unit:0}"/>
     <div class="modal-actions">
       <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
-      <button class="modal-btn modal-btn-primary" onclick="saveIngredient()">Save</button>
+      <button class="modal-btn modal-btn-primary" onclick="saveIngredient('${ingredientId||''}')">Save</button>
     </div>`;
   document.getElementById('formModal').classList.remove('hidden');
 };
-window.saveIngredient = async function(){
+window.saveIngredient = async function(ingredientId){
   const name = document.getElementById('ingName').value.trim();
   if (!name){ alert('Enter a name.'); return; }
+  const brand = document.getElementById('ingBrand').value.trim() || null;
   const category_id = document.getElementById('ingCategory').value || null;
-  const unit = document.getElementById('ingUnit').value.trim() || 'oz';
+  const unit = document.getElementById('ingUnit').value || 'oz';
+  const abvRaw = document.getElementById('ingAbv').value.trim();
+  const abv_percent = abvRaw === '' ? null : parseFloat(abvRaw);
+  if (abv_percent!=null && (isNaN(abv_percent) || abv_percent<0 || abv_percent>100)){ alert('ABV must be between 0 and 100.'); return; }
   const cost_per_unit = parseFloat(document.getElementById('ingCost').value) || 0;
-  const { error } = await sb.from('ingredients').insert({ name, category_id, unit, cost_per_unit });
+  const payload = { name, brand, category_id, unit, abv_percent, cost_per_unit };
+  const { error } = ingredientId
+    ? await sb.from('ingredients').update(payload).eq('id', ingredientId)
+    : await sb.from('ingredients').insert(payload);
   if (error){ alert('Error: '+error.message); return; }
   closeModal('formModal');
   await reloadMenuData();
@@ -5142,6 +5244,7 @@ function renderSettingsTab(){
           <td>${s.pin_hash ? '<span class="badge badge-confirmed">set</span>' : '<span class="badge badge-pending">none</span>'} <button class="btn btn-sm btn-secondary" onclick="promptSetStaffPin('${s.id}')">${s.pin_hash?'Reset':'Set'}</button></td>
           <td>${s.active ? '<span class="badge badge-confirmed">active</span>' : '<span class="badge badge-pending">pending</span>'}</td>
           <td style="display:flex;gap:6px">
+            <button class="btn btn-sm btn-secondary" onclick="openEditStaffModal('${s.id}')">Edit</button>
             <button class="btn btn-sm btn-secondary" onclick="openStaffPermissionsModal('${s.id}')">Permissions</button>
             <button class="btn btn-sm ${s.active?'btn-danger':'btn-success'}" onclick="toggleStaffActive('${s.id}', ${!s.active})">${s.active?'Deactivate':'Approve'}</button>
           </td>
@@ -5150,6 +5253,38 @@ function renderSettingsTab(){
     </table>
   </div>` : ''}`;
 }
+
+window.openEditStaffModal = function(staffId){
+  const s = state.staffList.find(x => x.id === staffId);
+  if (!s) return;
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Edit Staff Profile</h3>
+    <p class="modal-user-email">Login email: ${esc(s.email)} — email isn't editable here since it's tied to their sign-in account.</p>
+    <label class="field-label">Name</label>
+    <input type="text" class="modal-input" id="editStaffName" value="${esc(s.name||'')}"/>
+    <label class="field-label">Phone</label>
+    <input type="tel" class="modal-input" id="editStaffPhone" value="${esc(s.phone||'')}" placeholder="(555) 555-5555"/>
+    <label class="field-label">Address</label>
+    <input type="text" class="modal-input" id="editStaffAddress" value="${esc(s.address||'')}" placeholder="Street, city, state, zip"/>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="saveStaffProfile('${staffId}')">Save</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+
+window.saveStaffProfile = async function(staffId){
+  const name = document.getElementById('editStaffName').value.trim();
+  const phone = document.getElementById('editStaffPhone').value.trim() || null;
+  const address = document.getElementById('editStaffAddress').value.trim() || null;
+  if (!name){ alert('Name is required.'); return; }
+  const { error } = await sb.from('staff').update({ name, phone, address }).eq('id', staffId);
+  if (error){ alert('Error: '+error.message); return; }
+  await reloadStaffList();
+  closeModal('formModal');
+  render();
+};
 
 window.promptSetStaffPin = async function(staffId){
   const pin = prompt('New 4-6 digit PIN for this employee (used for comp/discount/loyalty-payment approval and time-clock punches):');
