@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.50';
+const APP_VERSION = '1.62';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -122,6 +122,14 @@ let state = {
   loyaltyTiers: [],    // club/society/founders terms — editable in Settings, not hardcoded
   loyaltyMembers: [],  // one row per enrolled guest (guests.id -> loyalty_members.guest_id)
   priorityHolidays: [], // dates where Founder's Circle gets the extended 14-day booking lead
+  scheduleShifts: [], myPermissions: null, permissions: [], rolePermissions: [], staffOverrides: [],
+  timeClockEntries: [], timeOffRequests: [],
+  staffGroups: [], staffGroupMembers: [], messageThreads: [], threadParticipants: [], messages: [], shiftSwapRequests: [],
+  ticketDestinations: [], ingredientCategories: [], ingredients: [], menuCategories: [], menuItems: [],
+  itemIngredients: [], modifierGroups: [], modifierOptions: [], menuItemModifierGroups: [],
+  checks: [], checkItems: [], ordersActiveTableId: null, ordersActiveCheckId: null,
+  checkDiscounts: [], payments: [],
+  vendors: [], purchaseOrders: [], purchaseOrderItems: [],
 };
 
 // ============================================================================
@@ -658,6 +666,7 @@ async function onSignedIn(){
 
   await loadAll();
   render();
+  startKdsPolling();
 }
 
 // ============================================================================
@@ -667,7 +676,8 @@ async function loadAll(){
   const statusEl = document.getElementById('syncStatus');
   setStatus(statusEl, '☁ Syncing…', '');
   try {
-    const [tablesRes, areasRes, fpRes, ssRes, comboRes, guestsRes, waitlistRes, staffRes, rosterRes, spRes, resRes, loyaltyTiersRes, loyaltyMembersRes, holidaysRes] = await Promise.all([
+    const [tablesRes, areasRes, fpRes, ssRes, comboRes, guestsRes, waitlistRes, staffRes, rosterRes, spRes, resRes, loyaltyTiersRes, loyaltyMembersRes, holidaysRes, permsRes, rolePermsRes, overridesRes,
+      tdRes, icRes, ingRes, mcRes, miRes, iiRes, mgRes, moRes, mimgRes] = await Promise.all([
       sb.from('dining_tables').select('*').order('label'),
       sb.from('floor_areas').select('*').order('sort_order').order('created_at'),
       sb.from('floor_plan_settings').select('*').eq('id', true).maybeSingle(),
@@ -682,7 +692,27 @@ async function loadAll(){
       sb.from('loyalty_tiers').select('*').order('sort_order'),
       sb.from('loyalty_members').select('*'),
       sb.from('priority_holidays').select('*').order('holiday_date'),
+      sb.from('permissions').select('*'),
+      sb.from('role_permissions').select('*'),
+      sb.from('staff_permission_overrides').select('*'),
+      sb.from('ticket_destinations').select('*').order('sort_order'),
+      sb.from('ingredient_categories').select('*').order('sort_order'),
+      sb.from('ingredients').select('*').order('name'),
+      sb.from('menu_categories').select('*').order('sort_order'),
+      sb.from('menu_items').select('*').order('sort_order'),
+      sb.from('item_ingredients').select('*'),
+      sb.from('modifier_groups').select('*').order('name'),
+      sb.from('modifier_options').select('*').order('sort_order'),
+      sb.from('menu_item_modifier_groups').select('*'),
     ]);
+    const [vendorsRes, poRes, poItemsRes] = await Promise.all([
+      sb.from('vendors').select('*').order('name'),
+      sb.from('purchase_orders').select('*').order('created_at', { ascending: false }),
+      sb.from('purchase_order_items').select('*'),
+    ]);
+    state.vendors = vendorsRes.data || [];
+    state.purchaseOrders = poRes.data || [];
+    state.purchaseOrderItems = poItemsRes.data || [];
     state.tables = tablesRes.data || [];
     state.areas = areasRes.data || [];
     if (fpRes.data) state.floorPlan = fpRes.data;
@@ -697,7 +727,20 @@ async function loadAll(){
     state.loyaltyTiers = loyaltyTiersRes.data || [];
     state.loyaltyMembers = loyaltyMembersRes.data || [];
     state.priorityHolidays = holidaysRes.data || [];
+    state.permissions = permsRes.data || [];
+    state.rolePermissions = rolePermsRes.data || [];
+    state.staffOverrides = overridesRes.data || [];
+    state.ticketDestinations = tdRes.data || [];
+    state.ingredientCategories = icRes.data || [];
+    state.ingredients = ingRes.data || [];
+    state.menuCategories = mcRes.data || [];
+    state.menuItems = miRes.data || [];
+    state.itemIngredients = iiRes.data || [];
+    state.modifierGroups = mgRes.data || [];
+    state.modifierOptions = moRes.data || [];
+    state.menuItemModifierGroups = mimgRes.data || [];
     if (!state.currentAreaId) state.currentAreaId = '__all';
+    computeMyPermissions();
     setStatus(statusEl, '☁ Synced', 'synced');
   } catch(e){
     setStatus(statusEl, '⚠ Offline', 'error');
@@ -719,6 +762,64 @@ async function logActivity(action, entity_type, entity_id, details){
 }
 
 // ============================================================================
+// PERMISSIONS — mirrors the has_permission() logic in Postgres client-side,
+// purely for showing/hiding UI. The database's Row Level Security is the
+// real enforcement; this just keeps people from seeing buttons/tabs they
+// can't actually use. Effective permission = this employee's own override
+// if one exists, else their role's default bundle. The 'admin' role (the
+// hardcoded owner bootstrap account) always gets everything.
+// ============================================================================
+function computeMyPermissions(){
+  const perms = new Set();
+  if (!currentStaff) { state.myPermissions = perms; return perms; }
+  if (currentStaff.role === 'admin'){
+    state.permissions.forEach(p => perms.add(p.key));
+    state.myPermissions = perms;
+    return perms;
+  }
+  state.rolePermissions.filter(rp => rp.role === currentStaff.role).forEach(rp => perms.add(rp.permission_key));
+  state.staffOverrides.filter(o => o.staff_id === currentStaff.id).forEach(o => {
+    if (o.granted) perms.add(o.permission_key); else perms.delete(o.permission_key);
+  });
+  state.myPermissions = perms;
+  return perms;
+}
+function can(permKey){ return state.myPermissions ? state.myPermissions.has(permKey) : false; }
+
+const TAB_PERMISSIONS = {
+  reservations: ['manage_reservations'],
+  floorplan: ['manage_reservations'],
+  split: ['manage_reservations'],
+  waitlist: ['manage_reservations'],
+  guests: ['manage_reservations','manage_loyalty_program'],
+  loyalty: ['manage_loyalty_program'],
+  dashboard: ['view_reports'],
+  settings: ['manage_reservations','manage_staff_permissions','manage_loyalty_program','manage_menu','manage_ingredients_costing','manage_inventory'],
+  schedule: ['view_own_schedule','manage_schedule','clock_in_out','request_time_off'],
+  orders: ['take_orders','take_payment'],
+  kitchen: ['view_kitchen_station'],
+  expo: ['mark_item_delivered'],
+};
+function canSeeTab(tab){
+  const need = TAB_PERMISSIONS[tab];
+  return !need ? true : need.some(p => can(p));
+}
+// Hides nav buttons the current employee has no permission for, and bumps
+// them off a tab they've lost access to (or never had) onto the first one
+// they can actually see — or a placeholder if there isn't one yet, which
+// will be the normal state for Kitchen/Expo/Waiter/Bartender logins until
+// ordering (a later phase) ships.
+function applyPermissionGating(){
+  let firstVisible = null;
+  document.querySelectorAll('.tabbtn').forEach(btn => {
+    const visible = canSeeTab(btn.dataset.tab);
+    btn.classList.toggle('hidden', !visible);
+    if (visible && !firstVisible) firstVisible = btn.dataset.tab;
+  });
+  if (!canSeeTab(state.tab)) state.tab = firstVisible; // null if nothing is visible yet
+}
+
+// ============================================================================
 // SHELL / TAB SWITCHING
 // ============================================================================
 window.setTab = function(tab){
@@ -727,16 +828,30 @@ window.setTab = function(tab){
   render();
 };
 
+let _lastRenderedTab = null; // guards against fetch-then-render loops for tabs whose loader itself calls render()
 function render(){
+  applyPermissionGating();
   renderNowBanner();
   renderTopbarClock();
   const c = document.getElementById('content');
+  if (!state.tab){
+    c.innerHTML = `<div class="empty-state"><div class="empty-state-icon">👋</div>Nothing here yet for your role.<br><span class="panel-sub">Ordering, kitchen, and bar screens are coming in a later update — for now, ask a manager if you think this is wrong.</span></div>`;
+    _lastRenderedTab = state.tab;
+    return;
+  }
+  const enteringTab = state.tab !== _lastRenderedTab;
+  _lastRenderedTab = state.tab;
+  document.querySelectorAll('.tabbtn').forEach(b => b.classList.toggle('active', b.dataset.tab === state.tab));
   if (state.tab === 'reservations') { c.innerHTML = renderReservationsTab(); if (state.resView === 'timeline') scrollTimelineToNow(); }
   else if (state.tab === 'floorplan') { c.innerHTML = renderFloorPlanTab(); fitFloorCanvasView(); }
   else if (state.tab === 'split') { c.innerHTML = renderSplitViewTab(); fitFloorCanvasView(); }
+  else if (state.tab === 'orders') { c.innerHTML = renderOrdersTab(); if (enteringTab) loadOrdersData(); }
+  else if (state.tab === 'kitchen') { c.innerHTML = renderKitchenTab(); if (enteringTab) loadOrdersData(); }
+  else if (state.tab === 'expo') { c.innerHTML = renderExpoTab(); if (enteringTab) loadOrdersData(); }
   else if (state.tab === 'waitlist') c.innerHTML = renderWaitlistTab();
   else if (state.tab === 'guests') c.innerHTML = renderGuestsTab();
   else if (state.tab === 'loyalty') c.innerHTML = renderLoyaltyTab();
+  else if (state.tab === 'schedule') { c.innerHTML = renderScheduleTab(); if (enteringTab) loadScheduleData(); }
   else if (state.tab === 'dashboard') { c.innerHTML = renderDashboardTab(); loadDashboard(); }
   else if (state.tab === 'settings') c.innerHTML = renderSettingsTab();
 }
@@ -2477,7 +2592,7 @@ window.openGuestModal = function(id){
     </label>
     ${g ? `<div class="modal-section"><h4>Stats</h4><div class="res-meta">${g.visit_count} visits · ${g.no_show_count} no-shows · last visit ${g.last_visit_at ? new Date(g.last_visit_at).toLocaleDateString() : 'never'}</div></div>` : ''}
     ${g ? `<div class="modal-section"><h4>Visit History</h4><div id="guestVisitHistory"><div class="panel-sub" style="margin:0">Loading…</div></div></div>` : ''}
-    ${g ? renderLoyaltySection(g) : ''}
+    ${g && can('manage_loyalty_program') ? renderLoyaltySection(g) : ''}
     <div class="modal-actions">
       ${g ? `<button class="modal-btn modal-btn-danger" onclick="deleteGuest('${g.id}')">Delete</button>` : ''}
       <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
@@ -2743,10 +2858,48 @@ async function loadDashboard(){
   const startISO = toLocalISODate(start);
   const endISO = toLocalISODate(end);
 
-  const [{ data: kpiRows }, { data: allRes }] = await Promise.all([
+  const startTs = new Date(startISO+'T00:00:00').toISOString();
+  const endTs = new Date(endISO+'T23:59:59.999').toISOString();
+
+  const [{ data: kpiRows }, { data: allRes }, { data: payRows }, { data: discRows }, { data: itemRows }] = await Promise.all([
     sb.from('kpi_daily').select('*').gte('day', startISO).lte('day', endISO),
     sb.from('reservations').select('reservation_time,party_size,status,guest_id').gte('reservation_date', startISO).lte('reservation_date', endISO),
+    sb.from('payments').select('*').gte('created_at', startTs).lte('created_at', endTs),
+    sb.from('check_discounts').select('*').gte('created_at', startTs).lte('created_at', endTs),
+    sb.from('check_items').select('check_id,fired_at,delivered_at,status').gte('created_at', startTs).lte('created_at', endTs),
   ]);
+  const pays = payRows || [];
+  const payCheckIds = [...new Set(pays.map(p=>p.check_id))];
+  const { data: payChecks } = payCheckIds.length ? await sb.from('checks').select('id,server_id').in('id', payCheckIds) : { data: [] };
+  const checksById = {}; (payChecks||[]).forEach(c=>checksById[c.id]=c);
+
+  const totalSales = pays.reduce((s,p)=>s+Number(p.amount)-Number(p.refunded_amount||0),0);
+  const totalTips = pays.reduce((s,p)=>s+Number(p.tip_amount||0),0);
+  const totalRefunds = pays.reduce((s,p)=>s+Number(p.refunded_amount||0),0);
+  const tipPct = totalSales ? (totalTips/totalSales*100) : 0;
+
+  const bySrv = {};
+  pays.forEach(p => {
+    const srvId = checksById[p.check_id]?.server_id;
+    if (!srvId) return;
+    bySrv[srvId] = bySrv[srvId] || { sales:0, tips:0 };
+    bySrv[srvId].sales += Number(p.amount) - Number(p.refunded_amount||0);
+    bySrv[srvId].tips += Number(p.tip_amount||0);
+  });
+  const serverRows = Object.keys(bySrv).map(id => {
+    const st = state.staffList.find(s=>s.id===id);
+    const { sales, tips } = bySrv[id];
+    return { name: st?.name||'?', sales, tips, tipPct: sales?(tips/sales*100):0 };
+  }).sort((a,b)=>b.sales-a.sales);
+
+  const discs = discRows || [];
+  const compTotal = discs.filter(d=>d.type==='comp_item').reduce((s,d)=>s+Number(d.amount||0),0);
+  const compCount = discs.filter(d=>d.type==='comp_item').length;
+  const discretionaryCount = discs.filter(d=>d.type==='discretionary_discount').length;
+  const loyaltyDiscCount = discs.filter(d=>d.type==='loyalty_discount').length;
+
+  const deliveredItems = (itemRows||[]).filter(i=>i.status==='delivered' && i.fired_at && i.delivered_at);
+  const avgOrderMin = deliveredItems.length ? deliveredItems.reduce((s,i)=>s+(new Date(i.delivered_at)-new Date(i.fired_at))/60000,0)/deliveredItems.length : null;
   const rows = kpiRows || [];
   const totalRes = rows.reduce((s,r)=>s+r.total_reservations,0);
   const totalCovers = rows.reduce((s,r)=>s+r.total_covers,0);
@@ -2790,19 +2943,1994 @@ async function loadDashboard(){
       <div class="kpi-card"><div class="kpi-value">${walkIns}</div><div class="kpi-label">Walk-Ins</div></div>
       <div class="kpi-card"><div class="kpi-value">${repeatRate}%</div><div class="kpi-label">Repeat Guest Rate</div></div>
     </div>
+
+    <div class="section-heading">Sales &amp; Tips</div>
+    <div class="grid grid-4" style="margin-bottom:20px">
+      <div class="kpi-card"><div class="kpi-value">$${totalSales.toFixed(2)}</div><div class="kpi-label">Total Sales</div></div>
+      <div class="kpi-card"><div class="kpi-value">$${totalTips.toFixed(2)}</div><div class="kpi-label">Total Tips</div></div>
+      <div class="kpi-card"><div class="kpi-value">${tipPct.toFixed(1)}%</div><div class="kpi-label">Tip %</div></div>
+      <div class="kpi-card"><div class="kpi-value">${avgOrderMin!=null?avgOrderMin.toFixed(1)+'m':'—'}</div><div class="kpi-label">Avg Order Time</div></div>
+    </div>
+
+    <div class="section-heading">Server Tips</div>
+    <div class="card" style="margin-bottom:20px">
+      <table class="data-table">
+        <thead><tr><th>Server</th><th>Sales</th><th>Tips</th><th>Tip %</th></tr></thead>
+        <tbody>
+          ${serverRows.map(r=>`<tr><td>${esc(r.name)}</td><td>$${r.sales.toFixed(2)}</td><td>$${r.tips.toFixed(2)}</td><td>${r.tipPct.toFixed(1)}%</td></tr>`).join('') || '<tr><td colspan="4"><span class="panel-sub">No payments in this range.</span></td></tr>'}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-heading">Comps, Discounts &amp; Refunds</div>
+    <div class="grid grid-4" style="margin-bottom:20px">
+      <div class="kpi-card"><div class="kpi-value">$${compTotal.toFixed(2)}</div><div class="kpi-label">Comps (${compCount})</div></div>
+      <div class="kpi-card"><div class="kpi-value">${discretionaryCount}</div><div class="kpi-label">Discretionary Discounts</div></div>
+      <div class="kpi-card"><div class="kpi-value">${loyaltyDiscCount}</div><div class="kpi-label">Membership Discounts</div></div>
+      <div class="kpi-card"><div class="kpi-value">$${totalRefunds.toFixed(2)}</div><div class="kpi-label">Refunds</div></div>
+    </div>
+
     <div class="section-heading">Reservations by Hour</div>
     <div class="card">${hourBars || '<div class="empty-state">No data in this range.</div>'}</div>`;
 }
 
 // ============================================================================
+// ORDERS TAB — table/check selection, item entry with modifiers, firing to
+// the kitchen/bar, check splitting (equal-ways or item-to-item move), and
+// linking a loyalty membership for automatic discounting at payment time
+// (Phase 8 will read checks.loyalty_member_id to apply the discount).
+// ============================================================================
+async function loadOrdersData(){
+  const { data: checks } = await sb.from('checks').select('*').eq('status','open').order('opened_at');
+  state.checks = checks || [];
+  const ids = state.checks.map(c=>c.id);
+  if (ids.length){
+    const [{ data: items }, { data: discounts }, { data: pays }] = await Promise.all([
+      sb.from('check_items').select('*').in('check_id', ids).order('created_at'),
+      sb.from('check_discounts').select('*').in('check_id', ids).order('created_at'),
+      sb.from('payments').select('*').in('check_id', ids).order('created_at'),
+    ]);
+    state.checkItems = items || [];
+    state.checkDiscounts = discounts || [];
+    state.payments = pays || [];
+  } else {
+    state.checkItems = [];
+    state.checkDiscounts = [];
+    state.payments = [];
+  }
+  render();
+}
+// Discount total (dollars) currently applied to a check, excluding item comps (which already
+// remove their own item from the subtotal by voiding it — counting them again would double-dip).
+function checkDiscountTotal(checkId, subtotal){
+  return state.checkDiscounts.filter(d => d.check_id === checkId && d.type !== 'comp_item')
+    .reduce((s,d) => s + (d.percent ? subtotal * (d.percent/100) : (Number(d.amount)||0)), 0);
+}
+function checkTotalDue(checkId){
+  const items = state.checkItems.filter(ci => ci.check_id === checkId && ci.status !== 'voided');
+  const subtotal = items.reduce((s,ci)=>s+checkItemTotal(ci), 0);
+  return Math.max(0, subtotal - checkDiscountTotal(checkId, subtotal));
+}
+function checkAmountPaid(checkId){
+  return state.payments.filter(p => p.check_id === checkId).reduce((s,p) => s + Number(p.amount) - Number(p.refunded_amount||0), 0);
+}
+// Every employee who currently holds `permKey` (self or via a per-employee override) — used to
+// populate the manager dropdown for a PIN-approval prompt without anyone else having to log in.
+function staffHasPermission(staffId, permKey){
+  const st = state.staffList.find(s=>s.id===staffId);
+  if (!st) return false;
+  if (st.role === 'admin') return true;
+  const ov = state.staffOverrides.find(o=>o.staff_id===staffId && o.permission_key===permKey);
+  if (ov) return ov.granted;
+  return state.rolePermissions.some(rp => rp.role === st.role && rp.permission_key === permKey);
+}
+function eligibleApprovers(permKey){
+  return state.staffList.filter(s => s.active && staffHasPermission(s.id, permKey));
+}
+// Generic PIN-approval gate: if the current employee already holds the permission themselves,
+// runs the action immediately (self-authorized). Otherwise prompts for a manager (by name — no
+// separate login) plus their PIN, and lets the server-side RPC verify both the PIN and that
+// manager's authority before doing anything privileged.
+function withApproval(permKey, actionLabel, actionFn){
+  if (can(permKey)) { actionFn(null, null); return; }
+  const approvers = eligibleApprovers(permKey);
+  if (!approvers.length){ alert('No one is currently set up to approve this. Ask an admin to grant the permission.'); return; }
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Manager Approval Needed</h3>
+    <div class="panel-sub" style="margin-bottom:10px">${esc(actionLabel)} requires a manager's PIN.</div>
+    <label class="field-label">Manager</label>
+    <select class="modal-select" id="apprStaff">${approvers.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select>
+    <label class="field-label">PIN</label>
+    <input type="password" inputmode="numeric" class="modal-input" id="apprPin"/>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" id="apprSubmitBtn">Approve</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+  document.getElementById('apprSubmitBtn').onclick = () => {
+    const approverId = document.getElementById('apprStaff').value;
+    const pin = document.getElementById('apprPin').value;
+    if (!pin){ alert('Enter the PIN.'); return; }
+    actionFn(approverId, pin);
+  };
+}
+function checkItemTotal(ci){
+  const modTotal = (ci.modifiers||[]).reduce((s,m)=>s+(Number(m.price_delta)||0),0);
+  return (Number(ci.price_snapshot) + modTotal) * ci.quantity;
+}
+function renderOrdersTab(){
+  const myTables = state.tables.filter(t => !t.is_combo && t.active);
+  const grouped = {};
+  myTables.forEach(t => {
+    const areaName = state.areas.find(a=>a.id===t.area_id)?.name || 'Unassigned';
+    (grouped[areaName] = grouped[areaName]||[]).push(t);
+  });
+  const activeChecks = state.checks.filter(c => c.status === 'open' && c.table_id === state.ordersActiveTableId);
+  const activeCheck = state.checks.find(c => c.id === state.ordersActiveCheckId && c.status === 'open');
+
+  const avgMin = avgOrderTimeMinutes();
+  return `
+  <div class="panel-header"><h2 class="panel-title">Orders</h2>
+    <div style="display:flex;align-items:center;gap:12px">
+      ${avgMin!=null?`<span class="panel-sub" style="margin:0">Avg order time: ${avgMin.toFixed(1)} min</span>`:''}
+      ${(can('sell_gift_card')||can('redeem_gift_card'))?`<button class="btn btn-secondary btn-sm" onclick="openGiftCardsModal()">🎁 Gift Cards</button>`:''}
+      ${can('take_payment')?`<button class="btn btn-secondary btn-sm" onclick="openRecentPaymentsModal()">Recent Payments</button>`:''}
+    </div>
+  </div>
+  <div style="display:flex;gap:16px;align-items:flex-start">
+    <div class="card" style="flex:0 0 240px;max-height:75vh;overflow-y:auto">
+      ${Object.keys(grouped).map(areaName => `
+        <div class="panel-sub" style="margin:10px 0 4px;font-weight:600">${esc(areaName)}</div>
+        ${grouped[areaName].map(t => {
+          const count = state.checks.filter(c=>c.status==='open' && c.table_id===t.id).length;
+          return `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:5px 6px;cursor:pointer;border-radius:6px;${state.ordersActiveTableId===t.id?'background:#eef2ff':''}" onclick="selectOrdersTable('${t.id}')">
+            <span>${esc(t.label)}</span>
+            ${count?`<span class="badge badge-pending">${count} check${count>1?'s':''}</span>`:''}
+          </div>`;
+        }).join('')}
+      `).join('') || '<div class="panel-sub">No tables set up yet.</div>'}
+    </div>
+
+    <div style="flex:1;min-width:0">
+      ${!state.ordersActiveTableId ? `<div class="card"><div class="panel-sub" style="margin:0">Pick a table on the left to open or view its checks.</div></div>` : `
+        <div class="card" style="margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <h3 style="margin:0">${esc(tableById(state.ordersActiveTableId)?.label||'')}</h3>
+            <button class="btn btn-secondary btn-sm" onclick="openNewCheckModal()">+ New Check</button>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px">
+            ${activeChecks.length ? activeChecks.map(c => {
+              const items = state.checkItems.filter(ci=>ci.check_id===c.id && ci.status!=='voided');
+              const total = items.reduce((s,ci)=>s+checkItemTotal(ci),0);
+              const readyCount = items.filter(ci=>ci.status==='ready').length;
+              const st = state.staffList.find(x=>x.id===c.server_id);
+              return `<div class="area-chip" style="cursor:pointer;${state.ordersActiveCheckId===c.id?'border-color:#0070f2':''}${readyCount?'border-color:#16a34a':''}" onclick="selectOrdersCheck('${c.id}')">
+                ${readyCount?'🔔 ':''}${esc(c.guest_label || 'Check')} · $${total.toFixed(2)}${c.split_ways>1?` · split ${c.split_ways}x`:''} <span class="panel-sub" style="margin:0">(${esc(st?.name||'?')})</span>
+              </div>`;
+            }).join('') : '<span class="panel-sub" style="margin:0">No open checks on this table yet.</span>'}
+          </div>
+        </div>
+        ${activeCheck ? renderCheckDetail(activeCheck) : ''}
+      `}
+    </div>
+  </div>`;
+}
+function renderCheckDetail(check){
+  const items = state.checkItems.filter(ci => ci.check_id === check.id && ci.status !== 'voided');
+  const subtotal = items.reduce((s,ci)=>s+checkItemTotal(ci), 0);
+  const canOrder = can('take_orders');
+  const canPay = can('take_payment');
+  const hasUnfired = items.some(ci => ci.status === 'open');
+  const loyaltyMember = check.loyalty_member_id ? state.loyaltyMembers.find(m=>m.id===check.loyalty_member_id) : null;
+  const loyaltyGuest = loyaltyMember ? state.guests.find(g=>g.id===loyaltyMember.guest_id) : null;
+  const hasLoyaltyDiscount = state.checkDiscounts.some(d=>d.check_id===check.id && d.type==='loyalty_discount');
+  const discounts = state.checkDiscounts.filter(d=>d.check_id===check.id);
+  const discountTotal = checkDiscountTotal(check.id, subtotal);
+  const totalDue = checkTotalDue(check.id);
+  const paid = checkAmountPaid(check.id);
+  const balance = Math.max(0, totalDue - paid);
+  const payments = state.payments.filter(p=>p.check_id===check.id);
+  return `
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
+      <h3 style="margin:0">${esc(check.guest_label || 'Check')}</h3>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="openItemPickerModal('${check.id}')">+ Add Items</button>` : ''}
+        ${canOrder && hasUnfired ? `<button class="btn btn-sm btn-primary" onclick="fireCheck('${check.id}')">Send to Kitchen/Bar</button>` : ''}
+        ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="openSplitCheckModal('${check.id}')">Split</button>` : ''}
+        ${(canOrder||canPay) ? `<button class="btn btn-sm btn-secondary" onclick="openDiscretionaryDiscountModal('${check.id}')">Discount</button>` : ''}
+        ${canPay && balance > 0 ? `<button class="btn btn-sm btn-primary" onclick="openPaymentModal('${check.id}')">Take Payment</button>` : ''}
+      </div>
+    </div>
+    <div class="panel-sub" style="margin-bottom:8px">
+      ${loyaltyGuest ? `💳 Linked: ${esc(loyaltyGuest.first_name)} ${esc(loyaltyGuest.last_name)} (${esc(loyaltyMember.locked_tier_name || state.loyaltyTiers.find(t=>t.key===loyaltyMember.tier_key)?.name || loyaltyMember.tier_key)})${(!hasLoyaltyDiscount && can('apply_loyalty_payment')) ? ` · <span class="linkBtn" style="cursor:pointer" onclick="applyLoyaltyDiscount('${check.id}')">Apply membership discount</span>` : ''}` : (canOrder ? `<span class="linkBtn" style="cursor:pointer" onclick="openLinkLoyaltyModal('${check.id}')">+ Link loyalty membership</span>` : '')}
+    </div>
+    <table class="data-table">
+      <thead><tr><th>Qty</th><th>Item</th><th>Modifiers</th><th>Status</th><th>Price</th><th></th></tr></thead>
+      <tbody>
+        ${items.map(ci => `<tr>
+          <td>${ci.quantity}</td>
+          <td>${esc(ci.name_snapshot)}${ci.notes?`<div class="panel-sub" style="margin:0">${esc(ci.notes)}</div>`:''}</td>
+          <td>${(ci.modifiers||[]).map(m=>esc(m.name)).join(', ')}</td>
+          <td><span class="badge badge-${ci.status==='ready'?'confirmed':ci.status==='delivered'?'confirmed':'pending'}">${ci.status==='ready'?'🔔 ready':esc(ci.status)}</span></td>
+          <td>$${checkItemTotal(ci).toFixed(2)}</td>
+          <td>${ci.status==='open' && canOrder ? `<button class="btn btn-sm btn-danger" onclick="removeCheckItem('${ci.id}')">Remove</button>` : ''}${ci.status!=='open' && canOrder ? `<button class="btn btn-sm btn-danger" onclick="compCheckItem('${ci.id}')">Comp</button>` : ''}</td>
+        </tr>`).join('') || `<tr><td colspan="6"><span class="panel-sub">No items yet.</span></td></tr>`}
+      </tbody>
+    </table>
+    ${discounts.length ? `<div class="panel-sub" style="margin-top:8px">${discounts.map(d=>`${d.type==='comp_item'?'Comp':d.type==='loyalty_discount'?'Membership discount':'Discount'}: ${d.percent?d.percent+'%':'$'+Number(d.amount).toFixed(2)}${d.reason?' — '+esc(d.reason):''}`).join('<br>')}</div>` : ''}
+    <div style="text-align:right;padding-top:8px">
+      <div>Subtotal: $${subtotal.toFixed(2)}</div>
+      ${discountTotal ? `<div>Discounts: -$${discountTotal.toFixed(2)}</div>` : ''}
+      <div style="font-weight:600">Total due: $${totalDue.toFixed(2)}${check.split_ways>1?` · ${check.split_ways}-way split ≈ $${(totalDue/check.split_ways).toFixed(2)} each`:''}</div>
+      ${paid ? `<div>Paid: $${paid.toFixed(2)} ${balance<=0.001?'<span class="badge badge-confirmed">paid in full</span>':''}</div>` : ''}
+    </div>
+    ${payments.length ? `<div class="panel-sub" style="margin-top:8px">${payments.map(p=>`${esc(p.method)} $${Number(p.amount).toFixed(2)}${p.tip_amount?' + $'+Number(p.tip_amount).toFixed(2)+' tip':''}${p.status!=='completed'?' ('+esc(p.status)+')':''}`).join('<br>')}</div>` : ''}
+  </div>`;
+}
+window.selectOrdersTable = function(tableId){
+  state.ordersActiveTableId = tableId;
+  const firstOpen = state.checks.find(c=>c.status==='open' && c.table_id===tableId);
+  state.ordersActiveCheckId = firstOpen ? firstOpen.id : null;
+  render();
+};
+window.selectOrdersCheck = function(checkId){
+  state.ordersActiveCheckId = checkId;
+  render();
+};
+window.openNewCheckModal = function(){
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>New Check</h3>
+    <label class="field-label">Label (optional — e.g. "Seat 1", "Smith party")</label>
+    <input type="text" class="modal-input" id="ncLabel" placeholder="Check"/>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="createCheck()">Open Check</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.createCheck = async function(){
+  const label = document.getElementById('ncLabel').value.trim() || null;
+  const { data, error } = await sb.from('checks').insert({ table_id: state.ordersActiveTableId, server_id: currentStaff.id, guest_label: label }).select().single();
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  state.ordersActiveCheckId = data.id;
+  await loadOrdersData();
+};
+
+let _orderPickerCategory = null;
+window.openItemPickerModal = function(checkId){
+  _orderPickerCategory = null;
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = renderItemPickerBody(checkId);
+  document.getElementById('formModal').classList.remove('hidden');
+};
+function renderItemPickerBody(checkId){
+  const cats = state.menuCategories;
+  const activeCat = _orderPickerCategory || (cats[0]?.id || null);
+  const items = state.menuItems.filter(it => it.active && (activeCat ? it.category_id === activeCat : true));
+  return `
+    <h3>Add Items</h3>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+      ${cats.map(c => `<button type="button" class="btn btn-sm ${activeCat===c.id?'btn-primary':'btn-secondary'}" onclick="setOrderPickerCategory('${checkId}','${c.id}')">${esc(c.name)}</button>`).join('') || '<span class="panel-sub">No menu categories set up yet — add them in Settings.</span>'}
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;max-height:340px;overflow-y:auto">
+      ${items.map(it => `<button type="button" class="btn btn-secondary" style="text-align:left;height:auto;padding:8px" onclick="pickMenuItem('${checkId}','${it.id}')">
+        <div style="font-weight:600;font-size:13px">${esc(it.name)}</div>
+        <div class="panel-sub" style="margin:2px 0 0">$${Number(it.price).toFixed(2)}</div>
+      </button>`).join('') || '<span class="panel-sub">No items in this category.</span>'}
+    </div>
+    <div class="modal-actions"><button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Done</button></div>`;
+}
+window.setOrderPickerCategory = function(checkId, catId){
+  _orderPickerCategory = catId;
+  document.getElementById('formModalBox').innerHTML = renderItemPickerBody(checkId);
+};
+window.pickMenuItem = function(checkId, itemId){
+  const groupIds = state.menuItemModifierGroups.filter(x=>x.item_id===itemId).map(x=>x.group_id);
+  if (groupIds.length) openItemModifierModal(checkId, itemId, groupIds);
+  else addItemToCheck(checkId, itemId, [], 1, null);
+};
+function openItemModifierModal(checkId, itemId, groupIds){
+  const it = state.menuItems.find(x=>x.id===itemId);
+  const groups = state.modifierGroups.filter(g=>groupIds.includes(g.id));
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>${esc(it.name)}</h3>
+    ${groups.map(g => {
+      const opts = state.modifierOptions.filter(o=>o.group_id===g.id);
+      const inputType = g.max_select === 1 ? 'radio' : 'checkbox';
+      return `<div style="margin-bottom:10px">
+        <label class="field-label">${esc(g.name)}${g.required?' *':''}</label>
+        ${opts.map(o => `<label style="display:flex;align-items:center;gap:8px;font-size:13px;padding:2px 0">
+          <input type="${inputType}" name="modgrp_${g.id}" class="miPickModOpt" data-group="${g.id}" value="${o.id}"/>
+          ${esc(o.name)}${o.price_delta?` (+$${Number(o.price_delta).toFixed(2)})`:''}
+        </label>`).join('')}
+      </div>`;
+    }).join('')}
+    <div class="formgrid">
+      <div><label class="field-label">Quantity</label><input type="number" min="1" class="modal-input" id="pickQty" value="1"/></div>
+      <div><label class="field-label">Notes (optional)</label><input type="text" class="modal-input" id="pickNotes" placeholder="e.g. no onions"/></div>
+    </div>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="confirmAddItemWithModifiers('${checkId}','${itemId}')">Add to Check</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+}
+window.confirmAddItemWithModifiers = function(checkId, itemId){
+  const groupIds = state.menuItemModifierGroups.filter(x=>x.item_id===itemId).map(x=>x.group_id);
+  const groups = state.modifierGroups.filter(g=>groupIds.includes(g.id));
+  const modifiers = [];
+  for (const g of groups){
+    const checked = Array.from(document.querySelectorAll(`.miPickModOpt[data-group="${g.id}"]:checked`));
+    if (g.required && checked.length < Math.max(1, g.min_select)){ alert(`Please choose an option for "${g.name}".`); return; }
+    checked.forEach(el => {
+      const opt = state.modifierOptions.find(o=>o.id===el.value);
+      if (opt) modifiers.push({ name: opt.name, price_delta: opt.price_delta });
+    });
+  }
+  const quantity = parseInt(document.getElementById('pickQty').value) || 1;
+  const notes = document.getElementById('pickNotes').value.trim() || null;
+  addItemToCheck(checkId, itemId, modifiers, quantity, notes);
+};
+async function addItemToCheck(checkId, itemId, modifiers, quantity, notes){
+  const it = state.menuItems.find(x=>x.id===itemId);
+  if (!it) return;
+  const { error } = await sb.from('check_items').insert({
+    check_id: checkId, menu_item_id: itemId, name_snapshot: it.name, price_snapshot: it.price,
+    quantity, modifiers, notes, ticket_destination_id: it.ticket_destination_id, added_by: currentStaff.id,
+  });
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+  openItemPickerModal(checkId); // stay in the picker so a server can add several items in a row
+}
+window.fireCheck = async function(checkId){
+  const { error } = await sb.from('check_items').update({ status: 'fired', fired_at: new Date().toISOString() }).eq('check_id', checkId).eq('status', 'open');
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+};
+window.removeCheckItem = async function(id){
+  if (!confirm('Remove this item?')) return;
+  const { error } = await sb.from('check_items').delete().eq('id', id);
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+};
+window.voidCheckItem = async function(id){
+  const reason = prompt('Reason for voiding this item (required):');
+  if (!reason || !reason.trim()) return;
+  const ci = state.checkItems.find(x=>x.id===id);
+  const newNotes = (ci?.notes ? ci.notes + ' | ' : '') + 'VOID: ' + reason.trim();
+  const { error } = await sb.from('check_items').update({ status: 'voided', notes: newNotes }).eq('id', id);
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+};
+window.openSplitCheckModal = function(checkId){
+  const check = state.checks.find(c=>c.id===checkId);
+  const otherChecks = state.checks.filter(c=>c.status==='open' && c.table_id===check.table_id && c.id!==checkId);
+  const items = state.checkItems.filter(ci=>ci.check_id===checkId && ci.status!=='voided');
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Split Check</h3>
+    <label class="field-label">Split evenly N ways (for payment — items stay together on this check)</label>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:14px">
+      <input type="number" min="1" class="modal-input" style="margin:0;width:80px" id="splitWays" value="${check.split_ways}"/>
+      <button class="btn btn-secondary btn-sm" onclick="saveSplitWays('${checkId}')">Set</button>
+    </div>
+    <label class="field-label">Or move specific items to ${otherChecks.length ? 'another check' : 'a new check'}</label>
+    <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:10px;max-height:200px;overflow-y:auto">
+      ${items.map(ci => `<label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" class="splitItemChk" value="${ci.id}"/> ${ci.quantity}x ${esc(ci.name_snapshot)} — $${checkItemTotal(ci).toFixed(2)}</label>`).join('') || '<span class="panel-sub" style="margin:0">No items to move.</span>'}
+    </div>
+    <label class="field-label">Move to</label>
+    <select class="modal-select" id="splitDestCheck">
+      <option value="__new">+ New check</option>
+      ${otherChecks.map(c=>`<option value="${c.id}">${esc(c.guest_label||'Check')}</option>`).join('')}
+    </select>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Close</button>
+      <button class="modal-btn modal-btn-primary" onclick="moveSplitItems('${checkId}')">Move Selected</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.saveSplitWays = async function(checkId){
+  const ways = parseInt(document.getElementById('splitWays').value) || 1;
+  const { error } = await sb.from('checks').update({ split_ways: ways }).eq('id', checkId);
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await loadOrdersData();
+};
+window.moveSplitItems = async function(checkId){
+  const ids = Array.from(document.querySelectorAll('.splitItemChk:checked')).map(el=>el.value);
+  if (!ids.length){ alert('Select at least one item to move.'); return; }
+  let destId = document.getElementById('splitDestCheck').value;
+  if (destId === '__new'){
+    const check = state.checks.find(c=>c.id===checkId);
+    const { data, error } = await sb.from('checks').insert({ table_id: check.table_id, server_id: currentStaff.id, guest_label: 'Split Check' }).select().single();
+    if (error){ alert('Error: '+error.message); return; }
+    destId = data.id;
+  }
+  const { error: moveErr } = await sb.from('check_items').update({ check_id: destId }).in('id', ids);
+  if (moveErr){ alert('Error: '+moveErr.message); return; }
+  closeModal('formModal');
+  state.ordersActiveCheckId = destId;
+  await loadOrdersData();
+};
+window.openLinkLoyaltyModal = function(checkId){
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Link Loyalty Membership</h3>
+    <label class="field-label">Search guest</label>
+    <input type="text" class="modal-input" id="linkLoyaltySearch" oninput="renderLinkLoyaltyResults('${checkId}', this.value)" placeholder="Name or phone…"/>
+    <div id="linkLoyaltyResults" style="max-height:220px;overflow-y:auto;margin-top:8px"></div>
+    <div class="modal-actions"><button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Close</button></div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.renderLinkLoyaltyResults = function(checkId, q){
+  const div = document.getElementById('linkLoyaltyResults');
+  const query = q.trim().toLowerCase();
+  if (!query){ div.innerHTML = ''; return; }
+  const activeMemberGuestIds = new Set(state.loyaltyMembers.filter(m=>m.status==='active').map(m=>m.guest_id));
+  const matches = state.guests.filter(g => activeMemberGuestIds.has(g.id) && (`${g.first_name} ${g.last_name}`.toLowerCase().includes(query) || (g.phone||'').includes(query))).slice(0,10);
+  div.innerHTML = matches.map(g => {
+    const m = state.loyaltyMembers.find(x=>x.guest_id===g.id);
+    return `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;cursor:pointer" onclick="linkLoyaltyToCheck('${checkId}','${m.id}')">
+      <span>${esc(g.first_name)} ${esc(g.last_name)} — ${esc(m.locked_tier_name || m.tier_key)}</span>
+    </div>`;
+  }).join('') || '<span class="panel-sub" style="margin:0">No active members match.</span>';
+};
+window.linkLoyaltyToCheck = async function(checkId, memberId){
+  const { error } = await sb.from('checks').update({ loyalty_member_id: memberId }).eq('id', checkId);
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await loadOrdersData();
+};
+
+// ============================================================================
+// PAYMENTS, TIPS, COMPS, DISCOUNTS, REFUNDS (Phase 8)
+// Comps/discretionary discounts/refunds all go through server-side RPCs that
+// self-authorize if the caller already holds the permission, or otherwise
+// require a manager's staff id + PIN (verified in Postgres, never client-side —
+// see apply_check_discount()/process_refund() in the DB). Payments are a fake
+// Square "sandbox" charge: no real card is ever contacted.
+// ============================================================================
+window.compCheckItem = function(checkItemId){
+  const ci = state.checkItems.find(x=>x.id===checkItemId);
+  if (!ci) return;
+  const reason = prompt('Reason for comping this item:');
+  if (!reason || !reason.trim()) return;
+  withApproval('apply_comp', 'Comping an item', async (approverId, pin) => {
+    const { error } = await sb.rpc('apply_check_discount', {
+      p_check_id: ci.check_id, p_check_item_id: ci.id, p_type: 'comp_item',
+      p_amount: checkItemTotal(ci), p_percent: null, p_reason: reason.trim(), p_approver_id: approverId, p_pin: pin,
+    });
+    if (error){ alert('Error: '+error.message); return; }
+    closeModal('formModal');
+    await loadOrdersData();
+  });
+};
+window.openDiscretionaryDiscountModal = function(checkId){
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Apply Discount</h3>
+    <div class="formgrid">
+      <div><label class="field-label">Percent off (%)</label><input type="number" min="0" max="100" class="modal-input" id="ddPercent" placeholder="e.g. 10"/></div>
+      <div><label class="field-label">Or flat $ off</label><input type="number" min="0" step="0.01" class="modal-input" id="ddAmount" placeholder="e.g. 5.00"/></div>
+    </div>
+    <label class="field-label">Reason</label>
+    <input type="text" class="modal-input" id="ddReason" placeholder="e.g. service recovery"/>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="submitDiscretionaryDiscount('${checkId}')">Apply</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.submitDiscretionaryDiscount = function(checkId){
+  const percent = parseFloat(document.getElementById('ddPercent').value) || null;
+  const amount = parseFloat(document.getElementById('ddAmount').value) || null;
+  const reason = document.getElementById('ddReason').value.trim();
+  if (!percent && !amount){ alert('Enter a percent or a flat amount.'); return; }
+  if (!reason){ alert('A reason is required.'); return; }
+  withApproval('apply_discretionary_discount', 'Applying a discount', async (approverId, pin) => {
+    const { error } = await sb.rpc('apply_check_discount', {
+      p_check_id: checkId, p_check_item_id: null, p_type: 'discretionary_discount',
+      p_amount: amount, p_percent: percent, p_reason: reason, p_approver_id: approverId, p_pin: pin,
+    });
+    if (error){ alert('Error: '+error.message); return; }
+    closeModal('formModal');
+    await loadOrdersData();
+  });
+};
+window.applyLoyaltyDiscount = async function(checkId){
+  const check = state.checks.find(c=>c.id===checkId);
+  const member = state.loyaltyMembers.find(m=>m.id===check?.loyalty_member_id);
+  if (!member) return;
+  const pct = member.locked_discount_pct ?? state.loyaltyTiers.find(t=>t.key===member.tier_key)?.discount_pct ?? 0;
+  if (!pct){ alert('This membership tier has no automatic discount.'); return; }
+  const { error } = await sb.from('check_discounts').insert({ check_id: checkId, type: 'loyalty_discount', percent: pct, reason: 'Membership discount', applied_by: currentStaff.id });
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+};
+window.openPaymentModal = function(checkId){
+  const subtotal = state.checkItems.filter(ci=>ci.check_id===checkId && ci.status!=='voided').reduce((s,ci)=>s+checkItemTotal(ci),0);
+  const discountTotal = checkDiscountTotal(checkId, subtotal);
+  const totalDue = checkTotalDue(checkId);
+  const paid = checkAmountPaid(checkId);
+  const balance = Math.max(0, totalDue - paid);
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Take Payment</h3>
+    <div class="panel-sub" style="margin-bottom:10px">Subtotal $${subtotal.toFixed(2)}${discountTotal?` · Discounts -$${discountTotal.toFixed(2)}`:''} · Total due $${totalDue.toFixed(2)}${paid?` · Already paid $${paid.toFixed(2)}`:''}</div>
+    <div class="formgrid">
+      <div><label class="field-label">Amount ($)</label><input type="number" min="0.01" step="0.01" class="modal-input" id="payAmount" value="${balance.toFixed(2)}"/></div>
+      <div><label class="field-label">Tip ($)</label><input type="number" min="0" step="0.01" class="modal-input" id="payTip" value="0"/></div>
+    </div>
+    <label class="field-label">Method</label>
+    <select class="modal-select" id="payMethod" onchange="togglePayMethodFields()">
+      <option value="card_sandbox">Card (Square sandbox)</option>
+      <option value="cash">Cash</option>
+      <option value="gift_card">Gift Card</option>
+    </select>
+    <div id="payMethodFields" class="panel-sub" style="margin-top:6px"></div>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" id="payChargeBtn" onclick="processPayment('${checkId}')">Charge</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+  togglePayMethodFields();
+};
+window.togglePayMethodFields = function(){
+  const method = document.getElementById('payMethod').value;
+  const div = document.getElementById('payMethodFields');
+  if (method === 'gift_card'){
+    div.innerHTML = `<label class="field-label" style="margin:0 0 4px">Gift card code</label><input type="text" class="modal-input" id="payGiftCode" placeholder="GC-XXXXXXXX" style="margin:0;text-transform:uppercase"/>`;
+  } else if (method === 'card_sandbox'){
+    div.innerHTML = 'A fake sandbox charge will be simulated — no real card is ever contacted.';
+  } else {
+    div.innerHTML = '';
+  }
+};
+window.processPayment = async function(checkId){
+  const amount = parseFloat(document.getElementById('payAmount').value) || 0;
+  const tip_amount = parseFloat(document.getElementById('payTip').value) || 0;
+  const method = document.getElementById('payMethod').value;
+  if (amount <= 0){ alert('Enter a valid amount.'); return; }
+  const btn = document.getElementById('payChargeBtn');
+  if (btn){ btn.disabled = true; btn.textContent = 'Processing…'; }
+  let sandbox_txn_id = null, card_last4 = null;
+  if (method === 'card_sandbox'){
+    sandbox_txn_id = 'SANDBOX-' + Date.now().toString(36).toUpperCase();
+    card_last4 = String(1000 + Math.floor(Math.random()*9000));
+    await new Promise(r => setTimeout(r, 600)); // simulated processing delay
+  } else if (method === 'gift_card'){
+    const code = (document.getElementById('payGiftCode')?.value || '').trim();
+    if (!code){ alert('Enter the gift card code.'); if (btn){ btn.disabled = false; btn.textContent = 'Charge'; } return; }
+    const { error: giftErr } = await sb.rpc('redeem_gift_card', { p_code: code, p_amount: amount, p_check_id: checkId });
+    if (giftErr){ alert('Error: '+giftErr.message); if (btn){ btn.disabled = false; btn.textContent = 'Charge'; } return; }
+  }
+  const { error } = await sb.from('payments').insert({
+    check_id: checkId, amount, tip_amount, method, sandbox_txn_id, card_last4, processed_by: currentStaff.id,
+  });
+  if (error){ alert('Error: '+error.message); if (btn){ btn.disabled = false; btn.textContent = 'Charge'; } return; }
+  await maybeCloseCheck(checkId);
+  closeModal('formModal');
+  await loadOrdersData();
+};
+
+// ============================================================================
+// GIFT CARDS (Phase 11) — selling issues a new random code; redemption is
+// handled atomically server-side (redeem_gift_card()) so balance can never go
+// negative even with two people using the same card at once.
+// ============================================================================
+window.openGiftCardsModal = function(){
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Gift Cards</h3>
+    ${can('sell_gift_card') ? `
+    <div class="section-heading" style="margin-top:0">Sell New</div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:14px">
+      <input type="number" min="1" step="1" class="modal-input" style="margin:0;width:120px" id="gcAmount" placeholder="$ amount"/>
+      <button class="btn btn-primary btn-sm" onclick="sellGiftCard()">Sell</button>
+    </div>` : ''}
+    <div class="section-heading">Look Up${can('sell_gift_card')?' / Reload':''}</div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <input type="text" class="modal-input" style="margin:0;text-transform:uppercase" id="gcLookupCode" placeholder="Card code"/>
+      <button class="btn btn-secondary btn-sm" onclick="lookupGiftCard()">Look Up</button>
+    </div>
+    <div id="gcLookupResult"></div>
+    <div class="modal-actions"><button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Close</button></div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.sellGiftCard = async function(){
+  const amount = parseFloat(document.getElementById('gcAmount').value) || 0;
+  if (amount <= 0){ alert('Enter a valid amount.'); return; }
+  const code = 'GC-' + Math.random().toString(36).slice(2,10).toUpperCase();
+  const { data, error } = await sb.from('gift_cards').insert({ code, initial_value: amount, balance: amount, sold_by: currentStaff.id }).select().single();
+  if (error){ alert('Error: '+error.message); return; }
+  await sb.from('gift_card_transactions').insert({ gift_card_id: data.id, type: 'sale', amount, staff_id: currentStaff.id });
+  alert(`Gift card sold! Code: ${code}\n\nWrite this on the card or give it to the guest — it's needed to redeem.`);
+  document.getElementById('gcAmount').value = '';
+};
+window.lookupGiftCard = async function(){
+  const code = document.getElementById('gcLookupCode').value.trim();
+  if (!code) return;
+  const { data: card, error } = await sb.from('gift_cards').select('*').ilike('code', code).maybeSingle();
+  const div = document.getElementById('gcLookupResult');
+  if (error || !card){ div.innerHTML = '<span class="panel-sub">Not found.</span>'; return; }
+  div.innerHTML = `
+    <div class="panel-sub" style="margin:8px 0">Balance: $${Number(card.balance).toFixed(2)} of $${Number(card.initial_value).toFixed(2)} · <span class="badge badge-${card.status==='active'?'confirmed':'cancelled'}">${esc(card.status)}</span></div>
+    ${(can('sell_gift_card') && card.status!=='cancelled') ? `<div style="display:flex;gap:8px;align-items:center">
+      <input type="number" min="1" step="1" class="modal-input" style="margin:0;width:120px" id="gcReloadAmount" placeholder="$ to add"/>
+      <button class="btn btn-secondary btn-sm" onclick="reloadGiftCard('${card.id}')">Add Funds</button>
+    </div>` : ''}`;
+};
+window.reloadGiftCard = async function(id){
+  const amount = parseFloat(document.getElementById('gcReloadAmount').value) || 0;
+  if (amount <= 0){ alert('Enter a valid amount.'); return; }
+  const { data: card } = await sb.from('gift_cards').select('*').eq('id', id).single();
+  if (!card) return;
+  const { error } = await sb.from('gift_cards').update({ balance: Number(card.balance) + amount, status: 'active' }).eq('id', id);
+  if (error){ alert('Error: '+error.message); return; }
+  await sb.from('gift_card_transactions').insert({ gift_card_id: id, type: 'reload', amount, staff_id: currentStaff.id });
+  alert('Funds added.');
+  document.getElementById('gcLookupResult').innerHTML = '';
+  document.getElementById('gcLookupCode').value = '';
+};
+async function maybeCloseCheck(checkId){
+  const totalDue = checkTotalDue(checkId);
+  const { data: freshPayments } = await sb.from('payments').select('amount,refunded_amount').eq('check_id', checkId);
+  const paid = (freshPayments||[]).reduce((s,p)=>s+Number(p.amount)-Number(p.refunded_amount||0),0);
+  if (paid >= totalDue - 0.005){
+    await sb.from('checks').update({ status: 'closed', closed_at: new Date().toISOString() }).eq('id', checkId);
+  }
+}
+window.openRecentPaymentsModal = async function(){
+  const { data: pays } = await sb.from('payments').select('*').order('created_at',{ascending:false}).limit(30);
+  const checkIds = [...new Set((pays||[]).map(p=>p.check_id))];
+  const { data: chks } = checkIds.length ? await sb.from('checks').select('id,table_id,guest_label').in('id', checkIds) : { data: [] };
+  const checksById = {}; (chks||[]).forEach(c=>checksById[c.id]=c);
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Recent Payments</h3>
+    <div style="max-height:400px;overflow-y:auto">
+      ${(pays||[]).map(p => {
+        const chk = checksById[p.check_id];
+        const table = chk ? tableById(chk.table_id) : null;
+        const refundable = p.status !== 'refunded' && (p.amount - p.refunded_amount) > 0;
+        return `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:5px 0">
+          <span>${esc(table?.label||'')}${chk?.guest_label?' · '+esc(chk.guest_label):''} — $${Number(p.amount).toFixed(2)} ${esc(p.method)} ${p.status!=='completed'?`<span class="badge badge-pending">${esc(p.status)}</span>`:''}<div class="panel-sub" style="margin:0">${new Date(p.created_at).toLocaleString()}</div></span>
+          ${refundable ? `<button class="btn btn-sm btn-danger" onclick="openRefundModal('${p.id}', ${Number(p.amount) - Number(p.refunded_amount)})">Refund</button>` : ''}
+        </div>`;
+      }).join('') || '<div class="panel-sub">No payments yet.</div>'}
+    </div>
+    <div class="modal-actions"><button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Close</button></div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.openRefundModal = function(paymentId, maxAmount){
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Refund Payment</h3>
+    <label class="field-label">Amount to refund (max $${maxAmount.toFixed(2)})</label>
+    <input type="number" min="0.01" max="${maxAmount}" step="0.01" class="modal-input" id="refundAmount" value="${maxAmount.toFixed(2)}"/>
+    <label class="field-label">Reason</label>
+    <input type="text" class="modal-input" id="refundReason" placeholder="e.g. guest complaint"/>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="submitRefund('${paymentId}')">Refund</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.submitRefund = function(paymentId){
+  const amount = parseFloat(document.getElementById('refundAmount').value) || 0;
+  const reason = document.getElementById('refundReason').value.trim();
+  if (amount <= 0){ alert('Enter a valid amount.'); return; }
+  if (!reason){ alert('A reason is required.'); return; }
+  withApproval('process_refund', 'Processing a refund', async (approverId, pin) => {
+    const { error } = await sb.rpc('process_refund', { p_payment_id: paymentId, p_amount: amount, p_reason: reason, p_approver_id: approverId, p_pin: pin });
+    if (error){ alert('Error: '+error.message); return; }
+    closeModal('formModal');
+    alert('Refund processed.');
+  });
+};
+
+// ============================================================================
+// KITCHEN / BAR DISPLAY (Phase 6) — one column per ticket destination, live
+// tickets grouped by check, oldest first. Polls every 15s while this tab (or
+// Orders, which shares the same data) is on screen so new fired tickets show
+// up without a manual refresh.
+// ============================================================================
+let _kdsPollInterval = null;
+function startKdsPolling(){
+  stopKdsPolling();
+  _kdsPollInterval = setInterval(() => {
+    if (state.tab === 'kitchen' || state.tab === 'orders' || state.tab === 'expo') loadOrdersData();
+  }, 15000);
+}
+function stopKdsPolling(){ if (_kdsPollInterval){ clearInterval(_kdsPollInterval); _kdsPollInterval = null; } }
+function ticketElapsedMinutes(firedAt){
+  if (!firedAt) return 0;
+  return Math.max(0, Math.floor((getNow().getTime() - new Date(firedAt).getTime()) / 60000));
+}
+function renderKitchenTab(){
+  const destinations = state.ticketDestinations.filter(td=>td.active);
+  const relevantItems = state.checkItems.filter(ci => ['fired','preparing','ready'].includes(ci.status));
+  return `
+  <div class="panel-header"><h2 class="panel-title">Kitchen &amp; Bar Tickets</h2></div>
+  <div style="display:flex;gap:14px;overflow-x:auto;padding-bottom:8px">
+    ${destinations.map(td => {
+      const items = relevantItems.filter(ci => ci.ticket_destination_id === td.id);
+      const checkIds = [...new Set(items.map(ci=>ci.check_id))];
+      const tickets = checkIds.map(cid => {
+        const check = state.checks.find(c=>c.id===cid);
+        const tItems = items.filter(ci=>ci.check_id===cid).sort((a,b)=>new Date(a.created_at)-new Date(b.created_at));
+        const firedAt = tItems.map(ci=>ci.fired_at).filter(Boolean).sort()[0];
+        return { check, items: tItems, firedAt };
+      }).filter(t => t.check).sort((a,b) => new Date(a.firedAt||0) - new Date(b.firedAt||0));
+      return `
+      <div style="flex:0 0 300px">
+        <div class="section-heading" style="margin-top:0">${esc(td.name)} <span class="panel-sub" style="margin:0">(${tickets.length})</span></div>
+        <div style="display:flex;flex-direction:column;gap:10px">
+          ${tickets.map(t => renderKitchenTicket(t)).join('') || '<div class="card"><div class="panel-sub" style="margin:0">No active tickets.</div></div>'}
+        </div>
+      </div>`;
+    }).join('') || '<div class="panel-sub">No ticket destinations set up yet — add them in Settings → Menu.</div>'}
+  </div>`;
+}
+function renderKitchenTicket(t){
+  const table = tableById(t.check.table_id);
+  const mins = ticketElapsedMinutes(t.firedAt);
+  const urgent = mins >= 12;
+  const allReady = t.items.every(ci => ci.status === 'ready');
+  const destId = t.items[0]?.ticket_destination_id;
+  return `
+  <div class="card" style="border-left:4px solid ${urgent?'#dc2626':'#0070f2'}">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <b>${esc(table?.label||'?')}${t.check.guest_label?' · '+esc(t.check.guest_label):''}</b>
+      <span class="panel-sub" style="margin:0">${mins}m</span>
+    </div>
+    ${t.items.map(ci => `<div style="padding:4px 0;border-top:1px solid var(--border)">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span>${ci.quantity}x ${esc(ci.name_snapshot)}</span>
+        <span class="badge badge-pending">${esc(ci.status)}</span>
+      </div>
+      ${(ci.modifiers||[]).length ? `<div class="panel-sub" style="margin:0">${(ci.modifiers||[]).map(m=>esc(m.name)).join(', ')}</div>` : ''}
+      ${ci.notes ? `<div class="panel-sub" style="margin:0">📝 ${esc(ci.notes)}</div>` : ''}
+      <div style="display:flex;gap:6px;margin-top:4px">
+        ${ci.status==='fired' ? `<button class="btn btn-sm btn-secondary" onclick="advanceCheckItem('${ci.id}','preparing')">Start</button>` : ''}
+        ${ci.status==='preparing' ? `<button class="btn btn-sm btn-primary" onclick="advanceCheckItem('${ci.id}','ready')">Ready</button>` : ''}
+      </div>
+    </div>`).join('')}
+    ${!allReady ? `<div class="modal-actions" style="padding-top:8px;justify-content:flex-start"><button class="btn btn-sm btn-primary" onclick="advanceTicket('${t.check.id}','${destId}')">Mark Whole Ticket Ready</button></div>` : `<div class="panel-sub" style="margin-top:6px">✅ Ready for expo</div>`}
+  </div>`;
+}
+window.advanceCheckItem = async function(id, newStatus){
+  const patch = { status: newStatus };
+  if (newStatus === 'ready') patch.ready_at = new Date().toISOString();
+  const { error } = await sb.from('check_items').update(patch).eq('id', id);
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+};
+window.advanceTicket = async function(checkId, destinationId){
+  const { error } = await sb.from('check_items').update({ status: 'ready', ready_at: new Date().toISOString() })
+    .eq('check_id', checkId).eq('ticket_destination_id', destinationId).in('status', ['fired','preparing']);
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+};
+
+// ============================================================================
+// EXPO (Phase 7) — everything the kitchen/bar has marked ready, waiting to be
+// run to the table. Expo (or a manager) clears items here once delivered,
+// which is also what clears the 🔔 ready flag servers see on the Orders tab.
+// ============================================================================
+function renderExpoTab(){
+  const readyItems = state.checkItems.filter(ci => ci.status === 'ready');
+  const checkIds = [...new Set(readyItems.map(ci=>ci.check_id))];
+  const tickets = checkIds.map(cid => {
+    const check = state.checks.find(c=>c.id===cid);
+    const items = readyItems.filter(ci=>ci.check_id===cid).sort((a,b)=>new Date(a.ready_at||0)-new Date(b.ready_at||0));
+    return { check, items };
+  }).filter(t=>t.check).sort((a,b) => new Date(a.items[0]?.ready_at||0) - new Date(b.items[0]?.ready_at||0));
+  return `
+  <div class="panel-header"><h2 class="panel-title">Expo — Ready to Run</h2></div>
+  <div style="display:flex;flex-wrap:wrap;gap:12px">
+    ${tickets.map(t => {
+      const table = tableById(t.check.table_id);
+      return `<div class="card" style="flex:0 0 300px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <b>${esc(table?.label||'?')}${t.check.guest_label?' · '+esc(t.check.guest_label):''}</b>
+          <span class="panel-sub" style="margin:0">${ticketElapsedMinutes(t.items[0]?.ready_at)}m ready</span>
+        </div>
+        ${t.items.map(ci => `<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-top:1px solid var(--border)">
+          <span>${ci.quantity}x ${esc(ci.name_snapshot)}</span>
+          <button class="btn btn-sm btn-primary" onclick="markItemDelivered('${ci.id}')">Delivered</button>
+        </div>`).join('')}
+        <div class="modal-actions" style="padding-top:8px;justify-content:flex-start"><button class="btn btn-sm btn-secondary" onclick="markTicketDelivered('${t.check.id}')">Mark All Delivered</button></div>
+      </div>`;
+    }).join('') || '<div class="panel-sub">Nothing ready right now.</div>'}
+  </div>`;
+}
+window.markItemDelivered = async function(id){
+  const { error } = await sb.from('check_items').update({ status: 'delivered', delivered_at: new Date().toISOString() }).eq('id', id);
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+};
+window.markTicketDelivered = async function(checkId){
+  const { error } = await sb.from('check_items').update({ status: 'delivered', delivered_at: new Date().toISOString() }).eq('check_id', checkId).eq('status','ready');
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+};
+function avgOrderTimeMinutes(){
+  const delivered = state.checkItems.filter(ci => ci.status==='delivered' && ci.fired_at && ci.delivered_at);
+  if (!delivered.length) return null;
+  const totalMin = delivered.reduce((s,ci) => s + (new Date(ci.delivered_at) - new Date(ci.fired_at))/60000, 0);
+  return totalMin / delivered.length;
+}
+
+// ============================================================================
+// SCHEDULE TAB — clock in/out, my schedule, time off, and (permission-gated)
+// the manager-facing schedule builder + timecard/time-off management.
+// ============================================================================
+async function loadScheduleData(){
+  const today = todayISO();
+  const from = toLocalISODate(new Date(new Date(today+'T00:00:00').getTime() - 7*86400000));
+  const to = toLocalISODate(new Date(new Date(today+'T00:00:00').getTime() + 30*86400000));
+  const [shiftsRes, clockRes, offRes, groupsRes, groupMembersRes, threadsRes, participantsRes, messagesRes, swapsRes] = await Promise.all([
+    sb.from('schedule_shifts').select('*').gte('shift_date', from).lte('shift_date', to).order('shift_date').order('scheduled_start'),
+    sb.from('time_clock_entries').select('*').order('clock_in_at', { ascending: false }).limit(300),
+    sb.from('time_off_requests').select('*').order('requested_at', { ascending: false }),
+    sb.from('staff_groups').select('*').order('name'),
+    sb.from('staff_group_members').select('*'),
+    sb.from('message_threads').select('*').order('created_at', { ascending: false }),
+    sb.from('thread_participants').select('*'),
+    sb.from('messages').select('*').order('created_at', { ascending: false }).limit(300),
+    sb.from('shift_swap_requests').select('*').order('created_at', { ascending: false }),
+  ]);
+  state.scheduleShifts = shiftsRes.data || [];
+  state.timeClockEntries = clockRes.data || [];
+  state.timeOffRequests = offRes.data || [];
+  state.staffGroups = groupsRes.data || [];
+  state.staffGroupMembers = groupMembersRes.data || [];
+  state.messageThreads = threadsRes.data || [];
+  state.threadParticipants = participantsRes.data || [];
+  state.messages = messagesRes.data || [];
+  state.shiftSwapRequests = swapsRes.data || [];
+  render();
+}
+
+function renderScheduleTab(){
+  const myOpenEntry = state.timeClockEntries.find(e => e.staff_id === currentStaff.id && !e.clock_out_at);
+  const myShifts = state.scheduleShifts.filter(s => s.staff_id === currentStaff.id && s.published && s.shift_date >= todayISO()).slice(0,10);
+  const myTimeOff = state.timeOffRequests.filter(r => r.staff_id === currentStaff.id);
+
+  const clockCard = can('clock_in_out') ? `
+  <div class="section-heading">Time Clock</div>
+  <div class="card">
+    ${myOpenEntry
+      ? `<div class="res-meta">Clocked in since ${new Date(myOpenEntry.clock_in_at).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}${myOpenEntry.status==='late'?' <span class="badge badge-pending">late</span>':''}</div>
+         <div class="modal-actions" style="padding-top:10px;justify-content:flex-start"><button class="btn btn-danger" onclick="clockOut()">Clock Out</button></div>`
+      : `<div class="panel-sub" style="margin:0 0 10px">Not clocked in.</div>
+         <div class="modal-actions" style="padding-top:0;justify-content:flex-start"><button class="btn btn-primary" onclick="clockIn()">Clock In</button></div>`}
+  </div>` : '';
+
+  const scheduleCard = can('view_own_schedule') ? `
+  <div class="section-heading">My Upcoming Shifts</div>
+  <div class="card">
+    ${myShifts.length ? myShifts.map(s => `<div class="res-meta" style="padding:3px 0">${fmtDateHuman(s.shift_date)} · ${fmtTime(s.scheduled_start)}–${fmtTime(s.scheduled_end)}${s.shift_role?' · '+esc(s.shift_role):''}</div>`).join('') : '<div class="panel-sub" style="margin:0">No upcoming shifts scheduled.</div>'}
+  </div>` : '';
+
+  const timeOffCard = can('request_time_off') ? `
+  <div class="section-heading">Time Off</div>
+  <div class="card">
+    ${myTimeOff.length ? myTimeOff.map(r => `<div class="res-meta" style="padding:3px 0">${fmtDateHuman(r.start_date)} – ${fmtDateHuman(r.end_date)}${r.reason?' · '+esc(r.reason):''} <span class="badge badge-${r.status==='approved'?'confirmed':r.status==='denied'?'cancelled':'pending'}">${r.status}</span></div>`).join('') : '<div class="panel-sub" style="margin:0 0 10px">No requests yet.</div>'}
+    <div class="modal-actions" style="padding-top:10px;justify-content:flex-start"><button class="btn btn-secondary btn-sm" onclick="openTimeOffModal()">+ Request Time Off</button></div>
+  </div>` : '';
+
+  return `
+  <div class="panel-header"><h2 class="panel-title">Schedule</h2></div>
+  ${clockCard}
+  ${scheduleCard}
+  ${timeOffCard}
+  ${can('use_messaging') ? renderMessagesSection() : ''}
+  ${can('manage_broadcasts') ? renderGroupsSection() : ''}
+  ${can('manage_schedule') ? renderScheduleBuilder() : ''}
+  ${can('manage_timecards') ? renderTimecardManagement() : ''}`;
+}
+
+// ---- Messaging: threads, groups, shift swaps -------------------------------
+function myThreadIds(){
+  return new Set(state.threadParticipants.filter(tp => tp.staff_id === currentStaff.id).map(tp => tp.thread_id));
+}
+function threadLabel(t){
+  if (t.type === 'broadcast') return '📣 ' + (t.name || 'Broadcast: Everyone');
+  if (t.type === 'group'){
+    const g = state.staffGroups.find(x => x.id === t.group_id);
+    return '👥 ' + (g?.name || t.name || 'Group');
+  }
+  const others = state.threadParticipants.filter(tp => tp.thread_id === t.id && tp.staff_id !== currentStaff.id).map(tp => state.staffList.find(s=>s.id===tp.staff_id)?.name).filter(Boolean);
+  return '💬 ' + (others.join(', ') || 'Direct message');
+}
+function renderMessagesSection(){
+  const mine = myThreadIds();
+  const myThreads = state.messageThreads.filter(t => mine.has(t.id) || can('manage_broadcasts'));
+  const rows = myThreads.map(t => {
+    const last = state.messages.filter(m => m.thread_id === t.id).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at))[0];
+    return { t, last };
+  }).sort((a,b) => new Date(b.last?.created_at||b.t.created_at) - new Date(a.last?.created_at||a.t.created_at));
+
+  const openSwaps = state.shiftSwapRequests.filter(r => r.status === 'open' && r.requested_by !== currentStaff.id);
+  const mySwaps = state.shiftSwapRequests.filter(r => r.requested_by === currentStaff.id && r.status !== 'denied');
+  const swapLine = r => {
+    const s = state.scheduleShifts.find(x => x.id === r.shift_id);
+    return s ? `${fmtDateHuman(s.shift_date)} · ${fmtTime(s.scheduled_start)}–${fmtTime(s.scheduled_end)}` : 'shift';
+  };
+
+  return `
+  <div class="section-heading">Messages</div>
+  <div class="card">
+    ${rows.length ? rows.map(({t,last}) => `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;cursor:pointer" onclick="openThreadModal('${t.id}')">
+      <span><b>${esc(threadLabel(t))}</b>${last ? ' — '+esc(last.body.slice(0,60))+(last.body.length>60?'…':'') : ' — no messages yet'}</span>
+      <span class="panel-sub" style="margin:0">${last ? new Date(last.created_at).toLocaleDateString() : ''}</span>
+    </div>`).join('') : '<div class="panel-sub" style="margin:0">No messages yet.</div>'}
+    <div class="modal-actions" style="padding-top:10px;justify-content:flex-start;gap:8px">
+      <button class="btn btn-secondary btn-sm" onclick="openNewMessageModal()">+ New Message</button>
+      <button class="btn btn-secondary btn-sm" onclick="openShiftSwapModal()">🔁 Request Shift Swap</button>
+    </div>
+  </div>
+  ${(openSwaps.length || mySwaps.length) ? `
+  <div class="section-heading">Shift Swaps</div>
+  <div class="card">
+    ${mySwaps.map(r => {
+      const claimant = r.claimed_by ? state.staffList.find(x=>x.id===r.claimed_by) : null;
+      return `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0">
+        <span>Your shift — ${swapLine(r)}${claimant ? ' — claimed by '+esc(claimant.name) : ''}</span>
+        <span class="badge badge-${r.status==='approved'?'confirmed':'pending'}">${r.status}</span>
+      </div>`;
+    }).join('')}
+    ${openSwaps.length ? openSwaps.map(r => {
+      const req = state.staffList.find(x=>x.id===r.requested_by);
+      return `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0">
+        <span>${esc(req?.name||'?')}'s shift — ${swapLine(r)}</span>
+        <button class="btn btn-sm btn-secondary" onclick="claimShiftSwap('${r.id}')">Claim</button>
+      </div>`;
+    }).join('') : '<div class="panel-sub" style="margin:0">No open swaps to claim right now.</div>'}
+  </div>` : ''}`;
+}
+
+function renderGroupsSection(){
+  return `
+  <div class="section-heading">Staff Groups</div>
+  <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">Groups used for group messages and broadcasts — any mix of employees, not tied to role.</div>
+    ${state.staffGroups.length ? state.staffGroups.map(g => {
+      const members = state.staffGroupMembers.filter(m => m.group_id === g.id).map(m => state.staffList.find(s=>s.id===m.staff_id)?.name).filter(Boolean);
+      return `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0">
+        <span><b>${esc(g.name)}</b> — ${members.length ? esc(members.join(', ')) : 'no members yet'}</span>
+        <span style="display:flex;gap:6px"><button class="btn btn-sm btn-secondary" onclick="openGroupModal('${g.id}')">Edit</button><button class="btn btn-sm btn-danger" onclick="deleteStaffGroup('${g.id}')">Delete</button></span>
+      </div>`;
+    }).join('') : '<div class="panel-sub" style="margin:0">No groups yet.</div>'}
+    <div class="modal-actions" style="padding-top:10px;justify-content:flex-start"><button class="btn btn-secondary btn-sm" onclick="openGroupModal()">+ New Group</button></div>
+  </div>`;
+}
+
+// ---- Groups: create/edit/delete -------------------------------------------
+window.openGroupModal = function(groupId){
+  const g = groupId ? state.staffGroups.find(x => x.id === groupId) : null;
+  const memberIds = g ? new Set(state.staffGroupMembers.filter(m => m.group_id === g.id).map(m => m.staff_id)) : new Set();
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>${g ? 'Edit Group' : 'New Group'}</h3>
+    <label class="field-label">Group name</label>
+    <input type="text" class="modal-input" id="grpName" value="${g ? esc(g.name) : ''}"/>
+    <label class="field-label">Members</label>
+    <div style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:8px;margin-bottom:10px">
+      ${state.staffList.filter(s=>s.active).map(s => `<label style="display:flex;align-items:center;gap:8px;padding:3px 0;font-size:13px">
+        <input type="checkbox" class="grpMemberChk" value="${s.id}" ${memberIds.has(s.id)?'checked':''}/> ${esc(s.name)} (${esc(s.role)})
+      </label>`).join('')}
+    </div>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="saveGroup(${g ? `'${g.id}'` : 'null'})">Save</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.saveGroup = async function(groupId){
+  const name = document.getElementById('grpName').value.trim();
+  if (!name){ alert('Enter a group name.'); return; }
+  const memberIds = Array.from(document.querySelectorAll('.grpMemberChk:checked')).map(el => el.value);
+  let id = groupId;
+  if (id){
+    const { error } = await sb.from('staff_groups').update({ name }).eq('id', id);
+    if (error){ alert('Error: '+error.message); return; }
+    await sb.from('staff_group_members').delete().eq('group_id', id);
+  } else {
+    const { data, error } = await sb.from('staff_groups').insert({ name, created_by: currentStaff.id }).select().single();
+    if (error){ alert('Error: '+error.message); return; }
+    id = data.id;
+  }
+  if (memberIds.length){
+    const { error: memErr } = await sb.from('staff_group_members').insert(memberIds.map(sid => ({ group_id: id, staff_id: sid })));
+    if (memErr){ alert('Group saved, but adding members failed: '+memErr.message); }
+  }
+  closeModal('formModal');
+  await loadScheduleData();
+};
+window.deleteStaffGroup = async function(id){
+  if (!confirm('Delete this group? Any group message thread stays but the group definition will be gone.')) return;
+  await sb.from('staff_group_members').delete().eq('group_id', id);
+  const { error } = await sb.from('staff_groups').delete().eq('id', id);
+  if (error){ alert('Error: '+error.message); return; }
+  await loadScheduleData();
+};
+
+// ---- Messages: new message, threads, replies -------------------------------
+window.openNewMessageModal = function(){
+  const canBroadcast = can('manage_broadcasts');
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>New Message</h3>
+    <label class="field-label">Send to</label>
+    <select class="modal-select" id="msgKind" onchange="toggleMsgKindFields()">
+      <option value="direct">One person</option>
+      <option value="group">A group</option>
+      ${canBroadcast ? '<option value="broadcast">Broadcast to everyone</option>' : ''}
+    </select>
+    <div id="msgKindFields" style="margin-top:8px"></div>
+    <label class="field-label" style="margin-top:10px">Message</label>
+    <textarea class="modal-input" id="msgBody" rows="3" style="resize:vertical"></textarea>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="sendNewMessage()">Send</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+  toggleMsgKindFields();
+};
+window.toggleMsgKindFields = function(){
+  const kind = document.getElementById('msgKind').value;
+  const div = document.getElementById('msgKindFields');
+  if (kind === 'direct'){
+    div.innerHTML = `<select class="modal-select" id="msgToStaff">${state.staffList.filter(s=>s.active && s.id!==currentStaff.id).map(s=>`<option value="${s.id}">${esc(s.name)} (${esc(s.role)})</option>`).join('') || '<option value="">No other staff yet</option>'}</select>`;
+  } else if (kind === 'group'){
+    div.innerHTML = `<select class="modal-select" id="msgToGroup">${state.staffGroups.map(g=>`<option value="${g.id}">${esc(g.name)}</option>`).join('') || '<option value="">No groups yet — create one first</option>'}</select>`;
+  } else {
+    div.innerHTML = `<div class="panel-sub" style="margin:0">Goes to every active employee.</div>`;
+  }
+};
+async function findOrCreateDirectThread(otherId){
+  const myThreadIdsArr = state.threadParticipants.filter(tp => tp.staff_id === currentStaff.id).map(tp => tp.thread_id);
+  const theirThreadIds = new Set(state.threadParticipants.filter(tp => tp.staff_id === otherId).map(tp => tp.thread_id));
+  const existing = state.messageThreads.find(t => t.type === 'direct' && myThreadIdsArr.includes(t.id) && theirThreadIds.has(t.id));
+  if (existing) return existing.id;
+  const { data, error } = await sb.from('message_threads').insert({ type: 'direct', created_by: currentStaff.id }).select().single();
+  if (error){ alert('Error: '+error.message); return null; }
+  const { error: partErr } = await sb.from('thread_participants').insert([{ thread_id: data.id, staff_id: currentStaff.id }, { thread_id: data.id, staff_id: otherId }]);
+  if (partErr){ alert('Error: '+partErr.message); return null; }
+  return data.id;
+}
+async function findOrCreateGroupThread(groupId){
+  const existing = state.messageThreads.find(t => t.type === 'group' && t.group_id === groupId);
+  if (existing) return existing.id;
+  const g = state.staffGroups.find(x => x.id === groupId);
+  const { data, error } = await sb.from('message_threads').insert({ type: 'group', group_id: groupId, name: g?.name || null, created_by: currentStaff.id }).select().single();
+  if (error){ alert('Error: '+error.message); return null; }
+  const memberIds = new Set(state.staffGroupMembers.filter(m => m.group_id === groupId).map(m => m.staff_id));
+  memberIds.add(currentStaff.id);
+  const { error: partErr } = await sb.from('thread_participants').insert(Array.from(memberIds).map(sid => ({ thread_id: data.id, staff_id: sid })));
+  if (partErr){ alert('Error: '+partErr.message); return null; }
+  return data.id;
+}
+async function findOrCreateBroadcastThread(){
+  const existing = state.messageThreads.find(t => t.type === 'broadcast');
+  if (existing) return existing.id;
+  const { data, error } = await sb.from('message_threads').insert({ type: 'broadcast', name: 'Everyone', created_by: currentStaff.id }).select().single();
+  if (error){ alert('Error: '+error.message); return null; }
+  const { error: partErr } = await sb.from('thread_participants').insert(state.staffList.filter(s=>s.active).map(s => ({ thread_id: data.id, staff_id: s.id })));
+  if (partErr){ alert('Error: '+partErr.message); return null; }
+  return data.id;
+}
+window.sendNewMessage = async function(){
+  const kind = document.getElementById('msgKind').value;
+  const body = document.getElementById('msgBody').value.trim();
+  if (!body){ alert('Enter a message.'); return; }
+  let threadId;
+  if (kind === 'direct'){
+    const toId = document.getElementById('msgToStaff').value;
+    if (!toId){ alert('Choose someone to message.'); return; }
+    threadId = await findOrCreateDirectThread(toId);
+  } else if (kind === 'group'){
+    const groupId = document.getElementById('msgToGroup').value;
+    if (!groupId){ alert('Choose a group.'); return; }
+    threadId = await findOrCreateGroupThread(groupId);
+  } else {
+    threadId = await findOrCreateBroadcastThread();
+  }
+  if (!threadId) return;
+  const { error } = await sb.from('messages').insert({ thread_id: threadId, sender_id: currentStaff.id, body });
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await loadScheduleData();
+};
+window.openThreadModal = function(threadId){
+  const t = state.messageThreads.find(x => x.id === threadId);
+  if (!t) return;
+  const msgs = state.messages.filter(m => m.thread_id === threadId).sort((a,b) => new Date(a.created_at) - new Date(b.created_at));
+  const canPost = t.type !== 'broadcast' || can('manage_broadcasts');
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>${esc(threadLabel(t))}</h3>
+    <div style="max-height:320px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;margin-bottom:12px;padding:4px">
+      ${msgs.length ? msgs.map(m => {
+        const s = state.staffList.find(x => x.id === m.sender_id);
+        return `<div style="padding:8px 10px;border-radius:8px;background:${m.sender_id===currentStaff.id?'#eef2ff':'#f4f4f5'}">
+          <div style="font-size:12px;font-weight:600;margin-bottom:2px">${esc(s?.name||'?')} <span class="panel-sub" style="font-weight:400">${new Date(m.created_at).toLocaleString()}</span></div>
+          <div style="font-size:13px">${esc(m.body)}</div>
+        </div>`;
+      }).join('') : '<div class="panel-sub" style="margin:0">No messages yet.</div>'}
+    </div>
+    ${canPost ? `
+    <div style="display:flex;gap:8px">
+      <input type="text" class="modal-input" id="replyBody" style="margin:0;flex:1" placeholder="Type a reply…" onkeydown="if(event.key==='Enter')sendReply('${threadId}')"/>
+      <button class="btn btn-primary" onclick="sendReply('${threadId}')">Send</button>
+    </div>` : `<div class="panel-sub" style="margin:0">Only managers can post to broadcasts.</div>`}
+    <div class="modal-actions"><button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Close</button></div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.sendReply = async function(threadId){
+  const input = document.getElementById('replyBody');
+  const body = input.value.trim();
+  if (!body) return;
+  const { error } = await sb.from('messages').insert({ thread_id: threadId, sender_id: currentStaff.id, body });
+  if (error){ alert('Error: '+error.message); return; }
+  await loadScheduleData();
+  openThreadModal(threadId);
+};
+
+// ---- Shift swaps: request, claim -------------------------------------------
+window.openShiftSwapModal = function(){
+  const myShifts = state.scheduleShifts.filter(s => s.staff_id === currentStaff.id && s.published && s.shift_date >= todayISO());
+  if (!myShifts.length){ alert('You have no upcoming published shifts to offer for swap.'); return; }
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Request Shift Swap</h3>
+    <label class="field-label">Which shift?</label>
+    <select class="modal-select" id="swapShift">${myShifts.map(s=>`<option value="${s.id}">${fmtDateHuman(s.shift_date)} · ${fmtTime(s.scheduled_start)}–${fmtTime(s.scheduled_end)}</option>`).join('')}</select>
+    <div class="panel-sub" style="margin:8px 0">Anyone can claim it from the Messages section — a manager still has to approve the swap before it's final.</div>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="submitShiftSwap()">Request Swap</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.submitShiftSwap = async function(){
+  const shiftId = document.getElementById('swapShift').value;
+  const { error } = await sb.from('shift_swap_requests').insert({ shift_id: shiftId, requested_by: currentStaff.id });
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await loadScheduleData();
+};
+window.claimShiftSwap = async function(id){
+  if (!confirm('Claim this shift? A manager still needs to approve it.')) return;
+  const { error } = await sb.from('shift_swap_requests').update({ status: 'claimed', claimed_by: currentStaff.id }).eq('id', id).eq('status', 'open');
+  if (error){ alert('Error: '+error.message); return; }
+  await loadScheduleData();
+};
+window.decideShiftSwap = async function(id, decision){
+  const r = state.shiftSwapRequests.find(x => x.id === id);
+  if (!r) return;
+  if (decision === 'approved' && !confirm('Approve this swap? The shift will be reassigned to the person who claimed it.')) return;
+  const { error } = await sb.from('shift_swap_requests').update({ status: decision, approved_by: currentStaff.id, decided_at: new Date().toISOString() }).eq('id', id);
+  if (error){ alert('Error: '+error.message); return; }
+  if (decision === 'approved' && r.claimed_by){
+    const { error: reassignErr } = await sb.from('schedule_shifts').update({ staff_id: r.claimed_by }).eq('id', r.shift_id);
+    if (reassignErr) alert('Swap approved, but the shift could not be reassigned automatically (missing schedule permission) — move it manually on the Schedule Builder. '+reassignErr.message);
+  }
+  await loadScheduleData();
+};
+
+function renderScheduleBuilder(){
+  const upcoming = state.scheduleShifts.filter(s => s.shift_date >= todayISO()).slice(0,50);
+  return `
+  <div class="section-heading">Schedule Builder</div>
+  <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">Unpublished shifts are drafts — only visible here until you publish them, so staff never see a schedule that isn't final yet.</div>
+    <table class="data-table">
+      <thead><tr><th>Employee</th><th>Date</th><th>Time</th><th>Role</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        ${upcoming.map(s => {
+          const st = state.staffList.find(x=>x.id===s.staff_id);
+          return `<tr>
+            <td>${esc(st?.name||'?')}</td>
+            <td>${fmtDateHuman(s.shift_date)}</td>
+            <td>${fmtTime(s.scheduled_start)}–${fmtTime(s.scheduled_end)}</td>
+            <td>${esc(s.shift_role||st?.role||'')}</td>
+            <td>${s.published ? '<span class="badge badge-confirmed">published</span>' : '<span class="badge badge-pending">draft</span>'}</td>
+            <td style="display:flex;gap:6px">
+              ${!s.published ? `<button class="btn btn-sm btn-primary" onclick="publishShift('${s.id}')">Publish</button>` : ''}
+              <button class="btn btn-sm btn-danger" onclick="deleteShift('${s.id}')">Delete</button>
+            </td>
+          </tr>`;
+        }).join('') || `<tr><td colspan="6"><span class="panel-sub">No shifts scheduled yet.</span></td></tr>`}
+      </tbody>
+    </table>
+    <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openShiftModal()">+ Add Shift</button></div>
+  </div>`;
+}
+
+function renderTimecardManagement(){
+  const now = getNow();
+  const missing = state.scheduleShifts.filter(s => {
+    if (s.shift_date > todayISO()) return false;
+    const scheduledEnd = new Date(s.shift_date+'T'+s.scheduled_end);
+    if (now.getTime() - scheduledEnd.getTime() < 60*60000) return false; // grace period before flagging
+    const entry = state.timeClockEntries.find(e => e.shift_id === s.id);
+    return !entry || !entry.clock_out_at;
+  });
+  const pendingOff = state.timeOffRequests.filter(r => r.status === 'pending');
+  const pendingSwaps = state.shiftSwapRequests.filter(r => r.status === 'claimed');
+  return `
+  <div class="section-heading">Missing Punches</div>
+  <div class="card">
+    ${missing.length ? missing.map(s => {
+      const st = state.staffList.find(x=>x.id===s.staff_id);
+      return `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0">
+        <span>${esc(st?.name||'?')} — ${fmtDateHuman(s.shift_date)}, scheduled until ${fmtTime(s.scheduled_end)}</span>
+        <button class="btn btn-sm btn-secondary" onclick="correctMissingPunch('${s.id}')">Correct</button>
+      </div>`;
+    }).join('') : '<div class="panel-sub" style="margin:0">No missing punches.</div>'}
+  </div>
+  <div class="section-heading">Time Off Requests</div>
+  <div class="card">
+    ${pendingOff.length ? pendingOff.map(r => {
+      const st = state.staffList.find(x=>x.id===r.staff_id);
+      return `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0">
+        <span>${esc(st?.name||'?')} — ${fmtDateHuman(r.start_date)} to ${fmtDateHuman(r.end_date)}${r.reason?' · '+esc(r.reason):''}</span>
+        <span style="display:flex;gap:6px"><button class="btn btn-sm btn-success" onclick="decideTimeOff('${r.id}','approved')">Approve</button><button class="btn btn-sm btn-danger" onclick="decideTimeOff('${r.id}','denied')">Deny</button></span>
+      </div>`;
+    }).join('') : '<div class="panel-sub" style="margin:0">No pending requests.</div>'}
+  </div>
+  ${can('approve_shift_swap') ? `
+  <div class="section-heading">Pending Shift Swaps</div>
+  <div class="card">
+    ${pendingSwaps.length ? pendingSwaps.map(r => {
+      const s = state.scheduleShifts.find(x=>x.id===r.shift_id);
+      const req = state.staffList.find(x=>x.id===r.requested_by);
+      const claim = state.staffList.find(x=>x.id===r.claimed_by);
+      return `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0">
+        <span>${esc(req?.name||'?')} → ${esc(claim?.name||'?')} — ${s?fmtDateHuman(s.shift_date)+' · '+fmtTime(s.scheduled_start)+'–'+fmtTime(s.scheduled_end):'shift'}</span>
+        <span style="display:flex;gap:6px"><button class="btn btn-sm btn-success" onclick="decideShiftSwap('${r.id}','approved')">Approve</button><button class="btn btn-sm btn-danger" onclick="decideShiftSwap('${r.id}','denied')">Deny</button></span>
+      </div>`;
+    }).join('') : '<div class="panel-sub" style="margin:0">No pending swaps.</div>'}
+  </div>` : ''}`;
+}
+
+window.clockIn = async function(){
+  const pin = prompt('Enter your PIN to clock in:');
+  if (!pin) return;
+  const { data: ok, error: pinErr } = await sb.rpc('verify_staff_pin', { target_staff_id: currentStaff.id, pin });
+  if (pinErr || !ok){ alert('Incorrect PIN.'); return; }
+  const now = getNow();
+  const today = todayISO();
+  const todaysShifts = state.scheduleShifts.filter(s => s.staff_id === currentStaff.id && s.shift_date === today && s.published);
+  let shift = todaysShifts.find(s => now.getTime() >= new Date(today+'T'+s.scheduled_start).getTime() - 10*60000) || todaysShifts[0];
+  if (!shift){
+    if (!can('manage_timecards')){ alert('No scheduled shift found for you today — ask a manager to clock you in.'); return; }
+    if (!confirm('No scheduled shift found for today — clock in anyway?')) return;
+  } else {
+    const start = new Date(today+'T'+shift.scheduled_start);
+    if (now.getTime() < start.getTime() - 10*60000){
+      alert(`Too early — your shift starts at ${fmtTime(shift.scheduled_start)}.`);
+      return;
+    }
+  }
+  const status = shift && now.getTime() > new Date(today+'T'+shift.scheduled_start).getTime() ? 'late' : 'on_time';
+  const { error } = await sb.from('time_clock_entries').insert({ staff_id: currentStaff.id, shift_id: shift?.id || null, clock_in_at: now.toISOString(), status });
+  if (error){ alert('Error: '+error.message); return; }
+  await loadScheduleData();
+};
+
+window.clockOut = async function(){
+  const entry = state.timeClockEntries.find(e => e.staff_id === currentStaff.id && !e.clock_out_at);
+  if (!entry){ alert("You're not clocked in."); return; }
+  const pin = prompt('Enter your PIN to clock out:');
+  if (!pin) return;
+  const { data: ok, error: pinErr } = await sb.rpc('verify_staff_pin', { target_staff_id: currentStaff.id, pin });
+  if (pinErr || !ok){ alert('Incorrect PIN.'); return; }
+  const cashTipsInput = prompt(`Card tips this shift: $${Number(entry.computed_card_tips||0).toFixed(2)} (tracked automatically once Payments is live — nothing to enter for that part).\n\nCash tips you received this shift ($):`, '0');
+  if (cashTipsInput === null) return;
+  const cashTips = Number(cashTipsInput);
+  if (isNaN(cashTips) || cashTips < 0){ alert('Enter a valid dollar amount.'); return; }
+  const { error } = await sb.from('time_clock_entries').update({ clock_out_at: getNow().toISOString(), declared_cash_tips: cashTips }).eq('id', entry.id);
+  if (error){ alert('Error: '+error.message); return; }
+  await loadScheduleData();
+};
+
+window.openTimeOffModal = function(){
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Request Time Off</h3>
+    <div class="formgrid">
+      <div><label class="field-label">Start date</label><input type="date" class="modal-input" id="toStart" value="${todayISO()}"/></div>
+      <div><label class="field-label">End date</label><input type="date" class="modal-input" id="toEnd" value="${todayISO()}"/></div>
+    </div>
+    <label class="field-label">Reason (optional)</label>
+    <input type="text" class="modal-input" id="toReason"/>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="submitTimeOff()">Submit</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.submitTimeOff = async function(){
+  const start = document.getElementById('toStart').value;
+  const end = document.getElementById('toEnd').value;
+  const reason = document.getElementById('toReason').value.trim();
+  if (!start || !end || end < start){ alert('Enter a valid date range.'); return; }
+  const { error } = await sb.from('time_off_requests').insert({ staff_id: currentStaff.id, start_date: start, end_date: end, reason: reason || null });
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await loadScheduleData();
+};
+window.decideTimeOff = async function(id, status){
+  await sb.from('time_off_requests').update({ status, decided_by: currentStaff.id, decided_at: new Date().toISOString() }).eq('id', id);
+  await loadScheduleData();
+};
+
+window.openShiftModal = function(){
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Add Shift</h3>
+    <label class="field-label">Employee</label>
+    <select class="modal-select" id="shStaff">${state.staffList.filter(s=>s.active).map(s=>`<option value="${s.id}">${esc(s.name)} (${esc(s.role)})</option>`).join('')}</select>
+    <div class="formgrid">
+      <div><label class="field-label">Date</label><input type="date" class="modal-input" id="shDate" value="${todayISO()}"/></div>
+      <div><label class="field-label">Role for this shift (optional)</label><input type="text" class="modal-input" id="shRole" placeholder="Defaults to their normal role"/></div>
+    </div>
+    <div class="formgrid">
+      <div><label class="field-label">Start time</label><select class="modal-select" id="shStart">${timeOptionsHtml('17:00')}</select></div>
+      <div><label class="field-label">End time</label><select class="modal-select" id="shEnd">${timeOptionsHtml('23:00')}</select></div>
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:10px 0;"><input type="checkbox" id="shPublished"/> Publish immediately (otherwise saved as a draft only visible here)</label>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="saveShift()">Save</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.saveShift = async function(){
+  const staffId = document.getElementById('shStaff').value;
+  const date = document.getElementById('shDate').value;
+  const role = document.getElementById('shRole').value.trim();
+  const start = document.getElementById('shStart').value;
+  const end = document.getElementById('shEnd').value;
+  const published = document.getElementById('shPublished').checked;
+  const conflict = state.timeOffRequests.find(r => r.staff_id === staffId && r.status === 'approved' && date >= r.start_date && date <= r.end_date);
+  if (conflict){
+    const st = state.staffList.find(s=>s.id===staffId);
+    if (!confirm(`${st?.name||'This employee'} has approved time off covering ${date}${conflict.reason?' ('+conflict.reason+')':''}. Schedule them anyway?`)) return;
+  }
+  const { error } = await sb.from('schedule_shifts').insert({ staff_id: staffId, shift_date: date, scheduled_start: start, scheduled_end: end, shift_role: role || null, published, created_by: currentStaff.id });
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await loadScheduleData();
+};
+window.publishShift = async function(id){
+  await sb.from('schedule_shifts').update({ published: true }).eq('id', id);
+  await loadScheduleData();
+};
+window.deleteShift = async function(id){
+  if (!confirm('Delete this shift?')) return;
+  await sb.from('schedule_shifts').delete().eq('id', id);
+  await loadScheduleData();
+};
+
+window.correctMissingPunch = async function(shiftId){
+  const shift = state.scheduleShifts.find(s => s.id === shiftId);
+  if (!shift) return;
+  const entry = state.timeClockEntries.find(e => e.shift_id === shiftId);
+  const correctedTime = prompt(`Corrected clock-out time (HH:MM, 24-hour) for ${fmtDateHuman(shift.shift_date)}:`, shift.scheduled_end.slice(0,5));
+  if (!correctedTime) return;
+  const note = prompt('Note explaining this correction (required):');
+  if (!note || !note.trim()){ alert('A note is required for any timecard correction.'); return; }
+  const clockOutIso = new Date(shift.shift_date+'T'+correctedTime+':00').toISOString();
+  if (entry){
+    await sb.from('time_clock_entries').update({ clock_out_at: clockOutIso, status:'manager_corrected', corrected_by: currentStaff.id, correction_note: note.trim() }).eq('id', entry.id);
+  } else {
+    const clockInTime = prompt('No clock-in was recorded either — corrected clock-in time (HH:MM):', shift.scheduled_start.slice(0,5));
+    if (!clockInTime) return;
+    await sb.from('time_clock_entries').insert({
+      staff_id: shift.staff_id, shift_id: shift.id,
+      clock_in_at: new Date(shift.shift_date+'T'+clockInTime+':00').toISOString(),
+      clock_out_at: clockOutIso, status:'manager_corrected', corrected_by: currentStaff.id, correction_note: note.trim(),
+    });
+  }
+  await loadScheduleData();
+};
+
+// ============================================================================
 // SETTINGS TAB (tables, service periods, staff)
 // ============================================================================
+// ============================================================================
+// MENU, INGREDIENTS & TICKET DESTINATIONS (Phase 4)
+// ============================================================================
+function ticketDestName(id){ return state.ticketDestinations.find(t=>t.id===id)?.name || '—'; }
+function menuCategoryName(id){ return state.menuCategories.find(c=>c.id===id)?.name || '—'; }
+function itemCost(itemId){
+  return state.itemIngredients.filter(ii=>ii.item_id===itemId).reduce((sum,ii) => {
+    const ing = state.ingredients.find(x=>x.id===ii.ingredient_id);
+    return sum + (ing ? ing.cost_per_unit * ii.quantity : 0);
+  }, 0);
+}
+async function reloadMenuData(){
+  const [tdRes, icRes, ingRes, mcRes, miRes, iiRes, mgRes, moRes, mimgRes] = await Promise.all([
+    sb.from('ticket_destinations').select('*').order('sort_order'),
+    sb.from('ingredient_categories').select('*').order('sort_order'),
+    sb.from('ingredients').select('*').order('name'),
+    sb.from('menu_categories').select('*').order('sort_order'),
+    sb.from('menu_items').select('*').order('sort_order'),
+    sb.from('item_ingredients').select('*'),
+    sb.from('modifier_groups').select('*').order('name'),
+    sb.from('modifier_options').select('*').order('sort_order'),
+    sb.from('menu_item_modifier_groups').select('*'),
+  ]);
+  state.ticketDestinations = tdRes.data || [];
+  state.ingredientCategories = icRes.data || [];
+  state.ingredients = ingRes.data || [];
+  state.menuCategories = mcRes.data || [];
+  state.menuItems = miRes.data || [];
+  state.itemIngredients = iiRes.data || [];
+  state.modifierGroups = mgRes.data || [];
+  state.modifierOptions = moRes.data || [];
+  state.menuItemModifierGroups = mimgRes.data || [];
+  render();
+}
+
+function renderMenuSection(){
+  const canCost = can('manage_ingredients_costing');
+  return `
+  <div class="section-heading">Ticket Destinations</div>
+  <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">Where a printed ticket for an item goes — Kitchen, Main Bar, Secret Bar, or any station you add. Assign one to each menu item below.</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+      ${state.ticketDestinations.map(td => `<span class="area-chip" style="cursor:default">${esc(td.name)} <span class="linkBtn" style="cursor:pointer;color:var(--danger);margin-left:4px" onclick="deleteTicketDestination('${td.id}')">×</span></span>`).join('') || '<span class="panel-sub" style="margin:0">None yet.</span>'}
+    </div>
+    <div style="display:flex;gap:8px">
+      <input type="text" class="modal-input" style="margin:0" id="newTicketDest" placeholder="e.g. Waiter Station"/>
+      <button class="btn btn-secondary btn-sm" onclick="addTicketDestination()">Add</button>
+    </div>
+  </div>
+
+  <div class="section-heading">Menu Categories</div>
+  <div class="card">
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+      ${state.menuCategories.map(c => `<span class="area-chip" style="cursor:default">${esc(c.name)} <span class="linkBtn" style="cursor:pointer;color:var(--danger);margin-left:4px" onclick="deleteMenuCategory('${c.id}')">×</span></span>`).join('') || '<span class="panel-sub" style="margin:0">None yet.</span>'}
+    </div>
+    <div style="display:flex;gap:8px">
+      <input type="text" class="modal-input" style="margin:0" id="newMenuCategory" placeholder="e.g. Small Plates"/>
+      <button class="btn btn-secondary btn-sm" onclick="addMenuCategory()">Add</button>
+    </div>
+  </div>
+
+  <div class="section-heading">Menu Items</div>
+  <div class="card">
+    <table class="data-table">
+      <thead><tr><th>Item</th><th>Category</th><th>Price</th>${canCost?'<th>Cost</th><th>Margin</th>':''}<th>Goes To</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        ${state.menuItems.map(it => {
+          const cost = itemCost(it.id);
+          const margin = it.price - cost;
+          return `<tr>
+            <td>${esc(it.name)}</td>
+            <td>${esc(menuCategoryName(it.category_id))}</td>
+            <td>$${Number(it.price).toFixed(2)}</td>
+            ${canCost?`<td>$${cost.toFixed(2)}</td><td>$${margin.toFixed(2)}</td>`:''}
+            <td>${esc(ticketDestName(it.ticket_destination_id))}</td>
+            <td>${it.active?'<span class="badge badge-confirmed">active</span>':'<span class="badge badge-pending">hidden</span>'}</td>
+            <td><button class="btn btn-sm btn-secondary" onclick="openMenuItemModal('${it.id}')">Edit</button></td>
+          </tr>`;
+        }).join('') || `<tr><td colspan="${canCost?7:5}"><span class="panel-sub">No menu items yet.</span></td></tr>`}
+      </tbody>
+    </table>
+    <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openMenuItemModal()">+ Add Menu Item</button></div>
+  </div>
+
+  <div class="section-heading">Modifier Groups</div>
+  <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">Reusable option sets like "Temperature" or "Add-ons" — attach any group to a menu item from that item's edit screen.</div>
+    ${state.modifierGroups.map(g => {
+      const opts = state.modifierOptions.filter(o=>o.group_id===g.id);
+      return `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0">
+        <span><b>${esc(g.name)}</b> (${g.required?'required, ':''}${g.min_select}-${g.max_select} select) — ${opts.map(o=>esc(o.name)+(o.price_delta?` (+$${Number(o.price_delta).toFixed(2)})`:'')).join(', ') || 'no options yet'}</span>
+        <span style="display:flex;gap:6px"><button class="btn btn-sm btn-secondary" onclick="openModifierGroupModal('${g.id}')">Edit</button><button class="btn btn-sm btn-danger" onclick="deleteModifierGroup('${g.id}')">Delete</button></span>
+      </div>`;
+    }).join('') || '<div class="panel-sub" style="margin:0 0 10px">No modifier groups yet.</div>'}
+    <div class="modal-actions" style="padding-top:10px;justify-content:flex-start"><button class="btn btn-secondary btn-sm" onclick="openModifierGroupModal()">+ New Modifier Group</button></div>
+  </div>`;
+}
+
+window.addTicketDestination = async function(){
+  const input = document.getElementById('newTicketDest');
+  const name = input.value.trim();
+  if (!name) return;
+  const { error } = await sb.from('ticket_destinations').insert({ name, sort_order: state.ticketDestinations.length });
+  if (error){ alert('Error: '+error.message); return; }
+  input.value = '';
+  await reloadMenuData();
+};
+window.deleteTicketDestination = async function(id){
+  if (!confirm('Delete this ticket destination? Any item using it will show "—" until reassigned.')) return;
+  await sb.from('ticket_destinations').delete().eq('id', id);
+  await reloadMenuData();
+};
+window.addMenuCategory = async function(){
+  const input = document.getElementById('newMenuCategory');
+  const name = input.value.trim();
+  if (!name) return;
+  const { error } = await sb.from('menu_categories').insert({ name, sort_order: state.menuCategories.length });
+  if (error){ alert('Error: '+error.message); return; }
+  input.value = '';
+  await reloadMenuData();
+};
+window.deleteMenuCategory = async function(id){
+  if (!confirm('Delete this category? Items in it will show "—" until reassigned.')) return;
+  await sb.from('menu_categories').delete().eq('id', id);
+  await reloadMenuData();
+};
+
+function renderRecipeRow(ingredientId, qty){
+  return `<div style="display:flex;gap:6px;align-items:center" class="miRecipeRow">
+    <select class="modal-select miRecipeIngredient" style="margin:0;flex:1">${state.ingredients.map(ing=>`<option value="${ing.id}" ${ing.id===ingredientId?'selected':''}>${esc(ing.name)} (${esc(ing.unit)})</option>`).join('')}</select>
+    <input type="number" min="0" step="0.01" class="modal-input miRecipeQty" style="margin:0;width:80px" value="${qty??0}"/>
+    <button type="button" class="btn btn-sm btn-danger" onclick="this.closest('.miRecipeRow').remove()">×</button>
+  </div>`;
+}
+window.addRecipeRow = function(){
+  if (!state.ingredients.length){ alert('Add ingredients first (Ingredients &amp; Costing section).'); return; }
+  document.getElementById('miRecipeRows').insertAdjacentHTML('beforeend', renderRecipeRow(state.ingredients[0].id, 0));
+};
+window.openMenuItemModal = function(itemId){
+  const it = itemId ? state.menuItems.find(x=>x.id===itemId) : null;
+  const canCost = can('manage_ingredients_costing');
+  const recipe = it ? state.itemIngredients.filter(ii=>ii.item_id===it.id) : [];
+  const myGroupIds = it ? new Set(state.menuItemModifierGroups.filter(x=>x.item_id===it.id).map(x=>x.group_id)) : new Set();
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>${it?'Edit':'New'} Menu Item</h3>
+    <label class="field-label">Name</label>
+    <input type="text" class="modal-input" id="miName" value="${it?esc(it.name):''}"/>
+    <div class="formgrid">
+      <div><label class="field-label">Category</label><select class="modal-select" id="miCategory"><option value="">—</option>${state.menuCategories.map(c=>`<option value="${c.id}" ${it?.category_id===c.id?'selected':''}>${esc(c.name)}</option>`).join('')}</select></div>
+      <div><label class="field-label">Ticket Destination</label><select class="modal-select" id="miDest"><option value="">—</option>${state.ticketDestinations.map(td=>`<option value="${td.id}" ${it?.ticket_destination_id===td.id?'selected':''}>${esc(td.name)}</option>`).join('')}</select></div>
+    </div>
+    <div class="formgrid">
+      <div><label class="field-label">Price ($)</label><input type="number" min="0" step="0.01" class="modal-input" id="miPrice" value="${it?it.price:'0'}"/></div>
+      <div><label class="field-label" style="display:flex;align-items:center;gap:6px;margin-top:22px"><input type="checkbox" id="miActive" ${it?(it.active?'checked':''):'checked'}/> Active / visible</label></div>
+    </div>
+    <label class="field-label">Description (optional)</label>
+    <input type="text" class="modal-input" id="miDesc" value="${it?esc(it.description||''):''}"/>
+    ${canCost ? `
+    <label class="field-label">Recipe / Ingredient Costing</label>
+    <div id="miRecipeRows" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px">
+      ${recipe.map(r => renderRecipeRow(r.ingredient_id, r.quantity)).join('')}
+    </div>
+    <button type="button" class="btn btn-secondary btn-sm" onclick="addRecipeRow()">+ Add Ingredient</button>
+    ` : ''}
+    <label class="field-label" style="margin-top:10px">Modifier Groups</label>
+    <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:10px">
+      ${state.modifierGroups.map(g => `<label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" class="miModGroupChk" value="${g.id}" ${myGroupIds.has(g.id)?'checked':''}/> ${esc(g.name)}</label>`).join('') || '<span class="panel-sub" style="margin:0">No modifier groups defined yet.</span>'}
+    </div>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      ${it ? `<button class="modal-btn modal-btn-danger" onclick="deleteMenuItem('${it.id}')">Delete</button>` : ''}
+      <button class="modal-btn modal-btn-primary" onclick="saveMenuItem(${it?`'${it.id}'`:'null'})">Save</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.saveMenuItem = async function(itemId){
+  const name = document.getElementById('miName').value.trim();
+  if (!name){ alert('Enter a name.'); return; }
+  const category_id = document.getElementById('miCategory').value || null;
+  const ticket_destination_id = document.getElementById('miDest').value || null;
+  const price = parseFloat(document.getElementById('miPrice').value) || 0;
+  const active = document.getElementById('miActive').checked;
+  const description = document.getElementById('miDesc').value.trim() || null;
+  let id = itemId;
+  if (id){
+    const { error } = await sb.from('menu_items').update({ name, category_id, ticket_destination_id, price, active, description }).eq('id', id);
+    if (error){ alert('Error: '+error.message); return; }
+  } else {
+    const { data, error } = await sb.from('menu_items').insert({ name, category_id, ticket_destination_id, price, active, description, sort_order: state.menuItems.length }).select().single();
+    if (error){ alert('Error: '+error.message); return; }
+    id = data.id;
+  }
+  if (can('manage_ingredients_costing')){
+    await sb.from('item_ingredients').delete().eq('item_id', id);
+    const rows = Array.from(document.querySelectorAll('#miRecipeRows .miRecipeRow')).map(row => ({
+      item_id: id,
+      ingredient_id: row.querySelector('.miRecipeIngredient').value,
+      quantity: parseFloat(row.querySelector('.miRecipeQty').value) || 0,
+    })).filter(r => r.ingredient_id);
+    if (rows.length) await sb.from('item_ingredients').insert(rows);
+  }
+  await sb.from('menu_item_modifier_groups').delete().eq('item_id', id);
+  const groupIds = Array.from(document.querySelectorAll('.miModGroupChk:checked')).map(el=>el.value);
+  if (groupIds.length) await sb.from('menu_item_modifier_groups').insert(groupIds.map(gid => ({ item_id: id, group_id: gid })));
+  closeModal('formModal');
+  await reloadMenuData();
+};
+window.deleteMenuItem = async function(id){
+  if (!confirm('Delete this menu item?')) return;
+  await sb.from('menu_items').delete().eq('id', id);
+  closeModal('formModal');
+  await reloadMenuData();
+};
+
+window.openModifierGroupModal = function(groupId){
+  const g = groupId ? state.modifierGroups.find(x=>x.id===groupId) : null;
+  const opts = g ? state.modifierOptions.filter(o=>o.group_id===g.id) : [];
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>${g?'Edit':'New'} Modifier Group</h3>
+    <label class="field-label">Group name</label>
+    <input type="text" class="modal-input" id="mgName" value="${g?esc(g.name):''}" placeholder="e.g. Temperature, Add-ons"/>
+    <div class="formgrid">
+      <div><label class="field-label">Min select</label><input type="number" min="0" class="modal-input" id="mgMin" value="${g?g.min_select:0}"/></div>
+      <div><label class="field-label">Max select</label><input type="number" min="1" class="modal-input" id="mgMax" value="${g?g.max_select:1}"/></div>
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:8px 0"><input type="checkbox" id="mgRequired" ${g?.required?'checked':''}/> Required</label>
+    <label class="field-label">Options (one per line — "Name" or "Name, +1.50" for a price add-on)</label>
+    <textarea class="modal-input" id="mgOptions" rows="4" style="resize:vertical">${opts.map(o=>o.price_delta?`${o.name}, +${o.price_delta}`:o.name).join('\n')}</textarea>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="saveModifierGroup(${g?`'${g.id}'`:'null'})">Save</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.saveModifierGroup = async function(groupId){
+  const name = document.getElementById('mgName').value.trim();
+  if (!name){ alert('Enter a group name.'); return; }
+  const min_select = parseInt(document.getElementById('mgMin').value) || 0;
+  const max_select = parseInt(document.getElementById('mgMax').value) || 1;
+  const required = document.getElementById('mgRequired').checked;
+  const lines = document.getElementById('mgOptions').value.split('\n').map(l=>l.trim()).filter(Boolean);
+  let id = groupId;
+  if (id){
+    const { error } = await sb.from('modifier_groups').update({ name, min_select, max_select, required }).eq('id', id);
+    if (error){ alert('Error: '+error.message); return; }
+    await sb.from('modifier_options').delete().eq('group_id', id);
+  } else {
+    const { data, error } = await sb.from('modifier_groups').insert({ name, min_select, max_select, required }).select().single();
+    if (error){ alert('Error: '+error.message); return; }
+    id = data.id;
+  }
+  const optionRows = lines.map((line, i) => {
+    const [namePart, priceStr] = line.split(',').map(s=>s?.trim());
+    const price_delta = priceStr ? parseFloat(priceStr.replace('+','')) || 0 : 0;
+    return { group_id: id, name: namePart, price_delta, sort_order: i };
+  });
+  if (optionRows.length){
+    const { error: optErr } = await sb.from('modifier_options').insert(optionRows);
+    if (optErr){ alert('Group saved, but options failed: '+optErr.message); }
+  }
+  closeModal('formModal');
+  await reloadMenuData();
+};
+window.deleteModifierGroup = async function(id){
+  if (!confirm('Delete this modifier group and its options?')) return;
+  await sb.from('modifier_options').delete().eq('group_id', id);
+  await sb.from('menu_item_modifier_groups').delete().eq('group_id', id);
+  const { error } = await sb.from('modifier_groups').delete().eq('id', id);
+  if (error){ alert('Error: '+error.message); return; }
+  await reloadMenuData();
+};
+
+function renderIngredientsSection(){
+  return `
+  <div class="section-heading">Ingredient Categories</div>
+  <div class="card">
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+      ${state.ingredientCategories.map(c => `<span class="area-chip" style="cursor:default">${esc(c.name)} <span class="linkBtn" style="cursor:pointer;color:var(--danger);margin-left:4px" onclick="deleteIngredientCategory('${c.id}')">×</span></span>`).join('') || '<span class="panel-sub" style="margin:0">None yet.</span>'}
+    </div>
+    <div style="display:flex;gap:8px">
+      <input type="text" class="modal-input" style="margin:0" id="newIngCategory" placeholder="e.g. Spirits"/>
+      <button class="btn btn-secondary btn-sm" onclick="addIngredientCategory()">Add</button>
+    </div>
+  </div>
+
+  <div class="section-heading">Ingredients &amp; Costing</div>
+  <div class="card">
+    <table class="data-table">
+      <thead><tr><th>Ingredient</th><th>Category</th><th>Unit</th><th>Cost / Unit</th><th></th></tr></thead>
+      <tbody>
+        ${state.ingredients.map(ing => `<tr>
+          <td>${esc(ing.name)}</td>
+          <td>${esc(state.ingredientCategories.find(c=>c.id===ing.category_id)?.name || '—')}</td>
+          <td>${esc(ing.unit)}</td>
+          <td>$<input type="number" min="0" step="0.01" class="modal-input" style="margin:0;width:80px;padding:4px 8px;display:inline-block" value="${ing.cost_per_unit}" onchange="setIngredientCost('${ing.id}', this.value)"/></td>
+          <td><button class="btn btn-sm btn-danger" onclick="deleteIngredient('${ing.id}')">Delete</button></td>
+        </tr>`).join('') || `<tr><td colspan="5"><span class="panel-sub">No ingredients yet.</span></td></tr>`}
+      </tbody>
+    </table>
+    <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openIngredientModal()">+ Add Ingredient</button></div>
+  </div>`;
+}
+window.addIngredientCategory = async function(){
+  const input = document.getElementById('newIngCategory');
+  const name = input.value.trim();
+  if (!name) return;
+  const { error } = await sb.from('ingredient_categories').insert({ name, sort_order: state.ingredientCategories.length });
+  if (error){ alert('Error: '+error.message); return; }
+  input.value = '';
+  await reloadMenuData();
+};
+window.deleteIngredientCategory = async function(id){
+  if (!confirm('Delete this category?')) return;
+  await sb.from('ingredient_categories').delete().eq('id', id);
+  await reloadMenuData();
+};
+window.openIngredientModal = function(){
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Add Ingredient</h3>
+    <label class="field-label">Name</label>
+    <input type="text" class="modal-input" id="ingName"/>
+    <div class="formgrid">
+      <div><label class="field-label">Category</label><select class="modal-select" id="ingCategory"><option value="">—</option>${state.ingredientCategories.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></div>
+      <div><label class="field-label">Unit</label><input type="text" class="modal-input" id="ingUnit" value="oz" placeholder="oz, lb, each…"/></div>
+    </div>
+    <label class="field-label">Cost per unit ($)</label>
+    <input type="number" min="0" step="0.01" class="modal-input" id="ingCost" value="0"/>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="saveIngredient()">Save</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.saveIngredient = async function(){
+  const name = document.getElementById('ingName').value.trim();
+  if (!name){ alert('Enter a name.'); return; }
+  const category_id = document.getElementById('ingCategory').value || null;
+  const unit = document.getElementById('ingUnit').value.trim() || 'oz';
+  const cost_per_unit = parseFloat(document.getElementById('ingCost').value) || 0;
+  const { error } = await sb.from('ingredients').insert({ name, category_id, unit, cost_per_unit });
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await reloadMenuData();
+};
+window.setIngredientCost = async function(id, value){
+  const cost_per_unit = parseFloat(value) || 0;
+  await sb.from('ingredients').update({ cost_per_unit }).eq('id', id);
+  await reloadMenuData();
+};
+window.deleteIngredient = async function(id){
+  if (!confirm('Delete this ingredient? It will be removed from any recipes using it.')) return;
+  await sb.from('ingredients').delete().eq('id', id);
+  await reloadMenuData();
+};
+
+// ============================================================================
+// INVENTORY, VENDORS & PURCHASE ORDERS (Phase 10)
+// Stock deducts automatically when an item is marked delivered (server-side
+// trigger, using the recipe from Phase 4) and credits automatically when a
+// purchase order line's received quantity is recorded — see
+// deplete_inventory_on_delivery() / receive_purchase_order_item() in the DB.
+// ============================================================================
+async function reloadInventoryData(){
+  const [{ data: vendors }, { data: pos }, { data: poItems }] = await Promise.all([
+    sb.from('vendors').select('*').order('name'),
+    sb.from('purchase_orders').select('*').order('created_at', { ascending: false }),
+    sb.from('purchase_order_items').select('*'),
+  ]);
+  state.vendors = vendors || [];
+  state.purchaseOrders = pos || [];
+  state.purchaseOrderItems = poItems || [];
+  render();
+}
+function renderInventorySection(){
+  const lowStock = state.ingredients.filter(ing => ing.reorder_threshold != null && ing.current_stock <= ing.reorder_threshold);
+  return `
+  <div class="section-heading">Inventory Levels</div>
+  <div class="card">
+    ${lowStock.length ? `<div class="panel-sub" style="margin-bottom:10px;color:#dc2626">⚠ Low stock: ${lowStock.map(i=>esc(i.name)).join(', ')}</div>` : ''}
+    <table class="data-table">
+      <thead><tr><th>Ingredient</th><th>On Hand</th><th>Reorder At</th></tr></thead>
+      <tbody>
+        ${state.ingredients.map(ing => `<tr>
+          <td>${esc(ing.name)} <span class="panel-sub" style="margin:0">(${esc(ing.unit)})</span></td>
+          <td><input type="number" step="0.01" class="modal-input" style="margin:0;width:90px;padding:4px 8px" value="${ing.current_stock}" onchange="setIngredientStock('${ing.id}', this.value)"/></td>
+          <td><input type="number" step="0.01" min="0" class="modal-input" style="margin:0;width:90px;padding:4px 8px" placeholder="none" value="${ing.reorder_threshold ?? ''}" onchange="setIngredientReorderThreshold('${ing.id}', this.value)"/></td>
+        </tr>`).join('') || `<tr><td colspan="3"><span class="panel-sub">Add ingredients in the Ingredients &amp; Costing section first.</span></td></tr>`}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="section-heading">Vendors</div>
+  <div class="card">
+    ${state.vendors.map(v => `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0">
+      <span><b>${esc(v.name)}</b>${v.contact_name?' — '+esc(v.contact_name):''}${v.phone?' · '+esc(v.phone):''}</span>
+      <span style="display:flex;gap:6px"><button class="btn btn-sm btn-secondary" onclick="openVendorModal('${v.id}')">Edit</button><button class="btn btn-sm btn-danger" onclick="deleteVendor('${v.id}')">Delete</button></span>
+    </div>`).join('') || '<div class="panel-sub" style="margin:0 0 10px">No vendors yet.</div>'}
+    <div class="modal-actions" style="padding-top:10px;justify-content:flex-start"><button class="btn btn-secondary btn-sm" onclick="openVendorModal()">+ New Vendor</button></div>
+  </div>
+
+  <div class="section-heading">Purchase Orders</div>
+  <div class="card">
+    <table class="data-table">
+      <thead><tr><th>Vendor</th><th>Status</th><th>Items</th><th>Total Cost</th><th>Created</th><th></th></tr></thead>
+      <tbody>
+        ${state.purchaseOrders.map(po => {
+          const items = state.purchaseOrderItems.filter(i=>i.po_id===po.id);
+          const total = items.reduce((s,i)=>s+i.quantity_ordered*i.unit_cost,0);
+          const vendor = state.vendors.find(v=>v.id===po.vendor_id);
+          return `<tr>
+            <td>${esc(vendor?.name||'—')}</td>
+            <td><span class="badge badge-${po.status==='received'?'confirmed':po.status==='cancelled'?'cancelled':'pending'}">${esc(po.status)}</span></td>
+            <td>${items.length}</td>
+            <td>$${total.toFixed(2)}</td>
+            <td>${new Date(po.created_at).toLocaleDateString()}</td>
+            <td><button class="btn btn-sm btn-secondary" onclick="openPurchaseOrderModal('${po.id}')">Open</button></td>
+          </tr>`;
+        }).join('') || `<tr><td colspan="6"><span class="panel-sub">No purchase orders yet.</span></td></tr>`}
+      </tbody>
+    </table>
+    <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openPurchaseOrderModal()">+ New Purchase Order</button></div>
+  </div>`;
+}
+window.setIngredientStock = async function(id, value){
+  const { error } = await sb.from('ingredients').update({ current_stock: parseFloat(value)||0 }).eq('id', id);
+  if (error){ alert('Error: '+error.message); return; }
+  await reloadMenuData();
+};
+window.setIngredientReorderThreshold = async function(id, value){
+  const reorder_threshold = value === '' ? null : parseFloat(value);
+  const { error } = await sb.from('ingredients').update({ reorder_threshold }).eq('id', id);
+  if (error){ alert('Error: '+error.message); return; }
+  await reloadMenuData();
+};
+window.openVendorModal = function(vendorId){
+  const v = vendorId ? state.vendors.find(x=>x.id===vendorId) : null;
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>${v?'Edit':'New'} Vendor</h3>
+    <label class="field-label">Name</label>
+    <input type="text" class="modal-input" id="vName" value="${v?esc(v.name):''}"/>
+    <div class="formgrid">
+      <div><label class="field-label">Contact name</label><input type="text" class="modal-input" id="vContact" value="${v?esc(v.contact_name||''):''}"/></div>
+      <div><label class="field-label">Phone</label><input type="text" class="modal-input" id="vPhone" value="${v?esc(v.phone||''):''}"/></div>
+    </div>
+    <label class="field-label">Email</label>
+    <input type="text" class="modal-input" id="vEmail" value="${v?esc(v.email||''):''}"/>
+    <label class="field-label">Notes</label>
+    <input type="text" class="modal-input" id="vNotes" value="${v?esc(v.notes||''):''}"/>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="saveVendor(${v?`'${v.id}'`:'null'})">Save</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.saveVendor = async function(vendorId){
+  const name = document.getElementById('vName').value.trim();
+  if (!name){ alert('Enter a name.'); return; }
+  const payload = {
+    name,
+    contact_name: document.getElementById('vContact').value.trim() || null,
+    phone: document.getElementById('vPhone').value.trim() || null,
+    email: document.getElementById('vEmail').value.trim() || null,
+    notes: document.getElementById('vNotes').value.trim() || null,
+  };
+  const { error } = vendorId ? await sb.from('vendors').update(payload).eq('id', vendorId) : await sb.from('vendors').insert(payload);
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await reloadInventoryData();
+};
+window.deleteVendor = async function(id){
+  if (!confirm('Delete this vendor?')) return;
+  await sb.from('vendors').delete().eq('id', id);
+  await reloadInventoryData();
+};
+function renderPoItemRow(item, status){
+  const editable = !status || status === 'draft';
+  const receiving = status === 'ordered';
+  return `<div class="poItemRow" style="display:flex;gap:6px;align-items:center" data-id="${item?.id||''}">
+    <select class="modal-select poItemIngredient" style="margin:0;flex:1" ${editable?'':'disabled'}>${state.ingredients.map(ing=>`<option value="${ing.id}" ${item?.ingredient_id===ing.id?'selected':''}>${esc(ing.name)} (${esc(ing.unit)})</option>`).join('')}</select>
+    <input type="number" min="0" step="0.01" class="modal-input poItemQty" style="margin:0;width:80px" placeholder="Qty" value="${item?item.quantity_ordered:0}" ${editable?'':'disabled'}/>
+    <input type="number" min="0" step="0.01" class="modal-input poItemCost" style="margin:0;width:90px" placeholder="Unit $" value="${item?item.unit_cost:0}" ${editable?'':'disabled'}/>
+    ${receiving ? `<input type="number" min="0" step="0.01" class="modal-input poItemReceived" style="margin:0;width:80px" placeholder="Received" value="${item?item.quantity_received:0}"/>` : ''}
+    ${editable ? `<button type="button" class="btn btn-sm btn-danger" onclick="this.closest('.poItemRow').remove()">×</button>` : ''}
+  </div>`;
+}
+window.addPoItemRow = function(){
+  if (!state.ingredients.length){ alert('Add ingredients first (Ingredients &amp; Costing section).'); return; }
+  document.getElementById('poItemRows').insertAdjacentHTML('beforeend', renderPoItemRow(null, 'draft'));
+};
+window.openPurchaseOrderModal = function(poId){
+  const po = poId ? state.purchaseOrders.find(x=>x.id===poId) : null;
+  const items = po ? state.purchaseOrderItems.filter(i=>i.po_id===po.id) : [];
+  const editable = !po || po.status === 'draft';
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>${po?'Purchase Order':'New Purchase Order'}</h3>
+    <label class="field-label">Vendor</label>
+    <select class="modal-select" id="poVendor" ${editable?'':'disabled'}>
+      <option value="">—</option>
+      ${state.vendors.map(v=>`<option value="${v.id}" ${po?.vendor_id===v.id?'selected':''}>${esc(v.name)}</option>`).join('')}
+    </select>
+    <label class="field-label">Notes</label>
+    <input type="text" class="modal-input" id="poNotes" value="${po?esc(po.notes||''):''}" ${editable?'':'disabled'}/>
+    <label class="field-label" style="margin-top:8px">Line Items</label>
+    <div id="poItemRows" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px">
+      ${items.map(i => renderPoItemRow(i, po?.status)).join('')}
+    </div>
+    ${editable ? `<button type="button" class="btn btn-secondary btn-sm" onclick="addPoItemRow()">+ Add Line</button>` : ''}
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Close</button>
+      ${editable ? `<button class="modal-btn modal-btn-primary" onclick="savePurchaseOrder(${po?`'${po.id}'`:'null'})">Save Draft</button>` : ''}
+      ${po && po.status==='draft' ? `<button class="modal-btn modal-btn-primary" onclick="markPoOrdered('${po.id}')">Mark Ordered</button>` : ''}
+      ${po && po.status==='ordered' ? `<button class="modal-btn modal-btn-primary" onclick="receivePurchaseOrder('${po.id}')">Save Received Quantities</button>` : ''}
+      ${po && (po.status==='draft'||po.status==='ordered') ? `<button class="modal-btn modal-btn-danger" onclick="cancelPurchaseOrder('${po.id}')">Cancel PO</button>` : ''}
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.savePurchaseOrder = async function(poId){
+  const vendor_id = document.getElementById('poVendor').value || null;
+  const notes = document.getElementById('poNotes').value.trim() || null;
+  let id = poId;
+  if (id){
+    const { error } = await sb.from('purchase_orders').update({ vendor_id, notes }).eq('id', id);
+    if (error){ alert('Error: '+error.message); return; }
+    await sb.from('purchase_order_items').delete().eq('po_id', id);
+  } else {
+    const { data, error } = await sb.from('purchase_orders').insert({ vendor_id, notes, created_by: currentStaff.id }).select().single();
+    if (error){ alert('Error: '+error.message); return; }
+    id = data.id;
+  }
+  const rows = Array.from(document.querySelectorAll('#poItemRows .poItemRow')).map(row => ({
+    po_id: id,
+    ingredient_id: row.querySelector('.poItemIngredient').value,
+    quantity_ordered: parseFloat(row.querySelector('.poItemQty').value) || 0,
+    unit_cost: parseFloat(row.querySelector('.poItemCost').value) || 0,
+  })).filter(r => r.ingredient_id);
+  if (rows.length){
+    const { error: itemErr } = await sb.from('purchase_order_items').insert(rows);
+    if (itemErr){ alert('PO saved, but line items failed: '+itemErr.message); }
+  }
+  closeModal('formModal');
+  await reloadInventoryData();
+};
+window.markPoOrdered = async function(poId){
+  const { error } = await sb.from('purchase_orders').update({ status: 'ordered', ordered_at: new Date().toISOString() }).eq('id', poId);
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await reloadInventoryData();
+};
+window.receivePurchaseOrder = async function(poId){
+  const rows = Array.from(document.querySelectorAll('#poItemRows .poItemRow'));
+  for (const row of rows){
+    const id = row.dataset.id;
+    if (!id) continue;
+    const received = parseFloat(row.querySelector('.poItemReceived').value) || 0;
+    await sb.from('purchase_order_items').update({ quantity_received: received }).eq('id', id);
+  }
+  const { error } = await sb.from('purchase_orders').update({ status: 'received', received_at: new Date().toISOString() }).eq('id', poId);
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await reloadMenuData(); // ingredient stock changed via trigger — refresh costing/ingredient views too
+  await reloadInventoryData();
+};
+window.cancelPurchaseOrder = async function(poId){
+  if (!confirm('Cancel this purchase order?')) return;
+  const { error } = await sb.from('purchase_orders').update({ status: 'cancelled' }).eq('id', poId);
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await reloadInventoryData();
+};
+
 function renderSettingsTab(){
   const isAdmin = currentStaff.role === 'admin';
+  const isStaffManager = isAdmin || can('manage_staff_permissions');
   return `
   <div class="panel-header"><h2 class="panel-title">Settings</h2></div>
 
-  ${isAdmin ? `
+  ${isStaffManager ? `
   <div class="section-heading">Testing: Override "Now"</div>
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">For testing off-hours (e.g. checking what a Friday 7pm dinner rush looks like at 3am): make the whole app believe it's a different date/time than your device clock. This affects Today's default date, the Floor Plan's live status view, the Timeline "now" line, waitlist wait counters, and every seated/completed/cancelled timestamp — all without touching any real reservation data. It ticks forward normally from whatever you set, and persists until you clear it, even across a page refresh — a purple banner stays up across the whole app the entire time it's active so it's never accidentally left on.</div>
@@ -2816,6 +4944,7 @@ function renderSettingsTab(){
     </div>
   </div>` : ''}
 
+  ${can('manage_reservations') ? `
   <div class="section-heading">Dining Tables &amp; Floor Plan</div>
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">${state.tables.filter(t=>!t.is_combo).length} tables across ${state.areas.length} area${state.areas.length===1?'':'s'}. Add, rename, resize, delete, and drag-position tables on your floor plan sketch from the <b>Floor Plan</b> tab.</div>
@@ -2835,8 +4964,9 @@ function renderSettingsTab(){
     </table>
     <div class="panel-sub" style="margin-top:8px">Each area's default duration pre-fills the Duration field on a new reservation once you pick a table there — the hostess can always type over it. The Pacing Cap limits how many total covers (guests) can be booked into any single 15-minute arrival window for that area. "Vault Seats Reserved for Members" holds that many seats back for active loyalty members until the release window before service — leave blank for areas with no loyalty carve-out (only the Speakeasy has one by default). All of these warn and ask for confirmation rather than blocking outright.</div>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="setTab('floorplan')">🗺️ Open Floor Plan Editor</button></div>
-  </div>
+  </div>` : ''}
 
+  ${can('manage_loyalty_program') ? `
   <div class="section-heading">Loyalty Program</div>
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">Membership tier terms. Changing a number here only affects future redemption counting and new enrollments — it does not retroactively change what a member has already used this period.</div>
@@ -2867,8 +4997,9 @@ function renderSettingsTab(){
       <input type="text" class="modal-input" style="margin:0" id="newHolidayLabel" placeholder="Label (e.g. New Year's Eve)"/>
       <button class="btn btn-secondary btn-sm" onclick="addPriorityHoliday()">Add</button>
     </div>
-  </div>
+  </div>` : ''}
 
+  ${can('manage_reservations') ? `
   <div class="section-heading">Table Status Colors</div>
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">Define what each table color means on the Floor Plan. Tapping a table there cycles through these statuses in order: Available → Reserved → Assigned (Pre-Seated) → Seated → Needs Bussing → Blocked / Out of Service. "Assigned" is for a table held for a specific walk-in or reservation that hasn't sat down yet. The legend shown on the Floor Plan always reflects whatever colors you set here.</div>
@@ -2946,28 +5077,100 @@ function renderSettingsTab(){
       </tbody>
     </table>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openServicePeriodModal()">+ Add Service Period</button></div>
-  </div>
+  </div>` : ''}
 
-  ${isAdmin ? `
-  <div class="section-heading">Staff Access</div>
+  ${can('manage_menu') ? renderMenuSection() : ''}
+  ${can('manage_ingredients_costing') ? renderIngredientsSection() : ''}
+  ${can('manage_inventory') ? renderInventorySection() : ''}
+
+  ${isStaffManager ? `
+  <div class="section-heading">Staff Access &amp; Permissions</div>
   <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">Each role has a default set of permissions (see the plan doc for the full bundle). Click "Permissions" on any employee to grant or deny specific ones for just that person — e.g. a senior waiter who can apply discounts without becoming a manager.</div>
     <table class="data-table">
-      <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>PIN</th><th>Status</th><th></th></tr></thead>
       <tbody>
         ${state.staffList.map(s => `<tr>
           <td>${esc(s.name)}</td><td>${esc(s.email)}</td>
           <td>
             <select class="modal-select" style="margin:0;padding:4px 8px" onchange="setStaffRole('${s.id}', this.value)">
-              ${['host','server','manager','admin'].map(r => `<option value="${r}" ${r===s.role?'selected':''}>${r}</option>`).join('')}
+              ${['host','waiter','bartender','kitchen','expo','manager'].includes(s.role) ? '' : `<option value="${s.role}" selected>${esc(s.role)}</option>`}
+              ${['host','waiter','bartender','kitchen','expo','manager'].map(r => `<option value="${r}" ${r===s.role?'selected':''}>${r}</option>`).join('')}
             </select>
           </td>
+          <td>${s.pin_hash ? '<span class="badge badge-confirmed">set</span>' : '<span class="badge badge-pending">none</span>'} <button class="btn btn-sm btn-secondary" onclick="promptSetStaffPin('${s.id}')">${s.pin_hash?'Reset':'Set'}</button></td>
           <td>${s.active ? '<span class="badge badge-confirmed">active</span>' : '<span class="badge badge-pending">pending</span>'}</td>
-          <td><button class="btn btn-sm ${s.active?'btn-danger':'btn-success'}" onclick="toggleStaffActive('${s.id}', ${!s.active})">${s.active?'Deactivate':'Approve'}</button></td>
+          <td style="display:flex;gap:6px">
+            <button class="btn btn-sm btn-secondary" onclick="openStaffPermissionsModal('${s.id}')">Permissions</button>
+            <button class="btn btn-sm ${s.active?'btn-danger':'btn-success'}" onclick="toggleStaffActive('${s.id}', ${!s.active})">${s.active?'Deactivate':'Approve'}</button>
+          </td>
         </tr>`).join('')}
       </tbody>
     </table>
   </div>` : ''}`;
 }
+
+window.promptSetStaffPin = async function(staffId){
+  const pin = prompt('New 4-6 digit PIN for this employee (used for comp/discount/loyalty-payment approval and time-clock punches):');
+  if (!pin) return;
+  if (!/^[0-9]{4,6}$/.test(pin)){ alert('PIN must be 4-6 digits.'); return; }
+  const { error } = await sb.rpc('set_staff_pin', { target_staff_id: staffId, new_pin: pin });
+  if (error){ alert('Error: '+error.message); return; }
+  await reloadStaffList();
+  render();
+};
+
+async function reloadStaffList(){
+  const { data } = await sb.from('staff').select('*').order('created_at');
+  state.staffList = data || [];
+}
+
+// ---- Per-employee permission overrides ------------------------------------
+window.openStaffPermissionsModal = function(staffId){
+  const s = state.staffList.find(x => x.id === staffId);
+  if (!s) return;
+  const roleDefaults = new Set(state.rolePermissions.filter(rp => rp.role === s.role).map(rp => rp.permission_key));
+  const overrideMap = {};
+  state.staffOverrides.filter(o => o.staff_id === staffId).forEach(o => { overrideMap[o.permission_key] = o.granted; });
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>${esc(s.name)}'s Permissions</h3>
+    <p class="modal-user-email">Role: ${esc(s.role)} — showing that role's defaults, with any personal overrides for this employee.</p>
+    <table class="data-table">
+      <thead><tr><th>Permission</th><th>Setting</th></tr></thead>
+      <tbody>
+        ${state.permissions.map(p => {
+          const roleDefault = roleDefaults.has(p.key);
+          const overrideVal = overrideMap.hasOwnProperty(p.key) ? overrideMap[p.key] : null;
+          const mode = overrideVal === null ? 'default' : (overrideVal ? 'granted' : 'denied');
+          return `<tr>
+            <td>${esc(p.label)}<div class="panel-sub" style="margin:0">${esc(p.description||'')}</div></td>
+            <td>
+              <select class="modal-select" style="margin:0;padding:4px 8px" onchange="setPermissionOverride('${staffId}','${p.key}', this.value)">
+                <option value="default" ${mode==='default'?'selected':''}>Default for ${esc(s.role)} (${roleDefault?'Yes':'No'})</option>
+                <option value="granted" ${mode==='granted'?'selected':''}>Force Grant</option>
+                <option value="denied" ${mode==='denied'?'selected':''}>Force Deny</option>
+              </select>
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>
+    <div class="modal-actions"><button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Close</button></div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+
+window.setPermissionOverride = async function(staffId, permKey, mode){
+  if (mode === 'default'){
+    await sb.from('staff_permission_overrides').delete().eq('staff_id', staffId).eq('permission_key', permKey);
+  } else {
+    await sb.from('staff_permission_overrides').upsert({ staff_id: staffId, permission_key: permKey, granted: mode === 'granted', set_by: currentStaff.id, set_at: new Date().toISOString() });
+  }
+  const { data } = await sb.from('staff_permission_overrides').select('*');
+  state.staffOverrides = data || [];
+  if (staffId === currentStaff.id) computeMyPermissions();
+  openStaffPermissionsModal(staffId);
+};
 
 // Assignee dropdown covers two very different kinds of people: lightweight roster
 // entries (just a name, no login — most servers) and real staff login accounts

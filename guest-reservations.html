@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Reserve a Table — Legend</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🍽️</text></svg>">
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --border:#2a2e38; --text:#eef0f3; --sub:#9aa3b0;
+    --primary:#c9a227; --primary-text:#171a21; --danger:#dc2626; --success:#16a34a;
+    --radius:10px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;justify-content:center;padding:32px 16px}
+  .wrap{max-width:520px;width:100%}
+  .brand{text-align:center;margin-bottom:24px}
+  .brand .logo{font-size:40px}
+  .brand h1{margin:6px 0 2px;font-size:22px}
+  .brand p{margin:0;color:var(--sub);font-size:14px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
+  label{display:block;font-size:12px;color:var(--sub);margin:0 0 6px;text-transform:uppercase;letter-spacing:.03em}
+  input, select{width:100%;padding:11px 12px;border-radius:8px;border:1px solid var(--border);background:#0d0f14;color:var(--text);font-size:15px;margin-bottom:14px}
+  input:focus, select:focus{outline:none;border-color:var(--primary)}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .btn{display:inline-block;padding:12px 18px;border-radius:8px;border:none;background:var(--primary);color:var(--primary-text);font-weight:600;font-size:15px;cursor:pointer;width:100%}
+  .btn:disabled{opacity:.5;cursor:default}
+  .btn-secondary{background:transparent;border:1px solid var(--border);color:var(--text)}
+  .slots{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 4px}
+  .slot{padding:8px 12px;border-radius:20px;border:1px solid var(--border);background:#0d0f14;color:var(--text);font-size:13px;cursor:pointer}
+  .slot.selected{background:var(--primary);color:var(--primary-text);border-color:var(--primary)}
+  .sub{color:var(--sub);font-size:13px;margin:0 0 10px}
+  .error{color:var(--danger);font-size:13px;margin:8px 0 0}
+  .success-box{text-align:center;padding:30px 16px}
+  .success-box .icon{font-size:44px;margin-bottom:10px}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <div class="logo">🍽️</div>
+    <h1>Legend</h1>
+    <p>Request a Reservation</p>
+  </div>
+
+  <div class="card" id="formCard">
+    <div class="row">
+      <div>
+        <label>Date</label>
+        <input type="date" id="rDate"/>
+      </div>
+      <div>
+        <label>Party Size</label>
+        <input type="number" id="rParty" min="1" max="20" value="2"/>
+      </div>
+    </div>
+
+    <label>Available Times</label>
+    <div class="sub" id="slotsHint">Pick a date and party size to see open times.</div>
+    <div class="slots" id="slotsBox"></div>
+
+    <div id="detailsFields" class="hidden" style="margin-top:14px">
+      <label>Your Name</label>
+      <input type="text" id="rName" placeholder="First and last name"/>
+      <label>Phone</label>
+      <input type="tel" id="rPhone" placeholder="(555) 555-5555"/>
+      <label>Email (optional)</label>
+      <input type="email" id="rEmail" placeholder="you@example.com"/>
+      <label>Special Requests (optional)</label>
+      <input type="text" id="rNotes" placeholder="Allergies, occasion, seating preference…"/>
+      <button class="btn" id="submitBtn" onclick="submitRequest()">Request Reservation</button>
+      <div class="error hidden" id="formError"></div>
+    </div>
+  </div>
+
+  <div class="card success-box hidden" id="successCard">
+    <div class="icon">✅</div>
+    <h2 style="margin:0 0 6px">Request received!</h2>
+    <p class="sub" style="margin:0">We'll confirm your reservation shortly by phone or email. This is a request, not yet a confirmed booking.</p>
+    <button class="btn btn-secondary" style="margin-top:16px" onclick="location.reload()">Submit Another Request</button>
+  </div>
+
+  <p class="sub" style="text-align:center">Prefer to call? Reach out to the restaurant directly for same-day or large-party requests.</p>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script>
+  const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
+  const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
+  const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+  const dateEl = document.getElementById('rDate');
+  const partyEl = document.getElementById('rParty');
+  const slotsBox = document.getElementById('slotsBox');
+  const slotsHint = document.getElementById('slotsHint');
+  const detailsFields = document.getElementById('detailsFields');
+  let selectedSlot = null; // { area_name, slot_time }
+
+  const today = new Date();
+  dateEl.value = today.toISOString().slice(0,10);
+  dateEl.min = today.toISOString().slice(0,10);
+
+  function fmtTime(t){
+    const [h,m] = t.split(':').map(Number);
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    const h12 = h % 12 === 0 ? 12 : h % 12;
+    return `${h12}:${String(m).padStart(2,'0')} ${ampm}`;
+  }
+
+  async function loadSlots(){
+    selectedSlot = null;
+    detailsFields.classList.add('hidden');
+    const date = dateEl.value;
+    const party = parseInt(partyEl.value) || 0;
+    if (!date || party < 1){ slotsBox.innerHTML = ''; return; }
+    slotsHint.textContent = 'Checking availability…';
+    slotsBox.innerHTML = '';
+    const { data, error } = await sb.rpc('get_available_times', { p_date: date, p_party_size: party });
+    if (error){ slotsHint.textContent = 'Could not check availability — try again.'; return; }
+    if (!data || !data.length){ slotsHint.textContent = 'No openings found for that date/party size — try another date or call us.'; return; }
+    slotsHint.textContent = 'Tap a time to continue:';
+    slotsBox.innerHTML = data.map(s => `<span class="slot" data-area="${s.area_name}" data-time="${s.slot_time}">${fmtTime(s.slot_time)}${data.some(x=>x.slot_time===s.slot_time && x.area_name!==s.area_name) ? ' · '+s.area_name : ''}</span>`).join('');
+    slotsBox.querySelectorAll('.slot').forEach(el => el.onclick = () => {
+      slotsBox.querySelectorAll('.slot').forEach(x=>x.classList.remove('selected'));
+      el.classList.add('selected');
+      selectedSlot = { area_name: el.dataset.area, slot_time: el.dataset.time };
+      detailsFields.classList.remove('hidden');
+    });
+  }
+  dateEl.addEventListener('change', loadSlots);
+  partyEl.addEventListener('change', loadSlots);
+  loadSlots();
+
+  window.submitRequest = async function(){
+    const errEl = document.getElementById('formError');
+    errEl.classList.add('hidden');
+    if (!selectedSlot){ return; }
+    const name = document.getElementById('rName').value.trim();
+    const phone = document.getElementById('rPhone').value.trim();
+    const email = document.getElementById('rEmail').value.trim() || null;
+    const notes = document.getElementById('rNotes').value.trim() || null;
+    if (!name || !phone){
+      errEl.textContent = 'Name and phone are required.';
+      errEl.classList.remove('hidden');
+      return;
+    }
+    const btn = document.getElementById('submitBtn');
+    btn.disabled = true; btn.textContent = 'Submitting…';
+    const { error } = await sb.rpc('submit_public_reservation_request', {
+      p_name: name, p_phone: phone, p_email: email,
+      p_party_size: parseInt(partyEl.value) || 1,
+      p_date: dateEl.value, p_time: selectedSlot.slot_time,
+      p_area_name: selectedSlot.area_name, p_notes: notes,
+    });
+    if (error){
+      errEl.textContent = error.message || 'Something went wrong — please try again.';
+      errEl.classList.remove('hidden');
+      btn.disabled = false; btn.textContent = 'Request Reservation';
+      return;
+    }
+    document.getElementById('formCard').classList.add('hidden');
+    document.getElementById('successCard').classList.remove('hidden');
+  };
+</script>
+</body>
+</html>
