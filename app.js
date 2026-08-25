@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.67';
+const APP_VERSION = '1.68';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -4755,7 +4755,7 @@ function renderIngredientsSection(){
   <div class="section-heading">Ingredients &amp; Costing</div>
   <div class="card">
     <table class="data-table">
-      <thead><tr><th>Ingredient</th><th>Brand</th><th>Category</th><th>Unit</th><th>ABV</th><th>Cost / Unit</th><th></th></tr></thead>
+      <thead><tr><th>Ingredient</th><th>Brand</th><th>Category</th><th>Unit</th><th>ABV</th><th>Package</th><th>Cost / Unit</th><th></th></tr></thead>
       <tbody>
         ${state.ingredients.map(ing => `<tr>
           <td>${esc(ing.name)}</td>
@@ -4763,9 +4763,10 @@ function renderIngredientsSection(){
           <td>${esc(state.ingredientCategories.find(c=>c.id===ing.category_id)?.name || '—')}</td>
           <td>${esc(ing.unit)}</td>
           <td>${ing.abv_percent!=null ? ing.abv_percent+'%' : '—'}</td>
+          <td>${ing.package_label ? `${esc(ing.package_label)}${ing.package_cost!=null?' · $'+Number(ing.package_cost).toFixed(2):''}` : '<span class="panel-sub" style="margin:0">not set</span>'}</td>
           <td>$<input type="number" min="0" step="0.01" class="modal-input" style="margin:0;width:80px;padding:4px 8px;display:inline-block" value="${ing.cost_per_unit}" onchange="setIngredientCost('${ing.id}', this.value)"/></td>
           <td style="display:flex;gap:6px"><button class="btn btn-sm btn-secondary" onclick="openIngredientModal('${ing.id}')">Edit</button><button class="btn btn-sm btn-danger" onclick="deleteIngredient('${ing.id}')">Delete</button></td>
-        </tr>`).join('') || `<tr><td colspan="7"><span class="panel-sub">No ingredients yet.</span></td></tr>`}
+        </tr>`).join('') || `<tr><td colspan="8"><span class="panel-sub">No ingredients yet.</span></td></tr>`}
       </tbody>
     </table>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openIngredientModal()">+ Add Ingredient</button></div>
@@ -4784,6 +4785,30 @@ function ingredientUnitSelectHtml(selected){
     `<optgroup label="${esc(label)}">${units.map(u=>`<option value="${u}" ${u===selected?'selected':''}>${u}</option>`).join('')}</optgroup>`
   ).join('');
 }
+// Standard liquor bottle sizes, pre-converted to fl oz, for the quick-fill buttons in the
+// ingredient modal — lets someone costing out a bottle skip doing the ml→oz math by hand.
+const BOTTLE_SIZES_OZ = [
+  { label: '50ml', oz: 1.69 }, { label: '200ml', oz: 6.76 }, { label: '375ml', oz: 12.68 },
+  { label: '750ml', oz: 25.36 }, { label: '1L', oz: 33.81 }, { label: '1.75L', oz: 59.18 },
+];
+window.fillBottleSize = function(oz){
+  const yieldInput = document.getElementById('ingPkgYield');
+  if (yieldInput){ yieldInput.value = oz; recalcIngredientCost(); }
+};
+// Package cost ÷ package yield = cost per recipe unit. Recomputes live as the manager types,
+// and only overwrites the Cost/Unit field while package fields are actually in use — clearing
+// them leaves Cost/Unit as a plain manually-entered number, same as before this feature existed.
+window.recalcIngredientCost = function(){
+  const costInput = document.getElementById('ingCost');
+  const pkgCost = parseFloat(document.getElementById('ingPkgCost')?.value);
+  const pkgYield = parseFloat(document.getElementById('ingPkgYield')?.value);
+  const preview = document.getElementById('ingPkgCostPreview');
+  if (!isNaN(pkgCost) && !isNaN(pkgYield) && pkgYield > 0){
+    const perUnit = pkgCost / pkgYield;
+    costInput.value = perUnit.toFixed(4).replace(/0+$/,'').replace(/\.$/,'') || '0';
+    if (preview) preview.textContent = `= $${perUnit.toFixed(4)} per ${document.getElementById('ingUnit').value}`;
+  } else if (preview) preview.textContent = '';
+};
 window.addIngredientCategory = async function(){
   const input = document.getElementById('newIngCategory');
   const name = input.value.trim();
@@ -4800,6 +4825,7 @@ window.deleteIngredientCategory = async function(id){
 };
 window.openIngredientModal = function(ingredientId){
   const ing = ingredientId ? state.ingredients.find(x=>x.id===ingredientId) : null;
+  const unit = ing?.unit || 'oz';
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
     <h3>${ing ? 'Edit' : 'Add'} Ingredient</h3>
@@ -4809,17 +4835,30 @@ window.openIngredientModal = function(ingredientId){
     <input type="text" class="modal-input" id="ingBrand" value="${esc(ing?.brand||'')}" placeholder="e.g. Tito's, Heinz…"/>
     <div class="formgrid">
       <div><label class="field-label">Category</label><select class="modal-select" id="ingCategory"><option value="">—</option>${state.ingredientCategories.map(c=>`<option value="${c.id}" ${ing?.category_id===c.id?'selected':''}>${esc(c.name)}</option>`).join('')}</select></div>
-      <div><label class="field-label">Unit</label><select class="modal-select" id="ingUnit">${ingredientUnitSelectHtml(ing?.unit||'oz')}</select></div>
+      <div><label class="field-label">Unit</label><select class="modal-select" id="ingUnit" onchange="recalcIngredientCost()">${ingredientUnitSelectHtml(unit)}</select></div>
     </div>
     <label class="field-label">ABV % <span class="panel-sub" style="margin:0">(alcoholic ingredients only — leave blank otherwise)</span></label>
     <input type="number" min="0" max="100" step="0.1" class="modal-input" id="ingAbv" value="${ing?.abv_percent!=null?ing.abv_percent:''}" placeholder="e.g. 40"/>
-    <label class="field-label">Cost per unit ($)</label>
-    <input type="number" min="0" step="0.01" class="modal-input" id="ingCost" value="${ing?.cost_per_unit!=null?ing.cost_per_unit:0}"/>
+
+    <div class="section-heading" style="margin-top:4px">Price by the Package</div>
+    <p class="panel-sub" style="margin:0 0 8px">Enter what you actually bought — a bottle, a case, a lemon — and its cost. Cost per unit below is calculated for you.</p>
+    <label class="field-label">Package <span class="panel-sub" style="margin:0">(e.g. "750ml bottle", "Case of 24", "1 lemon")</span></label>
+    <input type="text" class="modal-input" id="ingPkgLabel" value="${esc(ing?.package_label||'')}" placeholder="750ml bottle"/>
+    <div class="formgrid">
+      <div><label class="field-label">Package cost ($)</label><input type="number" min="0" step="0.01" class="modal-input" id="ingPkgCost" value="${ing?.package_cost!=null?ing.package_cost:''}" oninput="recalcIngredientCost()"/></div>
+      <div><label class="field-label">Package yield (${esc(unit)})</label><input type="number" min="0" step="0.01" class="modal-input" id="ingPkgYield" value="${ing?.package_yield!=null?ing.package_yield:''}" oninput="recalcIngredientCost()"/></div>
+    </div>
+    ${unit==='oz' ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin:-6px 0 10px">${BOTTLE_SIZES_OZ.map(b=>`<button type="button" class="btn btn-secondary btn-sm" onclick="fillBottleSize(${b.oz})">${b.label}</button>`).join('')}</div>` : ''}
+    <div class="panel-sub" id="ingPkgCostPreview" style="margin:-4px 0 10px;min-height:16px"></div>
+
+    <label class="field-label">Cost per unit ($) <span class="panel-sub" style="margin:0">(auto-filled from package above, or enter directly)</span></label>
+    <input type="number" min="0" step="0.0001" class="modal-input" id="ingCost" value="${ing?.cost_per_unit!=null?ing.cost_per_unit:0}"/>
     <div class="modal-actions">
       <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
       <button class="modal-btn modal-btn-primary" onclick="saveIngredient('${ingredientId||''}')">Save</button>
     </div>`;
   document.getElementById('formModal').classList.remove('hidden');
+  recalcIngredientCost();
 };
 window.saveIngredient = async function(ingredientId){
   const name = document.getElementById('ingName').value.trim();
@@ -4830,8 +4869,15 @@ window.saveIngredient = async function(ingredientId){
   const abvRaw = document.getElementById('ingAbv').value.trim();
   const abv_percent = abvRaw === '' ? null : parseFloat(abvRaw);
   if (abv_percent!=null && (isNaN(abv_percent) || abv_percent<0 || abv_percent>100)){ alert('ABV must be between 0 and 100.'); return; }
+  const package_label = document.getElementById('ingPkgLabel').value.trim() || null;
+  const pkgCostRaw = document.getElementById('ingPkgCost').value.trim();
+  const pkgYieldRaw = document.getElementById('ingPkgYield').value.trim();
+  const package_cost = pkgCostRaw === '' ? null : parseFloat(pkgCostRaw);
+  const package_yield = pkgYieldRaw === '' ? null : parseFloat(pkgYieldRaw);
+  if (package_cost!=null && (isNaN(package_cost) || package_cost<0)){ alert('Package cost must be a positive number.'); return; }
+  if (package_yield!=null && (isNaN(package_yield) || package_yield<=0)){ alert('Package yield must be greater than 0.'); return; }
   const cost_per_unit = parseFloat(document.getElementById('ingCost').value) || 0;
-  const payload = { name, brand, category_id, unit, abv_percent, cost_per_unit };
+  const payload = { name, brand, category_id, unit, abv_percent, package_label, package_cost, package_yield, cost_per_unit };
   const { error } = ingredientId
     ? await sb.from('ingredients').update(payload).eq('id', ingredientId)
     : await sb.from('ingredients').insert(payload);
