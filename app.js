@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.68';
+const APP_VERSION = '1.70';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -4594,14 +4594,32 @@ window.deleteMenuCategory = async function(id){
 
 function renderRecipeRow(ingredientId, qty){
   return `<div style="display:flex;gap:6px;align-items:center" class="miRecipeRow">
-    <select class="modal-select miRecipeIngredient" style="margin:0;flex:1">${state.ingredients.map(ing=>`<option value="${ing.id}" ${ing.id===ingredientId?'selected':''}>${esc(ing.name)} (${esc(ing.unit)})</option>`).join('')}</select>
-    <input type="number" min="0" step="0.01" class="modal-input miRecipeQty" style="margin:0;width:80px" value="${qty??0}"/>
-    <button type="button" class="btn btn-sm btn-danger" onclick="this.closest('.miRecipeRow').remove()">×</button>
+    <select class="modal-select miRecipeIngredient" style="margin:0;flex:1" onchange="recalcMenuItemCost()">${state.ingredients.map(ing=>`<option value="${ing.id}" ${ing.id===ingredientId?'selected':''}>${esc(ing.name)} (${esc(ing.unit)})</option>`).join('')}</select>
+    <input type="number" min="0" step="0.01" class="modal-input miRecipeQty" style="margin:0;width:80px" value="${qty??0}" oninput="recalcMenuItemCost()"/>
+    <button type="button" class="btn btn-sm btn-danger" onclick="this.closest('.miRecipeRow').remove(); recalcMenuItemCost();">×</button>
   </div>`;
 }
 window.addRecipeRow = function(){
   if (!state.ingredients.length){ alert('Add ingredients first (Ingredients &amp; Costing section).'); return; }
   document.getElementById('miRecipeRows').insertAdjacentHTML('beforeend', renderRecipeRow(state.ingredients[0].id, 0));
+  recalcMenuItemCost();
+};
+// Live-updates the cost/margin readout under the recipe builder as ingredients, quantities,
+// or the menu price change — before anything is saved, so pricing decisions happen up front.
+window.recalcMenuItemCost = function(){
+  const summaryEl = document.getElementById('miCostSummary');
+  if (!summaryEl) return;
+  const rows = Array.from(document.querySelectorAll('#miRecipeRows .miRecipeRow'));
+  const cost = rows.reduce((sum, row) => {
+    const ing = state.ingredients.find(x => x.id === row.querySelector('.miRecipeIngredient').value);
+    const qty = parseFloat(row.querySelector('.miRecipeQty').value) || 0;
+    return sum + (ing ? ing.cost_per_unit * qty : 0);
+  }, 0);
+  const price = parseFloat(document.getElementById('miPrice')?.value) || 0;
+  const margin = price - cost;
+  const marginPct = price > 0 ? (margin / price) * 100 : null;
+  summaryEl.innerHTML = `Ingredient cost: <strong>$${cost.toFixed(2)}</strong>`
+    + (price > 0 ? ` &nbsp;·&nbsp; Margin: <strong style="color:${margin>=0?'var(--success)':'var(--danger)'}">$${margin.toFixed(2)}${marginPct!=null?' ('+marginPct.toFixed(0)+'%)':''}</strong>` : '');
 };
 window.openMenuItemModal = function(itemId){
   const it = itemId ? state.menuItems.find(x=>x.id===itemId) : null;
@@ -4618,7 +4636,7 @@ window.openMenuItemModal = function(itemId){
       <div><label class="field-label">Ticket Destination</label><select class="modal-select" id="miDest"><option value="">—</option>${state.ticketDestinations.map(td=>`<option value="${td.id}" ${it?.ticket_destination_id===td.id?'selected':''}>${esc(td.name)}</option>`).join('')}</select></div>
     </div>
     <div class="formgrid">
-      <div><label class="field-label">Price ($)</label><input type="number" min="0" step="0.01" class="modal-input" id="miPrice" value="${it?it.price:'0'}"/></div>
+      <div><label class="field-label">Price ($)</label><input type="number" min="0" step="0.01" class="modal-input" id="miPrice" value="${it?it.price:'0'}" oninput="recalcMenuItemCost()"/></div>
       <div><label class="field-label" style="display:flex;align-items:center;gap:6px;margin-top:22px"><input type="checkbox" id="miActive" ${it?(it.active?'checked':''):'checked'}/> Active / visible</label></div>
     </div>
     <label class="field-label">Description (optional)</label>
@@ -4629,6 +4647,7 @@ window.openMenuItemModal = function(itemId){
       ${recipe.map(r => renderRecipeRow(r.ingredient_id, r.quantity)).join('')}
     </div>
     <button type="button" class="btn btn-secondary btn-sm" onclick="addRecipeRow()">+ Add Ingredient</button>
+    <div class="panel-sub" id="miCostSummary" style="margin:8px 0 0"></div>
     ` : ''}
     <label class="field-label" style="margin-top:10px">Modifier Groups</label>
     <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:10px">
@@ -4640,6 +4659,7 @@ window.openMenuItemModal = function(itemId){
       <button class="modal-btn modal-btn-primary" onclick="saveMenuItem(${it?`'${it.id}'`:'null'})">Save</button>
     </div>`;
   document.getElementById('formModal').classList.remove('hidden');
+  if (canCost) recalcMenuItemCost();
 };
 window.saveMenuItem = async function(itemId){
   const name = document.getElementById('miName').value.trim();
@@ -4799,6 +4819,11 @@ window.fillBottleSize = function(oz){
 // and only overwrites the Cost/Unit field while package fields are actually in use — clearing
 // them leaves Cost/Unit as a plain manually-entered number, same as before this feature existed.
 window.recalcIngredientCost = function(){
+  const unit = document.getElementById('ingUnit')?.value || 'oz';
+  const yieldUnitLabel = document.getElementById('ingPkgYieldUnit');
+  if (yieldUnitLabel) yieldUnitLabel.textContent = unit;
+  const bottleSizes = document.getElementById('ingBottleSizes');
+  if (bottleSizes) bottleSizes.style.display = unit === 'oz' ? 'flex' : 'none';
   const costInput = document.getElementById('ingCost');
   const pkgCost = parseFloat(document.getElementById('ingPkgCost')?.value);
   const pkgYield = parseFloat(document.getElementById('ingPkgYield')?.value);
@@ -4806,7 +4831,7 @@ window.recalcIngredientCost = function(){
   if (!isNaN(pkgCost) && !isNaN(pkgYield) && pkgYield > 0){
     const perUnit = pkgCost / pkgYield;
     costInput.value = perUnit.toFixed(4).replace(/0+$/,'').replace(/\.$/,'') || '0';
-    if (preview) preview.textContent = `= $${perUnit.toFixed(4)} per ${document.getElementById('ingUnit').value}`;
+    if (preview) preview.textContent = `= $${perUnit.toFixed(4)} per ${unit}`;
   } else if (preview) preview.textContent = '';
 };
 window.addIngredientCategory = async function(){
@@ -4846,9 +4871,9 @@ window.openIngredientModal = function(ingredientId){
     <input type="text" class="modal-input" id="ingPkgLabel" value="${esc(ing?.package_label||'')}" placeholder="750ml bottle"/>
     <div class="formgrid">
       <div><label class="field-label">Package cost ($)</label><input type="number" min="0" step="0.01" class="modal-input" id="ingPkgCost" value="${ing?.package_cost!=null?ing.package_cost:''}" oninput="recalcIngredientCost()"/></div>
-      <div><label class="field-label">Package yield (${esc(unit)})</label><input type="number" min="0" step="0.01" class="modal-input" id="ingPkgYield" value="${ing?.package_yield!=null?ing.package_yield:''}" oninput="recalcIngredientCost()"/></div>
+      <div><label class="field-label">Package yield (<span id="ingPkgYieldUnit">${esc(unit)}</span>)</label><input type="number" min="0" step="0.01" class="modal-input" id="ingPkgYield" value="${ing?.package_yield!=null?ing.package_yield:''}" oninput="recalcIngredientCost()"/></div>
     </div>
-    ${unit==='oz' ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin:-6px 0 10px">${BOTTLE_SIZES_OZ.map(b=>`<button type="button" class="btn btn-secondary btn-sm" onclick="fillBottleSize(${b.oz})">${b.label}</button>`).join('')}</div>` : ''}
+    <div id="ingBottleSizes" style="display:${unit==='oz'?'flex':'none'};flex-wrap:wrap;gap:6px;margin:-6px 0 10px">${BOTTLE_SIZES_OZ.map(b=>`<button type="button" class="btn btn-secondary btn-sm" onclick="fillBottleSize(${b.oz})">${b.label}</button>`).join('')}</div>
     <div class="panel-sub" id="ingPkgCostPreview" style="margin:-4px 0 10px;min-height:16px"></div>
 
     <label class="field-label">Cost per unit ($) <span class="panel-sub" style="margin:0">(auto-filled from package above, or enter directly)</span></label>
