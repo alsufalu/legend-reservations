@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.71';
+const APP_VERSION = '1.72';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -3886,6 +3886,23 @@ function renderScheduleTab(){
          <div class="modal-actions" style="padding-top:0;justify-content:flex-start"><button class="btn btn-primary" onclick="clockIn()">Clock In</button></div>`}
   </div>` : '';
 
+  const thisDeviceToken = localStorage.getItem(TERMINAL_TOKEN_KEY);
+  const thisDeviceIsTerminal = thisDeviceToken && state.clockTerminals.some(t => t.device_token === thisDeviceToken && t.active);
+  const kioskEligibleStaff = state.staffList.filter(s => s.active && staffHasPermission(s.id, 'clock_in_out'));
+  const kioskFirstOpen = kioskEligibleStaff.length && state.timeClockEntries.some(e => e.staff_id === kioskEligibleStaff[0].id && !e.clock_out_at);
+  const kioskCard = thisDeviceIsTerminal ? `
+  <div class="section-heading">Staff Time Clock (This Terminal)</div>
+  <div class="card">
+    <div class="panel-sub" style="margin-bottom:10px">This device is a registered clock-in terminal — anyone can use it to punch themselves in or out here, no matter whose account is signed into the browser. Pick your name and enter your own PIN.</div>
+    <div class="formgrid">
+      <div><label class="field-label">Employee</label><select class="modal-select" id="kioskEmployee" onchange="kioskUpdateButtonLabel()">${kioskEligibleStaff.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select></div>
+      <div><label class="field-label">PIN</label><input type="password" inputmode="numeric" maxlength="6" class="modal-input" id="kioskPin" placeholder="••••" onkeydown="if(event.key==='Enter')kioskPunch()"/></div>
+    </div>
+    <div class="modal-actions" style="padding-top:6px;justify-content:flex-start">
+      <button class="btn ${kioskFirstOpen?'btn-danger':'btn-primary'}" id="kioskPunchBtn" onclick="kioskPunch()">${kioskFirstOpen?'Clock Out':'Clock In'}</button>
+    </div>
+  </div>` : '';
+
   const scheduleCard = can('view_own_schedule') ? `
   <div class="section-heading">My Upcoming Shifts</div>
   <div class="card">
@@ -3902,6 +3919,7 @@ function renderScheduleTab(){
   return `
   <div class="panel-header"><h2 class="panel-title">Schedule</h2></div>
   ${clockCard}
+  ${kioskCard}
   ${scheduleCard}
   ${timeOffCard}
   ${can('use_messaging') ? renderMessagesSection() : ''}
@@ -4369,6 +4387,54 @@ window.clockOut = async function(){
   const { error } = await sb.rpc('punch_clock_out', { p_device_token: deviceToken, p_cash_tips: cashTips });
   if (error){ alert(error.message); return; }
   await loadScheduleData();
+};
+
+// ---- Shared-terminal kiosk: clock a DIFFERENT employee in/out by their own PIN, independent
+// of whichever account the browser itself is signed into (e.g. a manager stays logged into the
+// front-desk PC all shift, and each employee walks up, picks their name, and punches themselves).
+window.kioskPunch = async function(){
+  const staffId = document.getElementById('kioskEmployee')?.value;
+  const pinInput = document.getElementById('kioskPin');
+  const pin = pinInput?.value;
+  if (!staffId){ alert('Select an employee.'); return; }
+  if (!pin){ alert('Enter a PIN.'); return; }
+  const deviceToken = localStorage.getItem(TERMINAL_TOKEN_KEY);
+  const openEntry = state.timeClockEntries.find(e => e.staff_id === staffId && !e.clock_out_at);
+  if (openEntry){
+    const cashTipsInput = prompt(`Card tips this shift: $${Number(openEntry.computed_card_tips||0).toFixed(2)} (tracked automatically once Payments is live — nothing to enter for that part).\n\nCash tips received this shift ($):`, '0');
+    if (cashTipsInput === null) return;
+    const cashTips = Number(cashTipsInput);
+    if (isNaN(cashTips) || cashTips < 0){ alert('Enter a valid dollar amount.'); return; }
+    const { error } = await sb.rpc('punch_clock_out_for', { p_target_staff_id: staffId, p_pin: pin, p_device_token: deviceToken, p_cash_tips: cashTips });
+    if (error){ alert(error.message); return; }
+  } else {
+    const now = getNow();
+    const today = todayISO();
+    const todaysShifts = state.scheduleShifts.filter(s => s.staff_id === staffId && s.shift_date === today && s.published);
+    let shift = todaysShifts.find(s => now.getTime() >= new Date(today+'T'+s.scheduled_start).getTime() - 10*60000) || todaysShifts[0];
+    if (!shift){
+      if (!confirm('No scheduled shift found for this employee today — clock in anyway?')) return;
+    } else {
+      const start = new Date(today+'T'+shift.scheduled_start);
+      if (now.getTime() < start.getTime() - 10*60000){
+        alert(`Too early — this employee's shift starts at ${fmtTime(shift.scheduled_start)}.`);
+        return;
+      }
+    }
+    const status = shift && now.getTime() > new Date(today+'T'+shift.scheduled_start).getTime() ? 'late' : 'on_time';
+    const { error } = await sb.rpc('punch_clock_in_for', { p_target_staff_id: staffId, p_pin: pin, p_device_token: deviceToken, p_shift_id: shift?.id || null, p_status: status });
+    if (error){ alert(error.message); return; }
+  }
+  if (pinInput) pinInput.value = '';
+  await loadScheduleData();
+};
+window.kioskUpdateButtonLabel = function(){
+  const staffId = document.getElementById('kioskEmployee')?.value;
+  const btn = document.getElementById('kioskPunchBtn');
+  if (!btn) return;
+  const openEntry = state.timeClockEntries.find(e => e.staff_id === staffId && !e.clock_out_at);
+  btn.textContent = openEntry ? 'Clock Out' : 'Clock In';
+  btn.className = 'btn ' + (openEntry ? 'btn-danger' : 'btn-primary');
 };
 
 window.openTimeOffModal = function(){
