@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.70';
+const APP_VERSION = '1.71';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -94,6 +94,7 @@ let _authMode = 'signin';
 
 let state = {
   tab: 'reservations',
+  focusedSettingsSection: null, // when set (via ?settingsSection= URL param), Settings renders just that one section
   resView: 'list',
   timelinePartySize: '', // '' = show every table; otherwise filter Timeline rows to tables that fit this many guests
   timelineAreaFilter: null,     // Set<areaId|'__unassigned'> of checked areas
@@ -678,6 +679,15 @@ async function onSignedIn(){
   setStatus(document.getElementById('syncStatus'), '☁ Synced', 'synced');
 
   await loadAll();
+
+  // A Settings section link opens the whole app in a fresh tab with ?settingsSection=<key> —
+  // land straight on that one section instead of the tab the app would otherwise default to.
+  const settingsSectionParam = new URLSearchParams(location.search).get('settingsSection');
+  if (settingsSectionParam){
+    state.tab = 'settings';
+    state.focusedSettingsSection = settingsSectionParam;
+  }
+
   render();
   startKdsPolling();
 }
@@ -884,6 +894,7 @@ function applyPermissionGating(){
 // ============================================================================
 window.setTab = function(tab){
   state.tab = tab;
+  state.focusedSettingsSection = null; // clicking a nav tab always goes to the full Settings directory, not a leftover pop-out section
   document.querySelectorAll('.tabbtn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   render();
 };
@@ -5138,13 +5149,8 @@ window.cancelPurchaseOrder = async function(poId){
   await reloadInventoryData();
 };
 
-function renderSettingsTab(){
-  const isAdmin = currentStaff.role === 'admin';
-  const isStaffManager = isAdmin || can('manage_staff_permissions');
+function renderTestingToolsSection(){
   return `
-  <div class="panel-header"><h2 class="panel-title">Settings</h2></div>
-
-  ${isStaffManager ? `
   <div class="section-heading">Testing: Override "Now"</div>
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">For testing off-hours (e.g. checking what a Friday 7pm dinner rush looks like at 3am): make the whole app believe it's a different date/time than your device clock. This affects Today's default date, the Floor Plan's live status view, the Timeline "now" line, waitlist wait counters, and every seated/completed/cancelled timestamp — all without touching any real reservation data. It ticks forward normally from whatever you set, and persists until you clear it, even across a page refresh — a purple banner stays up across the whole app the entire time it's active so it's never accidentally left on.</div>
@@ -5156,9 +5162,10 @@ function renderSettingsTab(){
       <button class="btn btn-primary" onclick="setNowOverride(document.getElementById('nowOvDate').value, document.getElementById('nowOvTime').value)">Set Test Time</button>
       ${nowOverride ? `<button class="btn btn-secondary" onclick="clearNowOverride()">Exit Test Mode (use real time)</button>` : ''}
     </div>
-  </div>` : ''}
-
-  ${can('manage_reservations') ? `
+  </div>`;
+}
+function renderFloorPlanSettingsSection(){
+  return `
   <div class="section-heading">Dining Tables &amp; Floor Plan</div>
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">${state.tables.filter(t=>!t.is_combo).length} tables across ${state.areas.length} area${state.areas.length===1?'':'s'}. Add, rename, resize, delete, and drag-position tables on your floor plan sketch from the <b>Floor Plan</b> tab.</div>
@@ -5178,9 +5185,10 @@ function renderSettingsTab(){
     </table>
     <div class="panel-sub" style="margin-top:8px">Each area's default duration pre-fills the Duration field on a new reservation once you pick a table there — the hostess can always type over it. The Pacing Cap limits how many total covers (guests) can be booked into any single 15-minute arrival window for that area. "Vault Seats Reserved for Members" holds that many seats back for active loyalty members until the release window before service — leave blank for areas with no loyalty carve-out (only the Speakeasy has one by default). All of these warn and ask for confirmation rather than blocking outright.</div>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="setTab('floorplan')">🗺️ Open Floor Plan Editor</button></div>
-  </div>` : ''}
-
-  ${can('manage_loyalty_program') ? `
+  </div>`;
+}
+function renderLoyaltySettingsSection(){
+  return `
   <div class="section-heading">Loyalty Program</div>
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">Membership tier terms. Changing a number here only affects future redemption counting and new enrollments — it does not retroactively change what a member has already used this period.</div>
@@ -5211,9 +5219,10 @@ function renderSettingsTab(){
       <input type="text" class="modal-input" style="margin:0" id="newHolidayLabel" placeholder="Label (e.g. New Year's Eve)"/>
       <button class="btn btn-secondary btn-sm" onclick="addPriorityHoliday()">Add</button>
     </div>
-  </div>` : ''}
-
-  ${can('manage_reservations') ? `
+  </div>`;
+}
+function renderTableColorsSection(){
+  return `
   <div class="section-heading">Table Status Colors</div>
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">Define what each table color means on the Floor Plan. Tapping a table there cycles through these statuses in order: Available → Reserved → Assigned (Pre-Seated) → Seated → Needs Bussing → Blocked / Out of Service. "Assigned" is for a table held for a specific walk-in or reservation that hasn't sat down yet. The legend shown on the Floor Plan always reflects whatever colors you set here.</div>
@@ -5226,11 +5235,13 @@ function renderSettingsTab(){
         </tr>`).join('')}
       </tbody>
     </table>
-  </div>
-
+  </div>`;
+}
+function renderServersRosterSection(){
+  return `
   <div class="section-heading">Servers Roster</div>
   <div class="card">
-    <div class="panel-sub" style="margin-bottom:10px">Quick list of server names for assigning to sections below — no login account needed. Most servers never need to sign into this app, so they don't need "Request Access" or Staff Access approval; that's only for people who'll actually use the software (hosts, managers, you). If a server is later promoted and needs real access, add them via Request Access on the login screen and approve them in Staff Access below instead.</div>
+    <div class="panel-sub" style="margin-bottom:10px">Quick list of server names for assigning to sections below — no login account needed. Most servers never need to sign into this app, so they don't need "Request Access" or Staff Access approval; that's only for people who'll actually use the software (hosts, managers, you). If a server is later promoted and needs real access, add them via Request Access on the login screen and approve them in Staff Access instead.</div>
     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px">
       ${state.roster.length ? state.roster.map(r => `<span class="area-chip" style="cursor:default">${esc(r.name)} <span class="linkBtn" style="cursor:pointer;color:var(--danger);margin-left:4px" onclick="deleteRosterServer('${r.id}')">×</span></span>`).join('') : '<span class="panel-sub" style="margin:0">No servers added yet.</span>'}
     </div>
@@ -5238,8 +5249,10 @@ function renderSettingsTab(){
       <input type="text" class="modal-input" id="newRosterName" placeholder="Server name" style="margin:0;max-width:240px" onkeydown="if(event.key==='Enter')addRosterServer()"/>
       <button class="btn btn-primary btn-sm" onclick="addRosterServer()">+ Add Server</button>
     </div>
-  </div>
-
+  </div>`;
+}
+function renderServerSectionsSection(){
+  return `
   <div class="section-heading">Server Sections</div>
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">Group tables into color-coded sections and assign a server (or staff member) to each. Turn on "🎨 Server View" on the Floor Plan tab to see the floor colored by section instead of table status. Assign individual tables to a section from the table's edit panel on the Floor Plan tab.</div>
@@ -5260,8 +5273,10 @@ function renderSettingsTab(){
       </tbody>
     </table>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openServerSectionModal()">+ Add Section</button></div>
-  </div>
-
+  </div>`;
+}
+function renderTableCombosSection(){
+  return `
   <div class="section-heading">Table Combinations</div>
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">Predefine which tables can be pushed together for larger parties (e.g. two 4-tops = a 6-8 top). A combo shows up automatically as a bookable option once a party is too big for any single table, and it's protected from ever double-booking against its member tables.</div>
@@ -5277,8 +5292,10 @@ function renderSettingsTab(){
       </tbody>
     </table>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openTableComboModal()">+ Add Combination</button></div>
-  </div>
-
+  </div>`;
+}
+function renderServicePeriodsSection(){
+  return `
   <div class="section-heading">Service Periods</div>
   <div class="card">
     <table class="data-table">
@@ -5291,13 +5308,10 @@ function renderSettingsTab(){
       </tbody>
     </table>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openServicePeriodModal()">+ Add Service Period</button></div>
-  </div>` : ''}
-
-  ${can('manage_menu') ? renderMenuSection() : ''}
-  ${can('manage_ingredients_costing') ? renderIngredientsSection() : ''}
-  ${can('manage_inventory') ? renderInventorySection() : ''}
-
-  ${isStaffManager ? `
+  </div>`;
+}
+function renderStaffAccessSection(){
+  return `
   <div class="section-heading">Staff Access &amp; Permissions</div>
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">Each role has a default set of permissions (see the plan doc for the full bundle). Click "Permissions" on any employee to grant or deny specific ones for just that person — e.g. a senior waiter who can apply discounts without becoming a manager.</div>
@@ -5322,7 +5336,66 @@ function renderSettingsTab(){
         </tr>`).join('')}
       </tbody>
     </table>
-  </div>` : ''}`;
+  </div>`;
+}
+
+// Registry driving both the Settings directory (link grid) and the focused single-section
+// pop-out windows opened from it — one source of truth for what sections exist, their gating,
+// and how to render them, so the two views can never drift out of sync with each other.
+const SETTINGS_SECTIONS = [
+  { key:'testing',     label:'🧪 Testing Tools',                can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderTestingToolsSection },
+  { key:'floorplan',   label:'🗺️ Dining Tables & Floor Plan',   can: () => can('manage_reservations'), render: renderFloorPlanSettingsSection },
+  { key:'loyalty',     label:'💳 Loyalty Program',               can: () => can('manage_loyalty_program'), render: renderLoyaltySettingsSection },
+  { key:'colors',      label:'🎨 Table Status Colors',           can: () => can('manage_reservations'), render: renderTableColorsSection },
+  { key:'roster',      label:'🧑‍🍳 Servers Roster',             can: () => can('manage_reservations'), render: renderServersRosterSection },
+  { key:'sections',    label:'📍 Server Sections',               can: () => can('manage_reservations'), render: renderServerSectionsSection },
+  { key:'combos',      label:'🔗 Table Combinations',            can: () => can('manage_reservations'), render: renderTableCombosSection },
+  { key:'periods',     label:'⏰ Service Periods',                can: () => can('manage_reservations'), render: renderServicePeriodsSection },
+  { key:'menu',        label:'🍽️ Menu, Items & Modifiers',      can: () => can('manage_menu'), render: renderMenuSection },
+  { key:'ingredients', label:'🧂 Ingredients & Costing',         can: () => can('manage_ingredients_costing'), render: renderIngredientsSection },
+  { key:'inventory',   label:'📦 Inventory & Vendors',           can: () => can('manage_inventory'), render: renderInventorySection },
+  { key:'staff',       label:'👤 Staff Access & Permissions',    can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderStaffAccessSection },
+];
+
+function renderSettingsDirectory(){
+  const visible = SETTINGS_SECTIONS.filter(s => s.can());
+  return `
+  <div class="panel-header"><h2 class="panel-title">Settings</h2></div>
+  <p class="panel-sub" style="margin:0 0 14px">Each area below opens in its own window instead of one long page — click one to open it.</p>
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px">
+    ${visible.map(s => `<div class="card" style="cursor:pointer;padding:18px" onclick="openSettingsSection('${s.key}')">
+      <div style="font-size:16px;font-weight:600">${s.label}</div>
+      <div class="panel-sub" style="margin:4px 0 0">Opens in a new window</div>
+    </div>`).join('')}
+  </div>`;
+}
+
+window.openSettingsSection = function(key){
+  window.open('?settingsSection=' + encodeURIComponent(key), '_blank');
+};
+window.closeSettingsSectionWindow = function(){
+  window.close();
+  // Some browsers refuse to close a tab that wasn't opened by a user gesture in this same
+  // script context (varies by browser) — if it's still here a moment later, guide them instead.
+  setTimeout(() => { alert('You can close this browser tab now.'); }, 300);
+};
+
+function renderSettingsTab(){
+  if (state.focusedSettingsSection){
+    const sec = SETTINGS_SECTIONS.find(s => s.key === state.focusedSettingsSection);
+    if (!sec){
+      return `<div class="panel-header"><h2 class="panel-title">Settings</h2></div><div class="card"><div class="panel-sub" style="margin:0">Unknown settings section.</div></div>`;
+    }
+    if (!sec.can()){
+      return `<div class="panel-header"><h2 class="panel-title">${sec.label}</h2></div><div class="card"><div class="panel-sub" style="margin:0">You don't have permission to view this section.</div></div>`;
+    }
+    return `
+    <div class="panel-header"><h2 class="panel-title">${sec.label}</h2>
+      <button class="btn btn-secondary btn-sm" onclick="closeSettingsSectionWindow()">Close Window</button>
+    </div>
+    ${sec.render()}`;
+  }
+  return renderSettingsDirectory();
 }
 
 window.openEditStaffModal = function(staffId){
