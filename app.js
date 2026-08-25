@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.63';
+const APP_VERSION = '1.64';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -812,6 +812,35 @@ const TAB_PERMISSIONS = {
   kitchen: ['view_kitchen_station'],
   expo: ['mark_item_delivered'],
 };
+const PERMISSION_CATEGORIES = {
+  take_orders: 'Orders & Payments',
+  take_payment: 'Orders & Payments',
+  split_checks: 'Orders & Payments',
+  apply_comp: 'Orders & Payments',
+  apply_discretionary_discount: 'Orders & Payments',
+  apply_loyalty_payment: 'Orders & Payments',
+  process_refund: 'Orders & Payments',
+  sell_gift_card: 'Gift Cards',
+  redeem_gift_card: 'Gift Cards',
+  view_kitchen_station: 'Kitchen & Expo',
+  mark_item_delivered: 'Kitchen & Expo',
+  manage_menu: 'Menu & Inventory',
+  manage_ingredients_costing: 'Menu & Inventory',
+  manage_inventory: 'Menu & Inventory',
+  manage_reservations: 'Reservations & Loyalty',
+  manage_loyalty_program: 'Reservations & Loyalty',
+  clock_in_out: 'Schedule & Time',
+  view_own_schedule: 'Schedule & Time',
+  request_time_off: 'Schedule & Time',
+  manage_schedule: 'Schedule & Time',
+  manage_timecards: 'Schedule & Time',
+  approve_shift_swap: 'Schedule & Time',
+  use_messaging: 'Messaging',
+  manage_broadcasts: 'Messaging',
+  manage_staff_permissions: 'Staff & Reports',
+  view_reports: 'Staff & Reports',
+};
+const PERMISSION_CATEGORY_ORDER = ['Orders & Payments','Gift Cards','Kitchen & Expo','Menu & Inventory','Reservations & Loyalty','Schedule & Time','Messaging','Staff & Reports'];
 function canSeeTab(tab){
   const need = TAB_PERMISSIONS[tab];
   return !need ? true : need.some(p => can(p));
@@ -5144,39 +5173,43 @@ window.openStaffPermissionsModal = function(staffId){
   const roleDefaults = new Set(state.rolePermissions.filter(rp => rp.role === s.role).map(rp => rp.permission_key));
   const overrideMap = {};
   state.staffOverrides.filter(o => o.staff_id === staffId).forEach(o => { overrideMap[o.permission_key] = o.granted; });
+  const byCategory = {};
+  state.permissions.forEach(p => {
+    const cat = PERMISSION_CATEGORIES[p.key] || 'Other';
+    (byCategory[cat] = byCategory[cat] || []).push(p);
+  });
+  const categories = PERMISSION_CATEGORY_ORDER.filter(c => byCategory[c]).concat(Object.keys(byCategory).filter(c => !PERMISSION_CATEGORY_ORDER.includes(c)));
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
     <h3>${esc(s.name)}'s Permissions</h3>
-    <p class="modal-user-email">Role: ${esc(s.role)} — showing that role's defaults, with any personal overrides for this employee.</p>
-    <table class="data-table">
-      <thead><tr><th>Permission</th><th>Setting</th></tr></thead>
-      <tbody>
-        ${state.permissions.map(p => {
-          const roleDefault = roleDefaults.has(p.key);
-          const overrideVal = overrideMap.hasOwnProperty(p.key) ? overrideMap[p.key] : null;
-          const mode = overrideVal === null ? 'default' : (overrideVal ? 'granted' : 'denied');
-          return `<tr>
-            <td>${esc(p.label)}<div class="panel-sub" style="margin:0">${esc(p.description||'')}</div></td>
-            <td>
-              <select class="modal-select" style="margin:0;padding:4px 8px" onchange="setPermissionOverride('${staffId}','${p.key}', this.value)">
-                <option value="default" ${mode==='default'?'selected':''}>Default for ${esc(s.role)} (${roleDefault?'Yes':'No'})</option>
-                <option value="granted" ${mode==='granted'?'selected':''}>Force Grant</option>
-                <option value="denied" ${mode==='denied'?'selected':''}>Force Deny</option>
-              </select>
-            </td>
-          </tr>`;
-        }).join('')}
-      </tbody>
-    </table>
+    <p class="modal-user-email">Role: ${esc(s.role)}. Checked = this employee currently has the privilege (via role default or a personal override). Toggling a box overrides just that permission for this person; it stops following the role default only where you've changed it.</p>
+    ${categories.map(cat => `
+      <div class="section-heading" style="margin-top:16px;font-size:13px">${esc(cat)}</div>
+      <table class="data-table">
+        <tbody>
+          ${byCategory[cat].map(p => {
+            const roleDefault = roleDefaults.has(p.key);
+            const overrideVal = overrideMap.hasOwnProperty(p.key) ? overrideMap[p.key] : null;
+            const effective = overrideVal === null ? roleDefault : overrideVal;
+            const overridden = overrideVal !== null;
+            return `<tr>
+              <td style="width:28px"><input type="checkbox" ${effective?'checked':''} onchange="togglePermissionOverride('${staffId}','${p.key}', this.checked)"/></td>
+              <td>${esc(p.label)}${overridden ? ` <span class="panel-sub" style="margin:0">(overridden — role default: ${roleDefault?'Yes':'No'})</span>` : ''}<div class="panel-sub" style="margin:0">${esc(p.description||'')}</div></td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`).join('')}
     <div class="modal-actions"><button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Close</button></div>`;
   document.getElementById('formModal').classList.remove('hidden');
 };
 
-window.setPermissionOverride = async function(staffId, permKey, mode){
-  if (mode === 'default'){
+window.togglePermissionOverride = async function(staffId, permKey, checked){
+  const s = state.staffList.find(x => x.id === staffId);
+  const roleDefault = state.rolePermissions.some(rp => rp.role === s.role && rp.permission_key === permKey);
+  if (checked === roleDefault){
     await sb.from('staff_permission_overrides').delete().eq('staff_id', staffId).eq('permission_key', permKey);
   } else {
-    await sb.from('staff_permission_overrides').upsert({ staff_id: staffId, permission_key: permKey, granted: mode === 'granted', set_by: currentStaff.id, set_at: new Date().toISOString() });
+    await sb.from('staff_permission_overrides').upsert({ staff_id: staffId, permission_key: permKey, granted: checked, set_by: currentStaff.id, set_at: new Date().toISOString() });
   }
   const { data } = await sb.from('staff_permission_overrides').select('*');
   state.staffOverrides = data || [];
