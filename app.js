@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.72';
+const APP_VERSION = '1.73';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -3211,9 +3211,11 @@ function renderCheckDetail(check){
         ${canOrder && hasUnfired ? `<button class="btn btn-sm btn-primary" onclick="fireCheck('${check.id}')">Send to Kitchen/Bar</button>` : ''}
         ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="openSplitCheckModal('${check.id}')">Split</button>` : ''}
         ${(canOrder||canPay) ? `<button class="btn btn-sm btn-secondary" onclick="openDiscretionaryDiscountModal('${check.id}')">Discount</button>` : ''}
+        ${(canOrder||canPay) ? `<button class="btn btn-sm btn-secondary" onclick="openTransferCheckModal('${check.id}')">Transfer</button>` : ''}
         ${canPay && balance > 0 ? `<button class="btn btn-sm btn-primary" onclick="openPaymentModal('${check.id}')">Take Payment</button>` : ''}
       </div>
     </div>
+    <div class="panel-sub" style="margin-bottom:4px">Server: ${esc(state.staffList.find(s=>s.id===check.server_id)?.name || '?')}</div>
     <div class="panel-sub" style="margin-bottom:8px">
       ${loyaltyGuest ? `💳 Linked: ${esc(loyaltyGuest.first_name)} ${esc(loyaltyGuest.last_name)} (${esc(loyaltyMember.locked_tier_name || state.loyaltyTiers.find(t=>t.key===loyaltyMember.tier_key)?.name || loyaltyMember.tier_key)})${(!hasLoyaltyDiscount && can('apply_loyalty_payment')) ? ` · <span class="linkBtn" style="cursor:pointer" onclick="applyLoyaltyDiscount('${check.id}')">Apply membership discount</span>` : ''}` : (canOrder ? `<span class="linkBtn" style="cursor:pointer" onclick="openLinkLoyaltyModal('${check.id}')">+ Link loyalty membership</span>` : '')}
     </div>
@@ -3268,6 +3270,31 @@ window.createCheck = async function(){
   if (error){ alert('Error: '+error.message); return; }
   closeModal('formModal');
   state.ordersActiveCheckId = data.id;
+  await loadOrdersData();
+};
+window.openTransferCheckModal = function(checkId){
+  const check = state.checks.find(c=>c.id===checkId);
+  const candidates = eligibleApprovers('take_orders').filter(s=>s.id!==check.server_id);
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Transfer Check</h3>
+    <p class="panel-sub">Currently: ${esc(state.staffList.find(s=>s.id===check.server_id)?.name || '?')}</p>
+    <label class="field-label">Transfer to</label>
+    <select class="modal-select" id="transferToStaff">
+      ${candidates.map(s=>`<option value="${s.id}">${esc(s.name)} (${esc(s.role)})</option>`).join('') || '<option value="">No other eligible staff</option>'}
+    </select>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
+      <button class="modal-btn modal-btn-primary" onclick="transferCheck('${checkId}')">Transfer</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.transferCheck = async function(checkId){
+  const newServerId = document.getElementById('transferToStaff').value;
+  if (!newServerId){ alert('No staff selected.'); return; }
+  const { error } = await sb.from('checks').update({ server_id: newServerId }).eq('id', checkId);
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
   await loadOrdersData();
 };
 
