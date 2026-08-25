@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.62';
+const APP_VERSION = '1.63';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -602,7 +602,19 @@ window.submitAuth = async function(){
     const { data, error } = await sb.auth.signUp({ email, password });
     if (error){ err.textContent = error.message; return; }
     if (data.user){
-      await sb.from('staff').insert({ id: data.user.id, email, name: name || email, role:'host', active:false });
+      const { error: staffErr } = await sb.from('staff').insert({ id: data.user.id, email, name: name || email, role:'host', active:false });
+      if (staffErr && !data.session){
+        // Expected when email confirmation is required: there's no session yet for this brand-new
+        // user, so the insert is blocked by RLS. onSignedIn() re-attempts this same insert the
+        // moment they confirm their email and actually sign in, so nothing is lost — just delayed.
+        err.style.color = 'var(--success)';
+        err.textContent = 'Request submitted! Check your email to confirm your account, then come back and sign in — your access request will be ready for a manager to approve right after.';
+        return;
+      }
+      if (staffErr){
+        err.textContent = 'Your account was created, but saving your access request failed: ' + staffErr.message + '. Try signing in, or contact your manager.';
+        return;
+      }
     }
     err.style.color = 'var(--success)';
     err.textContent = 'Request submitted! Ask an admin to approve your access, then sign in.';
