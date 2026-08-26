@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.83';
+const APP_VERSION = '1.84';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -929,11 +929,22 @@ window.setTab = function(tab){
 };
 
 let _lastRenderedTab = null; // guards against fetch-then-render loops for tabs whose loader itself calls render()
+// render() fully replaces the active tab's innerHTML on every call — necessary
+// since state can change from many places (polling, other tabs, etc.), but that
+// normally means a focused text input (e.g. a live search box) gets destroyed
+// and rebuilt on every keystroke, kicking focus out after each character typed.
+// To avoid that, any focused <input>/<textarea> that has an `id` has its focus
+// + cursor position captured before the re-render and restored after, as long
+// as an element with that same id still exists in the freshly rendered markup.
 function render(){
   applyPermissionGating();
   renderNowBanner();
   renderTopbarClock();
   const c = document.getElementById('content');
+  const active = document.activeElement;
+  const focusPreserve = (active && active.id && c.contains(active) && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA'))
+    ? { id: active.id, start: active.selectionStart, end: active.selectionEnd }
+    : null;
   if (!state.tab){
     c.innerHTML = `<div class="empty-state"><div class="empty-state-icon">👋</div>Nothing here yet for your role.<br><span class="panel-sub">Ordering, kitchen, and bar screens are coming in a later update — for now, ask a manager if you think this is wrong.</span></div>`;
     _lastRenderedTab = state.tab;
@@ -954,6 +965,15 @@ function render(){
   else if (state.tab === 'schedule') { c.innerHTML = renderScheduleTab(); if (enteringTab) loadScheduleData(); }
   else if (state.tab === 'dashboard') { c.innerHTML = renderDashboardTab(); loadDashboard(); }
   else if (state.tab === 'settings') c.innerHTML = renderSettingsTab();
+  if (focusPreserve){
+    const el = document.getElementById(focusPreserve.id);
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')){
+      el.focus();
+      if (typeof focusPreserve.start === 'number' && el.setSelectionRange){
+        try { el.setSelectionRange(focusPreserve.start, focusPreserve.end); } catch(e){}
+      }
+    }
+  }
 }
 
 // Shows the Reservations panel and the Floor Plan panel side by side — same
@@ -2626,7 +2646,7 @@ function renderLoyaltyTab(){
     <div><h2 class="panel-title">Loyalty Members</h2><div class="panel-sub">${activeMembers.length} active members · $${mrr.toFixed(2)}/mo recurring · ${tierSummary}</div></div>
   </div>
   <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
-    <input type="text" class="search-input" style="margin:0;flex:1;min-width:200px" placeholder="Search by name…" value="${esc(_loyaltySearch)}" oninput="searchLoyalty(this.value)"/>
+    <input type="text" class="search-input" id="loyaltySearchInput" style="margin:0;flex:1;min-width:200px" placeholder="Search by name…" value="${esc(_loyaltySearch)}" oninput="searchLoyalty(this.value)"/>
     <select class="modal-select" style="margin:0;width:auto" onchange="filterLoyaltyStatus(this.value)">
       <option value="active" ${_loyaltyStatusFilter==='active'?'selected':''}>Active only</option>
       <option value="cancelled" ${_loyaltyStatusFilter==='cancelled'?'selected':''}>Cancelled only</option>
@@ -2662,7 +2682,7 @@ function renderGuestsTab(){
     <div><h2 class="panel-title">Guests</h2><div class="panel-sub">${state.guests.length} total guests on file</div></div>
     <button class="btn btn-primary" onclick="openGuestModal()">+ New Guest</button>
   </div>
-  <input type="text" class="search-input" placeholder="Search by name or phone…" value="${esc(_guestSearch)}" oninput="searchGuests(this.value)"/>
+  <input type="text" class="search-input" id="guestSearchInput" placeholder="Search by name or phone…" value="${esc(_guestSearch)}" oninput="searchGuests(this.value)"/>
   ${items}`;
 }
 
@@ -3262,6 +3282,10 @@ function renderCheckDetail(check){
         ${canPay && balance > 0 ? `<button class="btn btn-sm btn-primary" onclick="openPaymentModal('${check.id}')">Take Payment</button>` : ''}
       </div>
     </div>
+    ${check.notes || canOrder ? `<div class="res-meta" style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:6px;padding:6px 10px;margin-bottom:8px;white-space:pre-line">
+      ${check.notes ? esc(check.notes) : '<span style="color:var(--gray)">No notes for this check.</span>'}
+      ${canOrder ? ` <span class="linkBtn" style="cursor:pointer" onclick="editCheckNotes('${check.id}')">${check.notes?'Edit':'+ Add note'}</span>` : ''}
+    </div>` : ''}
     ${autoFireStatus && autoFireStatus.remainingMin <= 3 ? `<div class="res-meta" style="background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:6px 10px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:10px">
       <span>🔥 Mains fire automatically in ${Math.ceil(autoFireStatus.remainingMin)} min${canOrder?'':' — apps are all delivered'}</span>
       ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="holdMainsLonger('${check.id}')">Hold longer</button>` : ''}
@@ -3340,12 +3364,59 @@ window.openNewCheckModal = function(){
     </div>`;
   document.getElementById('formModal').classList.remove('hidden');
 };
+// A table counts as "linked" to a guest when today's reservation list has that
+// table assigned to a reservation that's currently seated (best signal — the
+// party is physically there right now) or, failing that, confirmed/pending for
+// today (host forgot to tap Seat, or a walk-in got matched to a phone booking).
+// Seated reservations are preferred and, among those, the most recently seated
+// one wins, since a table can cycle through more than one party in a night.
+function findGuestForTable(tableId){
+  if (!tableId) return null;
+  const todays = state.reservations.filter(r => r.table_id === tableId && r.reservation_date === todayISO() && !['cancelled','no_show'].includes(r.status));
+  if (!todays.length) return null;
+  const seated = todays.filter(r => r.status === 'seated').sort((a,b) => (b.seated_at||'').localeCompare(a.seated_at||''));
+  const r = seated[0] || todays.find(r => ['confirmed','pending'].includes(r.status));
+  if (!r) return null;
+  const g = guestById(r.guest_id);
+  if (!g) return null;
+  return { reservation: r, guest: g };
+}
+// Builds the "heads up" summary a waiter needs at a glance — kept short and
+// scannable rather than a full guest-profile dump, since this lands straight
+// in the check's notes the moment the ticket opens.
+function buildGuestInfoNote(guest, reservation){
+  const lines = [];
+  const member = activeLoyaltyMember(guest.id);
+  const memberTierName = member ? (member.locked_tier_name || loyaltyTierByKey(member.tier_key)?.name || member.tier_key) : null;
+  lines.push(`👤 ${guestName(guest)}${guest.vip ? ' ⭐ VIP' : ''}${memberTierName ? ' · 💳 '+memberTierName+' member' : ''}`);
+  if (guest.allergies) lines.push(`⚠️ Allergy/dietary: ${guest.allergies}`);
+  if (reservation?.occasion) lines.push(`🎉 Occasion: ${reservation.occasion}`);
+  if (reservation?.special_requests) lines.push(`📌 Special request: ${reservation.special_requests}`);
+  if (guest.notes) lines.push(`📝 ${guest.notes}`);
+  if ((guest.tags||[]).length) lines.push(`🏷️ ${guest.tags.join(', ')}`);
+  return lines.join('\n');
+}
 window.createCheck = async function(){
   const label = document.getElementById('ncLabel').value.trim() || null;
-  const { data, error } = await sb.from('checks').insert({ table_id: state.ordersActiveTableId, server_id: currentStaff.id, guest_label: label }).select().single();
+  const match = findGuestForTable(state.ordersActiveTableId);
+  const payload = { table_id: state.ordersActiveTableId, server_id: currentStaff.id, guest_label: label };
+  if (match){
+    payload.reservation_id = match.reservation.id;
+    payload.notes = buildGuestInfoNote(match.guest, match.reservation);
+    if (!label) payload.guest_label = guestName(match.guest);
+  }
+  const { data, error } = await sb.from('checks').insert(payload).select().single();
   if (error){ alert('Error: '+error.message); return; }
   closeModal('formModal');
   state.ordersActiveCheckId = data.id;
+  await loadOrdersData();
+};
+window.editCheckNotes = async function(checkId){
+  const check = state.checks.find(c=>c.id===checkId);
+  const notes = prompt('Notes for this check (visible to staff working this table):', check?.notes || '');
+  if (notes === null) return;
+  const { error } = await sb.from('checks').update({ notes: notes.trim() || null }).eq('id', checkId);
+  if (error){ alert('Error: '+error.message); return; }
   await loadOrdersData();
 };
 // Only reachable when the check has never had an item rung onto it (button is hidden
