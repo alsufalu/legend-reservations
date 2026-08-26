@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.84';
+const APP_VERSION = '1.86';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -599,7 +599,89 @@ window.addEventListener('DOMContentLoaded', () => {
       sb.auth.refreshSession().catch(()=>{});
     }
   });
+  // Any interaction on a shared terminal resets its auto-lock countdown — see
+  // the SHARED TERMINAL LOCK section below for what happens when it fires.
+  ['click','keydown','touchstart'].forEach(evt => document.addEventListener(evt, resetTerminalIdleTimer, { passive: true }));
 });
+
+// ============================================================================
+// SHARED TERMINAL LOCK — PIN-based active-operator switching
+// ============================================================================
+// A device flagged as a clock-in terminal (Settings → Clock Terminals) sits in
+// a public area of the restaurant and gets used by whichever waiter is
+// nearest — not just whoever's Supabase account happens to be signed into the
+// browser. Rather than requiring a full sign-out/sign-in for every handoff,
+// the terminal instead "locks" behind a PIN screen — the same PIN staff
+// already use for clock-in and manager approvals — and swaps the app's
+// notion of currentStaff to whoever just unlocked it. From that point on,
+// that's who gets stamped as server_id/added_by on new checks and items,
+// until the terminal locks again (idle for a minute, or tapped to lock).
+// This intentionally does NOT swap the underlying Supabase Auth session —
+// auth.uid() stays whatever account the terminal itself is signed into. That
+// works cleanly as long as the terminal's real login is the admin account,
+// since is_admin() already bypasses the "server_id must match auth.uid()"
+// check in RLS. It would NOT work correctly if a non-admin account were the
+// terminal's underlying login — RLS would reject writes attributed to a
+// different staff member in that case.
+let terminalLocked = false;
+let _terminalIdleTimer = null;
+function isSharedTerminalDevice(){
+  const token = localStorage.getItem(TERMINAL_TOKEN_KEY);
+  return !!(token && state.clockTerminals?.some(t => t.device_token === token && t.active));
+}
+function resetTerminalIdleTimer(){
+  if (!isSharedTerminalDevice() || terminalLocked) return;
+  clearTimeout(_terminalIdleTimer);
+  _terminalIdleTimer = setTimeout(() => window.lockTerminalNow(), 60000);
+}
+window.lockTerminalNow = function(){
+  if (!isSharedTerminalDevice() || terminalLocked) return;
+  terminalLocked = true;
+  clearTimeout(_terminalIdleTimer);
+  showTerminalLockOverlay();
+};
+function showTerminalLockOverlay(){
+  const sel = document.getElementById('lockEmployee');
+  if (sel){
+    const eligible = state.staffList.filter(s => s.active && staffHasPermission(s.id, 'take_orders'));
+    sel.innerHTML = eligible.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('') || '<option value="">No eligible staff found</option>';
+  }
+  const pinEl = document.getElementById('lockPin');
+  if (pinEl) pinEl.value = '';
+  const errEl = document.getElementById('lockError');
+  if (errEl) errEl.textContent = '';
+  document.getElementById('terminalLockOverlay')?.classList.remove('hidden');
+}
+window.unlockTerminal = async function(){
+  const staffId = document.getElementById('lockEmployee')?.value;
+  const pin = document.getElementById('lockPin')?.value;
+  const errEl = document.getElementById('lockError');
+  if (!staffId){ if (errEl) errEl.textContent = 'Select your name.'; return; }
+  if (!pin){ if (errEl) errEl.textContent = 'Enter your PIN.'; return; }
+  const { data: ok, error } = await sb.rpc('verify_staff_pin', { target_staff_id: staffId, pin });
+  if (error || !ok){ if (errEl) errEl.textContent = 'Incorrect PIN.'; return; }
+  const staffRow = state.staffList.find(s => s.id === staffId);
+  if (!staffRow){ if (errEl) errEl.textContent = 'Could not find that staff record — try again.'; return; }
+  currentStaff = staffRow;
+  computeMyPermissions();
+  document.getElementById('topbarName').textContent = currentStaff.name || currentUser.email.split('@')[0];
+  terminalLocked = false;
+  document.getElementById('terminalLockOverlay')?.classList.add('hidden');
+  resetTerminalIdleTimer();
+  render();
+};
+// Called once on sign-in (after loadAll, so clockTerminals/staffList are loaded) — a shared
+// terminal always boots locked, regardless of who the underlying browser session belongs to.
+function initTerminalLock(){
+  const btn = document.getElementById('lockNowBtn');
+  if (!isSharedTerminalDevice()){
+    btn?.classList.add('hidden');
+    return;
+  }
+  btn?.classList.remove('hidden');
+  terminalLocked = true;
+  showTerminalLockOverlay();
+}
 
 window.switchAuthTab = function(mode){
   _authMode = mode;
@@ -709,6 +791,7 @@ async function onSignedIn(){
   }
 
   render();
+  initTerminalLock();
   startKdsPolling();
   startMessagePolling();
   startCourseAutoFirePolling();
@@ -3302,7 +3385,8 @@ function renderCheckDetail(check){
           const removable = ci.status==='open' || ci.status==='held';
           const compable = !removable;
           const naturalCourse = state.menuItems.find(m=>m.id===ci.menu_item_id)?.course || null;
-          const overridden = naturalCourse>=2 && ci.course===1;
+          const overridden = naturalCourse>=2 && ci.course===1; // main reclassified to fire early with apps
+          const heldToMains = naturalCourse===1 && ci.course>=2; // app reclassified to hold and fire with mains instead
           let courseToggleHtml = '';
           if (naturalCourse>=2 && ci.course>=2 && removable){
             courseToggleHtml = `<span class="linkBtn" style="cursor:pointer" onclick="fireItemWithApps('${ci.id}')">Fire with apps</span>`;
@@ -3310,6 +3394,12 @@ function renderCheckDetail(check){
             courseToggleHtml = `<span class="linkBtn" style="cursor:pointer" onclick="undoFireWithApps('${ci.id}')">Undo — hold with mains</span>`;
           } else if (overridden){
             courseToggleHtml = `<span style="color:var(--gray)">Fired with apps</span>`;
+          } else if (naturalCourse===1 && ci.course===1 && ci.status==='open'){
+            courseToggleHtml = `<span class="linkBtn" style="cursor:pointer" onclick="holdItemWithMains('${ci.id}')">Hold with mains</span>`;
+          } else if (heldToMains && ci.status==='open'){
+            courseToggleHtml = `<span class="linkBtn" style="cursor:pointer" onclick="undoHoldWithMains('${ci.id}')">Undo — fire with apps</span>`;
+          } else if (heldToMains){
+            courseToggleHtml = `<span style="color:var(--gray)">Held with mains</span>`;
           }
           return `<tr>
           <td>${ci.quantity}</td>
@@ -3601,6 +3691,24 @@ window.undoFireWithApps = async function(checkItemId){
   if (!ci) return;
   const naturalCourse = state.menuItems.find(m=>m.id===ci.menu_item_id)?.course || null;
   const { error } = await sb.from('check_items').update({ course: naturalCourse }).eq('id', checkItemId);
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+};
+// The mirror case: customer wants an appetizer served AS a main, so it should
+// come out with the mains rather than firing right away with the other apps.
+// Bumping its course to 2 puts it in the same "held until mains release"
+// bucket as real mains once the check is fired — see fireCheck's grouping.
+// Only offered pre-fire (status still 'open'); once it's gone out there's
+// nothing left to hold back.
+window.holdItemWithMains = async function(checkItemId){
+  const { error } = await sb.from('check_items').update({ course: 2 }).eq('id', checkItemId);
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+};
+// Reverts "Hold with mains" back to firing with the apps like a normal appetizer —
+// only offered while the item is still 'open' (unsent).
+window.undoHoldWithMains = async function(checkItemId){
+  const { error } = await sb.from('check_items').update({ course: 1 }).eq('id', checkItemId);
   if (error){ alert('Error: '+error.message); return; }
   await loadOrdersData();
 };
