@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.74';
+const APP_VERSION = '1.76';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -708,7 +708,7 @@ async function loadAll(){
       sb.from('table_combo_members').select('*'),
       sb.from('guests').select('*').order('last_name'),
       sb.from('waitlist').select('*').eq('status','waiting').order('added_at'),
-      sb.from('staff').select('*').order('created_at'),
+      sb.rpc('staff_directory'),
       sb.from('server_roster').select('*').order('name'),
       sb.from('service_periods').select('*').order('start_time'),
       sb.from('reservations').select('*').eq('reservation_date', state.selectedDate).order('reservation_time'),
@@ -768,6 +768,11 @@ async function loadAll(){
     state.menuItemModifierGroups = mimgRes.data || [];
     if (!state.currentAreaId) state.currentAreaId = '__all';
     computeMyPermissions();
+    // The batch load above only pulls the safe staff_directory() columns (id/name/role/active) —
+    // enough for approvals, messaging, and transfers. Admins/managers who can actually edit staff
+    // (Settings > Staff Access) need the full row (email/phone/address), which RLS now allows for
+    // manage_staff_permissions holders — fetch it here rather than exposing it to everyone.
+    if (can('manage_staff_permissions')) await reloadStaffList();
     setStatus(statusEl, '☁ Synced', 'synced');
   } catch(e){
     setStatus(statusEl, '⚠ Offline', 'error');
@@ -3206,6 +3211,8 @@ function renderCheckDetail(check){
   const hasUnfired = items.some(ci => ci.status === 'open');
   const loyaltyMember = check.loyalty_member_id ? state.loyaltyMembers.find(m=>m.id===check.loyalty_member_id) : null;
   const loyaltyGuest = loyaltyMember ? state.guests.find(g=>g.id===loyaltyMember.guest_id) : null;
+  const cocktailsLeft = loyaltyMember ? cocktailsRemaining(loyaltyMember) : 0;
+  const canRedeemLoyalty = loyaltyMember && cocktailsLeft > 0 && can('apply_loyalty_payment');
   const hasLoyaltyDiscount = state.checkDiscounts.some(d=>d.check_id===check.id && d.type==='loyalty_discount');
   const discounts = state.checkDiscounts.filter(d=>d.check_id===check.id);
   const discountTotal = checkDiscountTotal(check.id, subtotal);
@@ -3228,22 +3235,25 @@ function renderCheckDetail(check){
     </div>
     <div class="panel-sub" style="margin-bottom:4px">Server: ${esc(state.staffList.find(s=>s.id===check.server_id)?.name || '?')}</div>
     <div class="panel-sub" style="margin-bottom:8px">
-      ${loyaltyGuest ? `💳 Linked: ${esc(loyaltyGuest.first_name)} ${esc(loyaltyGuest.last_name)} (${esc(loyaltyMember.locked_tier_name || state.loyaltyTiers.find(t=>t.key===loyaltyMember.tier_key)?.name || loyaltyMember.tier_key)})${(!hasLoyaltyDiscount && can('apply_loyalty_payment')) ? ` · <span class="linkBtn" style="cursor:pointer" onclick="applyLoyaltyDiscount('${check.id}')">Apply membership discount</span>` : ''}` : (canOrder ? `<span class="linkBtn" style="cursor:pointer" onclick="openLinkLoyaltyModal('${check.id}')">+ Link loyalty membership</span>` : '')}
+      ${loyaltyGuest ? `💳 Linked: ${esc(loyaltyGuest.first_name)} ${esc(loyaltyGuest.last_name)} (${esc(loyaltyMember.locked_tier_name || state.loyaltyTiers.find(t=>t.key===loyaltyMember.tier_key)?.name || loyaltyMember.tier_key)}) · 🍸 ${cocktailsLeft} free drink${cocktailsLeft===1?'':'s'} left this month${(!hasLoyaltyDiscount && can('apply_loyalty_payment')) ? ` · <span class="linkBtn" style="cursor:pointer" onclick="applyLoyaltyDiscount('${check.id}')">Apply membership discount</span>` : ''}` : (canOrder ? `<span class="linkBtn" style="cursor:pointer" onclick="openLinkLoyaltyModal('${check.id}')">+ Link loyalty membership</span>` : '')}
     </div>
     <table class="data-table">
       <thead><tr><th>Qty</th><th>Item</th><th>Modifiers</th><th>Status</th><th>Price</th><th></th></tr></thead>
       <tbody>
-        ${items.map(ci => `<tr>
+        ${items.map(ci => {
+          const miEligible = canRedeemLoyalty && state.menuItems.find(m=>m.id===ci.menu_item_id)?.loyalty_eligible;
+          return `<tr>
           <td>${ci.quantity}</td>
           <td>${esc(ci.name_snapshot)}${ci.notes?`<div class="panel-sub" style="margin:0">${esc(ci.notes)}</div>`:''}</td>
           <td>${(ci.modifiers||[]).map(m=>esc(m.name)).join(', ')}</td>
           <td><span class="badge badge-${ci.status==='ready'?'confirmed':ci.status==='delivered'?'confirmed':'pending'}">${ci.status==='ready'?'🔔 ready':esc(ci.status)}</span></td>
           <td>$${checkItemTotal(ci).toFixed(2)}</td>
-          <td>${ci.status==='open' && canOrder ? `<button class="btn btn-sm btn-danger" onclick="removeCheckItem('${ci.id}')">Remove</button>` : ''}${ci.status!=='open' && canOrder ? `<button class="btn btn-sm btn-danger" onclick="compCheckItem('${ci.id}')">Comp</button>` : ''}</td>
-        </tr>`).join('') || `<tr><td colspan="6"><span class="panel-sub">No items yet.</span></td></tr>`}
+          <td style="white-space:nowrap">${ci.status==='open' && canOrder ? `<button class="btn btn-sm btn-danger" onclick="removeCheckItem('${ci.id}')">Remove</button>` : ''}${ci.status!=='open' && canOrder ? `<button class="btn btn-sm btn-danger" onclick="compCheckItem('${ci.id}')">Comp</button>` : ''}${miEligible ? `<button class="btn btn-sm btn-secondary" onclick="redeemLoyaltyFreeItem('${ci.id}')">🍸 Free Drink</button>` : ''}</td>
+        </tr>`;
+        }).join('') || `<tr><td colspan="6"><span class="panel-sub">No items yet.</span></td></tr>`}
       </tbody>
     </table>
-    ${discounts.length ? `<div class="panel-sub" style="margin-top:8px">${discounts.map(d=>`${d.type==='comp_item'?'Comp':d.type==='loyalty_discount'?'Membership discount':'Discount'}: ${d.percent?d.percent+'%':'$'+Number(d.amount).toFixed(2)}${d.reason?' — '+esc(d.reason):''}`).join('<br>')}</div>` : ''}
+    ${discounts.length ? `<div class="panel-sub" style="margin-top:8px">${discounts.map(d=>`${d.type==='comp_item'?'Comp':d.type==='loyalty_discount'?'Membership discount':d.type==='loyalty_free_item'?'🍸 Free drink (membership)':'Discount'}: ${d.percent?d.percent+'%':'$'+Number(d.amount).toFixed(2)}${d.reason?' — '+esc(d.reason):''}`).join('<br>')}</div>` : ''}
     <div style="text-align:right;padding-top:8px">
       <div>Subtotal: $${subtotal.toFixed(2)}</div>
       ${discountTotal ? `<div>Discounts: -$${discountTotal.toFixed(2)}</div>` : ''}
@@ -3528,6 +3538,22 @@ window.compCheckItem = function(checkItemId){
     closeModal('formModal');
     await loadOrdersData();
   });
+};
+window.redeemLoyaltyFreeItem = async function(checkItemId){
+  const ci = state.checkItems.find(x=>x.id===checkItemId);
+  if (!ci) return;
+  const check = state.checks.find(c=>c.id===ci.check_id);
+  const member = check?.loyalty_member_id ? state.loyaltyMembers.find(m=>m.id===check.loyalty_member_id) : null;
+  if (!member){ alert('No membership linked to this check.'); return; }
+  const remaining = cocktailsRemaining(member);
+  if (remaining <= 0){ alert('This member has no free drinks remaining this month.'); return; }
+  if (!confirm(`Redeem 1 free drink for "${ci.name_snapshot}"? (${remaining} of ${lockedCocktailsPerMonth(member)} left this month)`)) return;
+  const { error } = await sb.rpc('redeem_loyalty_free_item', {
+    p_check_id: ci.check_id, p_check_item_id: ci.id, p_loyalty_member_id: member.id, p_amount: checkItemTotal(ci),
+  });
+  if (error){ alert('Error: '+error.message); return; }
+  await reloadLoyaltyMembers();
+  await loadOrdersData();
 };
 window.openDiscretionaryDiscountModal = function(checkId){
   const box = document.getElementById('formModalBox');
@@ -4766,6 +4792,9 @@ window.openMenuItemModal = function(itemId){
     </div>
     <label class="field-label">Description (optional)</label>
     <input type="text" class="modal-input" id="miDesc" value="${it?esc(it.description||''):''}"/>
+    <label class="field-label" style="display:flex;align-items:center;gap:6px;margin-top:10px">
+      <input type="checkbox" id="miLoyaltyEligible" ${it?.loyalty_eligible?'checked':''}/> Counts toward membership free drink
+    </label>
     ${canCost ? `
     <label class="field-label">Recipe / Ingredient Costing</label>
     <div id="miRecipeRows" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px">
@@ -4794,12 +4823,13 @@ window.saveMenuItem = async function(itemId){
   const price = parseFloat(document.getElementById('miPrice').value) || 0;
   const active = document.getElementById('miActive').checked;
   const description = document.getElementById('miDesc').value.trim() || null;
+  const loyalty_eligible = document.getElementById('miLoyaltyEligible').checked;
   let id = itemId;
   if (id){
-    const { error } = await sb.from('menu_items').update({ name, category_id, ticket_destination_id, price, active, description }).eq('id', id);
+    const { error } = await sb.from('menu_items').update({ name, category_id, ticket_destination_id, price, active, description, loyalty_eligible }).eq('id', id);
     if (error){ alert('Error: '+error.message); return; }
   } else {
-    const { data, error } = await sb.from('menu_items').insert({ name, category_id, ticket_destination_id, price, active, description, sort_order: state.menuItems.length }).select().single();
+    const { data, error } = await sb.from('menu_items').insert({ name, category_id, ticket_destination_id, price, active, description, loyalty_eligible, sort_order: state.menuItems.length }).select().single();
     if (error){ alert('Error: '+error.message); return; }
     id = data.id;
   }
