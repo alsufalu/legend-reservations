@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.73';
+const APP_VERSION = '1.74';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -129,7 +129,7 @@ let state = {
   staffGroups: [], staffGroupMembers: [], messageThreads: [], threadParticipants: [], messages: [], shiftSwapRequests: [],
   ticketDestinations: [], ingredientCategories: [], ingredients: [], menuCategories: [], menuItems: [],
   itemIngredients: [], modifierGroups: [], modifierOptions: [], menuItemModifierGroups: [],
-  checks: [], checkItems: [], ordersActiveTableId: null, ordersActiveCheckId: null,
+  checks: [], checkItems: [], ordersActiveTableId: null, ordersActiveCheckId: null, ordersCollapsedAreas: [],
   checkDiscounts: [], payments: [],
   vendors: [], purchaseOrders: [], purchaseOrderItems: [],
 };
@@ -3151,16 +3151,27 @@ function renderOrdersTab(){
   </div>
   <div style="display:flex;gap:16px;align-items:flex-start">
     <div class="card" style="flex:0 0 240px;max-height:75vh;overflow-y:auto">
-      ${Object.keys(grouped).map(areaName => `
-        <div class="panel-sub" style="margin:10px 0 4px;font-weight:600">${esc(areaName)}</div>
-        ${grouped[areaName].map(t => {
+      ${Object.keys(grouped).length ? `<div style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:4px">
+        <span class="linkBtn" style="cursor:pointer;font-size:12px" onclick='setOrdersAreasCollapsed(${JSON.stringify(Object.keys(grouped))})'>Collapse all</span>
+        <span class="linkBtn" style="cursor:pointer;font-size:12px" onclick="setOrdersAreasCollapsed([])">Expand all</span>
+      </div>` : ''}
+      ${Object.keys(grouped).map(areaName => {
+        const collapsed = state.ordersCollapsedAreas.includes(areaName);
+        const zoneCheckCount = grouped[areaName].reduce((s,t)=>s+state.checks.filter(c=>c.status==='open' && c.table_id===t.id).length, 0);
+        return `
+        <div class="panel-sub" style="margin:10px 0 4px;font-weight:600;display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick='toggleOrdersAreaCollapse(${JSON.stringify(areaName)})'>
+          <span>${collapsed?'▸':'▾'} ${esc(areaName)}</span>
+          ${collapsed && zoneCheckCount ? `<span class="badge badge-pending">${zoneCheckCount} check${zoneCheckCount>1?'s':''}</span>` : ''}
+        </div>
+        ${collapsed ? '' : grouped[areaName].map(t => {
           const count = state.checks.filter(c=>c.status==='open' && c.table_id===t.id).length;
           return `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:5px 6px;cursor:pointer;border-radius:6px;${state.ordersActiveTableId===t.id?'background:#eef2ff':''}" onclick="selectOrdersTable('${t.id}')">
             <span>${esc(t.label)}</span>
             ${count?`<span class="badge badge-pending">${count} check${count>1?'s':''}</span>`:''}
           </div>`;
         }).join('')}
-      `).join('') || '<div class="panel-sub">No tables set up yet.</div>'}
+      `;
+      }).join('') || '<div class="panel-sub">No tables set up yet.</div>'}
     </div>
 
     <div style="flex:1;min-width:0">
@@ -3242,6 +3253,16 @@ function renderCheckDetail(check){
     ${payments.length ? `<div class="panel-sub" style="margin-top:8px">${payments.map(p=>`${esc(p.method)} $${Number(p.amount).toFixed(2)}${p.tip_amount?' + $'+Number(p.tip_amount).toFixed(2)+' tip':''}${p.status!=='completed'?' ('+esc(p.status)+')':''}`).join('<br>')}</div>` : ''}
   </div>`;
 }
+window.toggleOrdersAreaCollapse = function(areaName){
+  const i = state.ordersCollapsedAreas.indexOf(areaName);
+  if (i === -1) state.ordersCollapsedAreas.push(areaName);
+  else state.ordersCollapsedAreas.splice(i, 1);
+  render();
+};
+window.setOrdersAreasCollapsed = function(areaNames){
+  state.ordersCollapsedAreas = areaNames;
+  render();
+};
 window.selectOrdersTable = function(tableId){
   state.ordersActiveTableId = tableId;
   const firstOpen = state.checks.find(c=>c.status==='open' && c.table_id===tableId);
