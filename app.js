@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.86';
+const APP_VERSION = '1.87';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -4366,7 +4366,16 @@ function renderScheduleTab(){
   const myShifts = state.scheduleShifts.filter(s => s.staff_id === currentStaff.id && s.published && s.shift_date >= todayISO()).slice(0,10);
   const myTimeOff = state.timeOffRequests.filter(r => r.staff_id === currentStaff.id);
 
-  const clockCard = can('clock_in_out') ? `
+  const thisDeviceToken = localStorage.getItem(TERMINAL_TOKEN_KEY);
+  const thisDeviceIsTerminal = thisDeviceToken && state.clockTerminals.some(t => t.device_token === thisDeviceToken && t.active);
+  // On a shared terminal, currentStaff is whoever PIN-unlocked the screen (see the
+  // terminal-lock feature) — not the identity actually behind this browser's Supabase
+  // session. The plain Clock In/Out button below calls punch_clock_in/out, which stamps
+  // auth.uid() (the real underlying session) rather than currentStaff, so on a shared
+  // terminal it would silently clock in the WRONG person. Hide it there entirely and
+  // rely on the PIN-verified kiosk card instead, which stamps whichever staff id the PIN
+  // actually belongs to regardless of the browser's own session.
+  const clockCard = (can('clock_in_out') && !thisDeviceIsTerminal) ? `
   <div class="section-heading">Time Clock</div>
   <div class="card">
     ${myOpenEntry
@@ -4376,16 +4385,18 @@ function renderScheduleTab(){
          <div class="modal-actions" style="padding-top:0;justify-content:flex-start"><button class="btn btn-primary" onclick="clockIn()">Clock In</button></div>`}
   </div>` : '';
 
-  const thisDeviceToken = localStorage.getItem(TERMINAL_TOKEN_KEY);
-  const thisDeviceIsTerminal = thisDeviceToken && state.clockTerminals.some(t => t.device_token === thisDeviceToken && t.active);
   const kioskEligibleStaff = state.staffList.filter(s => s.active && staffHasPermission(s.id, 'clock_in_out'));
-  const kioskFirstOpen = kioskEligibleStaff.length && state.timeClockEntries.some(e => e.staff_id === kioskEligibleStaff[0].id && !e.clock_out_at);
+  // Default the picker to whoever's currently PIN-active on this terminal (if they're
+  // clock-eligible) instead of just the first name alphabetically — on a shared terminal
+  // that's almost always who actually walked up to punch in.
+  const kioskDefaultId = kioskEligibleStaff.some(s => s.id === currentStaff.id) ? currentStaff.id : kioskEligibleStaff[0]?.id;
+  const kioskFirstOpen = kioskDefaultId && state.timeClockEntries.some(e => e.staff_id === kioskDefaultId && !e.clock_out_at);
   const kioskCard = thisDeviceIsTerminal ? `
   <div class="section-heading">Staff Time Clock (This Terminal)</div>
   <div class="card">
     <div class="panel-sub" style="margin-bottom:10px">This device is a registered clock-in terminal — anyone can use it to punch themselves in or out here, no matter whose account is signed into the browser. Pick your name and enter your own PIN.</div>
     <div class="formgrid">
-      <div><label class="field-label">Employee</label><select class="modal-select" id="kioskEmployee" onchange="kioskUpdateButtonLabel()">${kioskEligibleStaff.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select></div>
+      <div><label class="field-label">Employee</label><select class="modal-select" id="kioskEmployee" onchange="kioskUpdateButtonLabel()">${kioskEligibleStaff.map(s => `<option value="${s.id}" ${s.id===kioskDefaultId?'selected':''}>${esc(s.name)}</option>`).join('')}</select></div>
       <div><label class="field-label">PIN</label><input type="password" inputmode="numeric" maxlength="6" class="modal-input" id="kioskPin" placeholder="••••" onkeydown="if(event.key==='Enter')kioskPunch()"/></div>
     </div>
     <div class="modal-actions" style="padding-top:6px;justify-content:flex-start">
@@ -4837,6 +4848,10 @@ window.deleteClockTerminal = async function(id){
 };
 
 window.clockIn = async function(){
+  // punch_clock_in stamps auth.uid() (the real signed-in browser session), not
+  // currentStaff — wrong on a shared terminal where currentStaff may be a PIN-swapped
+  // operator. The Schedule tab already hides this button there; this is a backstop.
+  if (isSharedTerminalDevice()){ alert('Use the "Staff Time Clock (This Terminal)" section below to clock in on a shared terminal.'); return; }
   const pin = prompt('Enter your PIN to clock in:');
   if (!pin) return;
   const { data: ok, error: pinErr } = await sb.rpc('verify_staff_pin', { target_staff_id: currentStaff.id, pin });
@@ -4863,6 +4878,7 @@ window.clockIn = async function(){
 };
 
 window.clockOut = async function(){
+  if (isSharedTerminalDevice()){ alert('Use the "Staff Time Clock (This Terminal)" section below to clock out on a shared terminal.'); return; }
   const entry = state.timeClockEntries.find(e => e.staff_id === currentStaff.id && !e.clock_out_at);
   if (!entry){ alert("You're not clocked in."); return; }
   const pin = prompt('Enter your PIN to clock out:');
