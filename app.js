@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.80';
+const APP_VERSION = '1.82';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -125,7 +125,7 @@ let state = {
   loyaltyMembers: [],  // one row per enrolled guest (guests.id -> loyalty_members.guest_id)
   priorityHolidays: [], // dates where Founder's Circle gets the extended 14-day booking lead
   scheduleShifts: [], myPermissions: null, permissions: [], rolePermissions: [], staffOverrides: [],
-  timeClockEntries: [], timeOffRequests: [], clockTerminals: [],
+  timeClockEntries: [], timeOffRequests: [], clockTerminals: [], kitchenSettings: { course_hold_minutes: 12 },
   staffGroups: [], staffGroupMembers: [], messageThreads: [], threadParticipants: [], messages: [], shiftSwapRequests: [],
   ticketDestinations: [], ingredientCategories: [], ingredients: [], menuCategories: [], menuItems: [],
   itemIngredients: [], modifierGroups: [], modifierOptions: [], menuItemModifierGroups: [],
@@ -702,6 +702,7 @@ async function onSignedIn(){
   render();
   startKdsPolling();
   startMessagePolling();
+  startCourseAutoFirePolling();
 }
 
 // ============================================================================
@@ -740,18 +741,20 @@ async function loadAll(){
       sb.from('modifier_options').select('*').order('sort_order'),
       sb.from('menu_item_modifier_groups').select('*'),
     ]);
-    const [vendorsRes, poRes, poItemsRes, terminalsRes, clockRes] = await Promise.all([
+    const [vendorsRes, poRes, poItemsRes, terminalsRes, clockRes, kitchenSettingsRes] = await Promise.all([
       sb.from('vendors').select('*').order('name'),
       sb.from('purchase_orders').select('*').order('created_at', { ascending: false }),
       sb.from('purchase_order_items').select('*'),
       sb.from('clock_terminals').select('*').order('created_at'),
       sb.from('time_clock_entries').select('*').order('clock_in_at', { ascending: false }).limit(300),
+      sb.from('kitchen_settings').select('*').eq('id', true).maybeSingle(),
     ]);
     state.vendors = vendorsRes.data || [];
     state.purchaseOrders = poRes.data || [];
     state.purchaseOrderItems = poItemsRes.data || [];
     state.clockTerminals = terminalsRes.data || [];
     state.timeClockEntries = clockRes.data || [];
+    state.kitchenSettings = kitchenSettingsRes.data || { course_hold_minutes: 12 };
     state.tables = tablesRes.data || [];
     state.areas = areasRes.data || [];
     if (fpRes.data) state.floorPlan = fpRes.data;
@@ -3217,11 +3220,13 @@ function renderOrdersTab(){
 }
 function renderCheckDetail(check){
   const items = state.checkItems.filter(ci => ci.check_id === check.id && ci.status !== 'voided');
+  const isEmpty = !state.checkItems.some(ci => ci.check_id === check.id);
   const subtotal = items.reduce((s,ci)=>s+checkItemTotal(ci), 0);
   const canOrder = can('take_orders');
   const canPay = can('take_payment');
   const hasUnfired = items.some(ci => ci.status === 'open');
   const hasHeld = items.some(ci => ci.status === 'held');
+  const autoFireStatus = hasHeld ? courseAutoFireStatus(check) : null;
   const loyaltyMember = check.loyalty_member_id ? state.loyaltyMembers.find(m=>m.id===check.loyalty_member_id) : null;
   const loyaltyGuest = loyaltyMember ? state.guests.find(g=>g.id===loyaltyMember.guest_id) : null;
   const cocktailsLeft = loyaltyMember ? cocktailsRemaining(loyaltyMember) : 0;
@@ -3244,9 +3249,14 @@ function renderCheckDetail(check){
         ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="openSplitCheckModal('${check.id}')">Split</button>` : ''}
         ${(canOrder||canPay) ? `<button class="btn btn-sm btn-secondary" onclick="openDiscretionaryDiscountModal('${check.id}')">Discount</button>` : ''}
         ${(canOrder||canPay) ? `<button class="btn btn-sm btn-secondary" onclick="openTransferCheckModal('${check.id}')">Transfer</button>` : ''}
+        ${canOrder && isEmpty ? `<button class="btn btn-sm btn-danger" onclick="deleteEmptyCheck('${check.id}')">Delete Check</button>` : ''}
         ${canPay && balance > 0 ? `<button class="btn btn-sm btn-primary" onclick="openPaymentModal('${check.id}')">Take Payment</button>` : ''}
       </div>
     </div>
+    ${autoFireStatus && autoFireStatus.remainingMin <= 3 ? `<div class="res-meta" style="background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:6px 10px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:10px">
+      <span>🔥 Mains fire automatically in ${Math.ceil(autoFireStatus.remainingMin)} min${canOrder?'':' — apps are all delivered'}</span>
+      ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="holdMainsLonger('${check.id}')">Hold longer</button>` : ''}
+    </div>` : ''}
     <div class="panel-sub" style="margin-bottom:4px">Server: ${esc(state.staffList.find(s=>s.id===check.server_id)?.name || '?')}</div>
     <div class="panel-sub" style="margin-bottom:8px">
       ${loyaltyGuest ? `💳 Linked: ${esc(loyaltyGuest.first_name)} ${esc(loyaltyGuest.last_name)} (${esc(loyaltyMember.locked_tier_name || state.loyaltyTiers.find(t=>t.key===loyaltyMember.tier_key)?.name || loyaltyMember.tier_key)}) · 🍸 ${cocktailsLeft} free drink${cocktailsLeft===1?'':'s'} left this month${(!hasLoyaltyDiscount && can('apply_loyalty_payment')) ? ` · <span class="linkBtn" style="cursor:pointer" onclick="applyLoyaltyDiscount('${check.id}')">Apply membership discount</span>` : ''}` : (canOrder ? `<span class="linkBtn" style="cursor:pointer" onclick="openLinkLoyaltyModal('${check.id}')">+ Link loyalty membership</span>` : '')}
@@ -3327,6 +3337,16 @@ window.createCheck = async function(){
   if (error){ alert('Error: '+error.message); return; }
   closeModal('formModal');
   state.ordersActiveCheckId = data.id;
+  await loadOrdersData();
+};
+// Only reachable when the check has never had an item rung onto it (button is hidden
+// otherwise) — RLS double-checks the same thing server-side, so this can't be used to
+// quietly make a real order disappear.
+window.deleteEmptyCheck = async function(checkId){
+  if (!confirm('Delete this check? This can\'t be undone.')) return;
+  const { error } = await sb.from('checks').delete().eq('id', checkId);
+  if (error){ alert('Error: '+error.message); return; }
+  if (state.ordersActiveCheckId === checkId) state.ordersActiveCheckId = null;
   await loadOrdersData();
 };
 window.openTransferCheckModal = function(checkId){
@@ -3470,6 +3490,15 @@ window.fireCheck = async function(checkId){
 };
 window.releaseHeldCourse = async function(checkId){
   const { error } = await sb.from('check_items').update({ status: 'fired', fired_at: new Date().toISOString() }).eq('check_id', checkId).eq('status', 'held');
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+};
+// Pushes the course auto-fire deadline back by another full hold window from right now —
+// for the table that's clearly still working through apps when the warning banner shows up.
+window.holdMainsLonger = async function(checkId){
+  const holdMin = state.kitchenSettings?.course_hold_minutes || 12;
+  const until = new Date(Date.now() + holdMin*60000).toISOString();
+  const { error } = await sb.from('checks').update({ course_hold_snoozed_until: until }).eq('id', checkId);
   if (error){ alert('Error: '+error.message); return; }
   await loadOrdersData();
 };
@@ -3896,6 +3925,62 @@ function startMessagePolling(){
   }, 8000);
 }
 function stopMessagePolling(){ if (_msgPollInterval){ clearInterval(_msgPollInterval); _msgPollInterval = null; } }
+
+// ============================================================================
+// COURSE AUTO-FIRE SAFETY NET — runs in the background regardless of which tab
+// is open (a forgotten "Send Mains to Kitchen" click is exactly the kind of
+// thing that happens on a busy floor, not just when someone's staring at the
+// screen). Once every course-1 (appetizer) item on a check has been delivered,
+// a countdown starts; if nobody has released the held course-2+ items by the
+// time it expires, they fire automatically. A check-level snooze
+// (course_hold_snoozed_until) lets staff explicitly push the deadline back
+// instead of just getting overridden.
+// ============================================================================
+let _courseAutoFireInterval = null;
+function startCourseAutoFirePolling(){
+  stopCourseAutoFirePolling();
+  _courseAutoFireInterval = setInterval(checkCourseAutoFire, 30000);
+}
+function stopCourseAutoFirePolling(){ if (_courseAutoFireInterval){ clearInterval(_courseAutoFireInterval); _courseAutoFireInterval = null; } }
+async function checkCourseAutoFire(){
+  const holdMin = state.kitchenSettings?.course_hold_minutes || 12;
+  const { data: held } = await sb.from('check_items').select('id,check_id').eq('status','held');
+  if (!held || !held.length) return;
+  const checkIds = [...new Set(held.map(h=>h.check_id))];
+  const [{ data: appItems }, { data: checksRows }] = await Promise.all([
+    sb.from('check_items').select('check_id,status,delivered_at').in('check_id', checkIds).eq('course', 1).neq('status','voided'),
+    sb.from('checks').select('id,course_hold_snoozed_until').in('id', checkIds),
+  ]);
+  const now = getNow();
+  const readyCheckIds = checkIds.filter(cid => {
+    const snoozedUntil = checksRows?.find(c=>c.id===cid)?.course_hold_snoozed_until;
+    if (snoozedUntil && new Date(snoozedUntil).getTime() > now.getTime()) return false;
+    const apps = (appItems||[]).filter(a=>a.check_id===cid);
+    if (!apps.length || !apps.every(a=>a.status==='delivered')) return false;
+    const latest = apps.map(a=>a.delivered_at).filter(Boolean).sort().slice(-1)[0];
+    if (!latest) return false;
+    return (now.getTime() - new Date(latest).getTime())/60000 >= holdMin;
+  });
+  if (!readyCheckIds.length) return;
+  const heldIdsToFire = held.filter(h=>readyCheckIds.includes(h.check_id)).map(h=>h.id);
+  await sb.from('check_items').update({ status:'fired', fired_at: new Date().toISOString() }).in('id', heldIdsToFire);
+  if (['orders','kitchen','expo'].includes(state.tab)) await loadOrdersData();
+}
+// Latest-delivered appetizer time + remaining minutes for a check's held mains, or null if
+// there's nothing to time (no held items, apps not all delivered yet, or actively snoozed).
+// Shared by the warning banner on the check detail view.
+function courseAutoFireStatus(check){
+  const holdMin = state.kitchenSettings?.course_hold_minutes || 12;
+  if (check.course_hold_snoozed_until && new Date(check.course_hold_snoozed_until).getTime() > getNow().getTime()) return null;
+  const items = state.checkItems.filter(ci => ci.check_id === check.id);
+  if (!items.some(ci => ci.status === 'held')) return null;
+  const apps = items.filter(ci => ci.course === 1 && ci.status !== 'voided');
+  if (!apps.length || !apps.every(ci => ci.status === 'delivered')) return null;
+  const latest = apps.map(ci=>ci.delivered_at).filter(Boolean).sort().slice(-1)[0];
+  if (!latest) return null;
+  const elapsedMin = (getNow().getTime() - new Date(latest).getTime())/60000;
+  return { remainingMin: Math.max(0, holdMin - elapsedMin) };
+}
 function ticketElapsedMinutes(firedAt){
   if (!firedAt) return 0;
   return Math.max(0, Math.floor((getNow().getTime() - new Date(firedAt).getTime()) / 60000));
@@ -3915,6 +4000,14 @@ window.toggleKdsDestination = function(destId, visible){
   localStorage.setItem(KDS_HIDDEN_DESTINATIONS_KEY, JSON.stringify([...hidden]));
   render();
 };
+window.saveCourseHoldMinutes = async function(){
+  const val = parseInt(document.getElementById('courseHoldMinutes').value);
+  if (!val || val < 1){ alert('Enter a number of minutes.'); return; }
+  const { error } = await sb.from('kitchen_settings').update({ course_hold_minutes: val, updated_at: new Date().toISOString() }).eq('id', true);
+  if (error){ alert('Error: '+error.message); return; }
+  state.kitchenSettings.course_hold_minutes = val;
+  render();
+};
 function renderKitchenTab(){
   const allDestinations = state.ticketDestinations.filter(td=>td.active);
   const hidden = kdsHiddenDestinations();
@@ -3929,6 +4022,13 @@ function renderKitchenTab(){
         <input type="checkbox" ${hidden.has(td.id)?'':'checked'} onchange="toggleKdsDestination('${td.id}', this.checked)"/> ${esc(td.name)}
       </label>`).join('') || '<span class="panel-sub" style="margin:0">No ticket destinations set up yet.</span>'}
     </div>
+    ${can('manage_menu') ? `
+    <div style="margin-top:10px;display:flex;align-items:center;gap:8px">
+      <label class="field-label" style="margin:0">Auto-fire held mains after apps are delivered:</label>
+      <input type="number" min="1" step="1" class="modal-input" style="margin:0;width:70px" id="courseHoldMinutes" value="${state.kitchenSettings.course_hold_minutes}"/>
+      <span class="panel-sub" style="margin:0">min</span>
+      <button class="btn btn-secondary btn-sm" onclick="saveCourseHoldMinutes()">Save</button>
+    </div>` : ''}
   </div>
   <div style="display:flex;gap:14px;overflow-x:auto;padding-bottom:8px">
     ${destinations.map(td => {
