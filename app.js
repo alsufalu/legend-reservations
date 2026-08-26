@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.82';
+const APP_VERSION = '1.83';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -395,6 +395,15 @@ function tablesFittingParty(partySize, blockedAreaIds){
 function preferSingles(tables){
   const singles = tables.filter(t => !t.is_combo);
   return singles.length ? singles : tables;
+}
+// Same rule as preferSingles, but applied separately within each dining area.
+// A single table qualifying in one room (e.g. a 6-top on the Patio) should never
+// hide a table combination in a different room (e.g. M Dining Room) — the two
+// aren't real alternatives to each other since a party can only be in one place.
+function preferSinglesPerArea(tables){
+  const byArea = {};
+  tables.forEach(t => { (byArea[t.area_id] ||= []).push(t); });
+  return Object.values(byArea).flatMap(preferSingles);
 }
 
 // ---- Auto-Assign: suggest tables for every still-Unassigned reservation on a date ----
@@ -1438,7 +1447,7 @@ window.openSeatModal = function(id){
   const r = state.reservations.find(x => x.id === id);
   const physicallyFree = state.tables.filter(t => t.active && ['available','reserved'].includes(t.status));
   const capFits = t => r.party_size >= t.min_party && r.party_size <= Math.min(t.max_party, t.seats);
-  const fits = preferSingles(physicallyFree.filter(capFits));
+  const fits = preferSinglesPerArea(physicallyFree.filter(capFits));
   const tooSmallOrBig = physicallyFree.filter(t => !capFits(t));
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
@@ -1605,7 +1614,7 @@ window.refreshAvailability = async function(preserveSelection){
   const fitting = areaId ? fittingAll.filter(t => t.area_id === areaId) : fittingAll;
   const dateReservations = date ? await fetchDateReservations(date, excludeId) : [];
   const stillFree = new Set(simulateAvailability(dateReservations, time, duration, excludeId, blockedAreaIds).map(t => t.id));
-  const freeFitting = preferSingles(fitting.filter(t => stillFree.has(t.id)));
+  const freeFitting = preferSinglesPerArea(fitting.filter(t => stillFree.has(t.id)));
   const busyFitting = fitting.filter(t => !stillFree.has(t.id));
   const blockedAreaNames = state.areas.filter(a => blockedAreaIds.has(a.id)).map(a => a.name);
 
