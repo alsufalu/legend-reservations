@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.79';
+const APP_VERSION = '1.80';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -3258,9 +3258,19 @@ function renderCheckDetail(check){
           const miEligible = canRedeemLoyalty && state.menuItems.find(m=>m.id===ci.menu_item_id)?.loyalty_eligible;
           const removable = ci.status==='open' || ci.status==='held';
           const compable = !removable;
+          const naturalCourse = state.menuItems.find(m=>m.id===ci.menu_item_id)?.course || null;
+          const overridden = naturalCourse>=2 && ci.course===1;
+          let courseToggleHtml = '';
+          if (naturalCourse>=2 && ci.course>=2 && removable){
+            courseToggleHtml = `<span class="linkBtn" style="cursor:pointer" onclick="fireItemWithApps('${ci.id}')">Fire with apps</span>`;
+          } else if (overridden && ci.status==='open'){
+            courseToggleHtml = `<span class="linkBtn" style="cursor:pointer" onclick="undoFireWithApps('${ci.id}')">Undo — hold with mains</span>`;
+          } else if (overridden){
+            courseToggleHtml = `<span style="color:var(--gray)">Fired with apps</span>`;
+          }
           return `<tr>
           <td>${ci.quantity}</td>
-          <td>${esc(ci.name_snapshot)}${ci.notes?`<div class="panel-sub" style="margin:0">${esc(ci.notes)}</div>`:''}${(ci.course>=2 && removable) ? `<div class="panel-sub" style="margin:0"><span class="linkBtn" style="cursor:pointer" onclick="fireItemWithApps('${ci.id}')">Fire with apps</span></div>` : ''}</td>
+          <td>${esc(ci.name_snapshot)}${ci.notes?`<div class="panel-sub" style="margin:0">${esc(ci.notes)}</div>`:''}${courseToggleHtml ? `<div class="panel-sub" style="margin:0">${courseToggleHtml}</div>` : ''}</td>
           <td>${(ci.modifiers||[]).map(m=>esc(m.name)).join(', ')}</td>
           <td><span class="badge badge-${ci.status==='ready'?'confirmed':ci.status==='delivered'?'confirmed':'pending'}">${ci.status==='ready'?'🔔 ready':ci.status==='held'?'held (course 2)':esc(ci.status)}</span></td>
           <td>$${checkItemTotal(ci).toFixed(2)}</td>
@@ -3472,6 +3482,16 @@ window.fireItemWithApps = async function(checkItemId){
   if (!ci) return;
   const patch = ci.status === 'held' ? { course: 1, status: 'fired', fired_at: new Date().toISOString() } : { course: 1 };
   const { error } = await sb.from('check_items').update(patch).eq('id', checkItemId);
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+};
+// Reverts "Fire with apps" back to the item's normal course — only offered while the item is
+// still 'open' (unsent). Once it's actually been fired to the kitchen there's nothing to undo.
+window.undoFireWithApps = async function(checkItemId){
+  const ci = state.checkItems.find(x=>x.id===checkItemId);
+  if (!ci) return;
+  const naturalCourse = state.menuItems.find(m=>m.id===ci.menu_item_id)?.course || null;
+  const { error } = await sb.from('check_items').update({ course: naturalCourse }).eq('id', checkItemId);
   if (error){ alert('Error: '+error.message); return; }
   await loadOrdersData();
 };
