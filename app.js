@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.76';
+const APP_VERSION = '1.79';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -579,6 +579,17 @@ window.addEventListener('DOMContentLoaded', () => {
     if (session?.user && !currentUser){ currentUser = session.user; onSignedIn(); }
     if (event === 'SIGNED_OUT'){ location.reload(); }
   });
+  // Laptops/phones that sleep or sit backgrounded for hours can miss the library's
+  // normal auto-refresh timer, leaving a stale access token in place. The next request
+  // then goes out unauthenticated (Postgres sees it as the anon role) and fails with a
+  // confusing "permission denied for function ..." error instead of a clear sign-in
+  // prompt. Force a session refresh whenever the tab regains focus so this resolves
+  // itself silently before the person touches anything.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && currentUser){
+      sb.auth.refreshSession().catch(()=>{});
+    }
+  });
 });
 
 window.switchAuthTab = function(mode){
@@ -690,6 +701,7 @@ async function onSignedIn(){
 
   render();
   startKdsPolling();
+  startMessagePolling();
 }
 
 // ============================================================================
@@ -3209,6 +3221,7 @@ function renderCheckDetail(check){
   const canOrder = can('take_orders');
   const canPay = can('take_payment');
   const hasUnfired = items.some(ci => ci.status === 'open');
+  const hasHeld = items.some(ci => ci.status === 'held');
   const loyaltyMember = check.loyalty_member_id ? state.loyaltyMembers.find(m=>m.id===check.loyalty_member_id) : null;
   const loyaltyGuest = loyaltyMember ? state.guests.find(g=>g.id===loyaltyMember.guest_id) : null;
   const cocktailsLeft = loyaltyMember ? cocktailsRemaining(loyaltyMember) : 0;
@@ -3227,6 +3240,7 @@ function renderCheckDetail(check){
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="openItemPickerModal('${check.id}')">+ Add Items</button>` : ''}
         ${canOrder && hasUnfired ? `<button class="btn btn-sm btn-primary" onclick="fireCheck('${check.id}')">Send to Kitchen/Bar</button>` : ''}
+        ${canOrder && hasHeld ? `<button class="btn btn-sm btn-primary" onclick="releaseHeldCourse('${check.id}')">Send Mains to Kitchen</button>` : ''}
         ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="openSplitCheckModal('${check.id}')">Split</button>` : ''}
         ${(canOrder||canPay) ? `<button class="btn btn-sm btn-secondary" onclick="openDiscretionaryDiscountModal('${check.id}')">Discount</button>` : ''}
         ${(canOrder||canPay) ? `<button class="btn btn-sm btn-secondary" onclick="openTransferCheckModal('${check.id}')">Transfer</button>` : ''}
@@ -3242,13 +3256,15 @@ function renderCheckDetail(check){
       <tbody>
         ${items.map(ci => {
           const miEligible = canRedeemLoyalty && state.menuItems.find(m=>m.id===ci.menu_item_id)?.loyalty_eligible;
+          const removable = ci.status==='open' || ci.status==='held';
+          const compable = !removable;
           return `<tr>
           <td>${ci.quantity}</td>
-          <td>${esc(ci.name_snapshot)}${ci.notes?`<div class="panel-sub" style="margin:0">${esc(ci.notes)}</div>`:''}</td>
+          <td>${esc(ci.name_snapshot)}${ci.notes?`<div class="panel-sub" style="margin:0">${esc(ci.notes)}</div>`:''}${(ci.course>=2 && removable) ? `<div class="panel-sub" style="margin:0"><span class="linkBtn" style="cursor:pointer" onclick="fireItemWithApps('${ci.id}')">Fire with apps</span></div>` : ''}</td>
           <td>${(ci.modifiers||[]).map(m=>esc(m.name)).join(', ')}</td>
-          <td><span class="badge badge-${ci.status==='ready'?'confirmed':ci.status==='delivered'?'confirmed':'pending'}">${ci.status==='ready'?'🔔 ready':esc(ci.status)}</span></td>
+          <td><span class="badge badge-${ci.status==='ready'?'confirmed':ci.status==='delivered'?'confirmed':'pending'}">${ci.status==='ready'?'🔔 ready':ci.status==='held'?'held (course 2)':esc(ci.status)}</span></td>
           <td>$${checkItemTotal(ci).toFixed(2)}</td>
-          <td style="white-space:nowrap">${ci.status==='open' && canOrder ? `<button class="btn btn-sm btn-danger" onclick="removeCheckItem('${ci.id}')">Remove</button>` : ''}${ci.status!=='open' && canOrder ? `<button class="btn btn-sm btn-danger" onclick="compCheckItem('${ci.id}')">Comp</button>` : ''}${miEligible ? `<button class="btn btn-sm btn-secondary" onclick="redeemLoyaltyFreeItem('${ci.id}')">🍸 Free Drink</button>` : ''}</td>
+          <td style="white-space:nowrap">${removable && canOrder ? `<button class="btn btn-sm btn-danger" onclick="removeCheckItem('${ci.id}')">Remove</button>` : ''}${compable && canOrder ? `<button class="btn btn-sm btn-danger" onclick="compCheckItem('${ci.id}')">Comp</button>` : ''}${miEligible ? `<button class="btn btn-sm btn-secondary" onclick="redeemLoyaltyFreeItem('${ci.id}')">🍸 Free Drink</button>` : ''}</td>
         </tr>`;
         }).join('') || `<tr><td colspan="6"><span class="panel-sub">No items yet.</span></td></tr>`}
       </tbody>
@@ -3411,13 +3427,51 @@ async function addItemToCheck(checkId, itemId, modifiers, quantity, notes){
   const { error } = await sb.from('check_items').insert({
     check_id: checkId, menu_item_id: itemId, name_snapshot: it.name, price_snapshot: it.price,
     quantity, modifiers, notes, ticket_destination_id: it.ticket_destination_id, added_by: currentStaff.id,
+    course: it.course || null,
   });
   if (error){ alert('Error: '+error.message); return; }
   await loadOrdersData();
   openItemPickerModal(checkId); // stay in the picker so a server can add several items in a row
 }
+// Course firing: if the check has any appetizer-course item on it (fired or not), mains
+// (course 2+) get held back instead of firing immediately — the kitchen only sees them once
+// someone taps "Send Mains to Kitchen". A check with no apps at all has nothing to sequence
+// against, so everything just fires together like before.
 window.fireCheck = async function(checkId){
-  const { error } = await sb.from('check_items').update({ status: 'fired', fired_at: new Date().toISOString() }).eq('check_id', checkId).eq('status', 'open');
+  const openItems = state.checkItems.filter(ci => ci.check_id === checkId && ci.status === 'open');
+  const hasApps = state.checkItems.some(ci => ci.check_id === checkId && ci.status !== 'voided' && ci.course === 1);
+  const now = new Date().toISOString();
+  if (hasApps){
+    const toFireIds = openItems.filter(ci => !(ci.course >= 2)).map(ci=>ci.id);
+    const toHoldIds = openItems.filter(ci => ci.course >= 2).map(ci=>ci.id);
+    if (toFireIds.length){
+      const { error } = await sb.from('check_items').update({ status: 'fired', fired_at: now }).in('id', toFireIds);
+      if (error){ alert('Error: '+error.message); return; }
+    }
+    if (toHoldIds.length){
+      const { error } = await sb.from('check_items').update({ status: 'held' }).in('id', toHoldIds);
+      if (error){ alert('Error: '+error.message); return; }
+    }
+  } else {
+    const { error } = await sb.from('check_items').update({ status: 'fired', fired_at: now }).eq('check_id', checkId).eq('status', 'open');
+    if (error){ alert('Error: '+error.message); return; }
+  }
+  await loadOrdersData();
+};
+window.releaseHeldCourse = async function(checkId){
+  const { error } = await sb.from('check_items').update({ status: 'fired', fired_at: new Date().toISOString() }).eq('check_id', checkId).eq('status', 'held');
+  if (error){ alert('Error: '+error.message); return; }
+  await loadOrdersData();
+};
+// For the "customer wants their appetizer served as/with the main" case: reclassify a single
+// item to course 1 so it goes out with the apps rather than waiting. If the apps have already
+// been fired (this item is currently 'held'), fire it immediately instead of waiting on a
+// separate release click.
+window.fireItemWithApps = async function(checkItemId){
+  const ci = state.checkItems.find(x=>x.id===checkItemId);
+  if (!ci) return;
+  const patch = ci.status === 'held' ? { course: 1, status: 'fired', fired_at: new Date().toISOString() } : { course: 1 };
+  const { error } = await sb.from('check_items').update(patch).eq('id', checkItemId);
   if (error){ alert('Error: '+error.message); return; }
   await loadOrdersData();
 };
@@ -3793,15 +3847,69 @@ function startKdsPolling(){
   }, 15000);
 }
 function stopKdsPolling(){ if (_kdsPollInterval){ clearInterval(_kdsPollInterval); _kdsPollInterval = null; } }
+
+// ============================================================================
+// MESSAGES — same polling approach as the KDS above. Postgres Realtime isn't
+// wired up in this project (no tables in the realtime publication), so instead
+// of a persistent socket subscription, poll for new threads/messages every 8s
+// while the Schedule tab (where Messages lives) is on screen. Deliberately a
+// lighter query than loadScheduleData() — just the three messaging tables —
+// so it doesn't re-pull shifts/timecards/groups on every tick.
+// ============================================================================
+let _msgPollInterval = null;
+async function reloadMessagingData(){
+  const [threadsRes, participantsRes, messagesRes] = await Promise.all([
+    sb.from('message_threads').select('*').order('created_at', { ascending: false }),
+    sb.from('thread_participants').select('*'),
+    sb.from('messages').select('*').order('created_at', { ascending: false }).limit(300),
+  ]);
+  state.messageThreads = threadsRes.data || [];
+  state.threadParticipants = participantsRes.data || [];
+  state.messages = messagesRes.data || [];
+}
+function startMessagePolling(){
+  stopMessagePolling();
+  _msgPollInterval = setInterval(async () => {
+    if (state.tab !== 'schedule') return;
+    await reloadMessagingData();
+    render();
+  }, 8000);
+}
+function stopMessagePolling(){ if (_msgPollInterval){ clearInterval(_msgPollInterval); _msgPollInterval = null; } }
 function ticketElapsedMinutes(firedAt){
   if (!firedAt) return 0;
   return Math.max(0, Math.floor((getNow().getTime() - new Date(firedAt).getTime()) / 60000));
 }
+// Which ticket-destination columns this device shows on the Kitchen/Bar board — a display
+// preference for the physical screen sitting in that station, not a business setting, so it's
+// kept in localStorage per-device rather than the database. Kitchen doesn't want Main Bar/Secret
+// Bar tickets cluttering their screen and vice versa, but nothing stops any station from checking
+// every box to see the whole house if they want to.
+const KDS_HIDDEN_DESTINATIONS_KEY = 'legend_kds_hidden_destinations';
+function kdsHiddenDestinations(){
+  try { return new Set(JSON.parse(localStorage.getItem(KDS_HIDDEN_DESTINATIONS_KEY) || '[]')); } catch(e){ return new Set(); }
+}
+window.toggleKdsDestination = function(destId, visible){
+  const hidden = kdsHiddenDestinations();
+  if (visible) hidden.delete(destId); else hidden.add(destId);
+  localStorage.setItem(KDS_HIDDEN_DESTINATIONS_KEY, JSON.stringify([...hidden]));
+  render();
+};
 function renderKitchenTab(){
-  const destinations = state.ticketDestinations.filter(td=>td.active);
+  const allDestinations = state.ticketDestinations.filter(td=>td.active);
+  const hidden = kdsHiddenDestinations();
+  const destinations = allDestinations.filter(td => !hidden.has(td.id));
   const relevantItems = state.checkItems.filter(ci => ['fired','preparing','ready'].includes(ci.status));
   return `
   <div class="panel-header"><h2 class="panel-title">Kitchen &amp; Bar Tickets</h2></div>
+  <div class="card" style="margin-bottom:12px">
+    <div class="panel-sub" style="margin-bottom:6px">Show stations on this screen:</div>
+    <div style="display:flex;gap:16px;flex-wrap:wrap">
+      ${allDestinations.map(td => `<label style="display:flex;align-items:center;gap:6px;font-size:13px">
+        <input type="checkbox" ${hidden.has(td.id)?'':'checked'} onchange="toggleKdsDestination('${td.id}', this.checked)"/> ${esc(td.name)}
+      </label>`).join('') || '<span class="panel-sub" style="margin:0">No ticket destinations set up yet.</span>'}
+    </div>
+  </div>
   <div style="display:flex;gap:14px;overflow-x:auto;padding-bottom:8px">
     ${destinations.map(td => {
       const items = relevantItems.filter(ci => ci.ticket_destination_id === td.id);
@@ -3819,7 +3927,7 @@ function renderKitchenTab(){
           ${tickets.map(t => renderKitchenTicket(t)).join('') || '<div class="card"><div class="panel-sub" style="margin:0">No active tickets.</div></div>'}
         </div>
       </div>`;
-    }).join('') || '<div class="panel-sub">No ticket destinations set up yet — add them in Settings → Menu.</div>'}
+    }).join('') || `<div class="panel-sub">${allDestinations.length ? 'All stations are hidden on this screen — check a box above to show one.' : 'No ticket destinations set up yet — add them in Settings → Menu.'}</div>`}
   </div>`;
 }
 function renderKitchenTicket(t){
@@ -4795,6 +4903,14 @@ window.openMenuItemModal = function(itemId){
     <label class="field-label" style="display:flex;align-items:center;gap:6px;margin-top:10px">
       <input type="checkbox" id="miLoyaltyEligible" ${it?.loyalty_eligible?'checked':''}/> Counts toward membership free drink
     </label>
+    <label class="field-label" style="margin-top:10px">Course</label>
+    <select class="modal-select" id="miCourse">
+      <option value="" ${!it?.course?'selected':''}>No course — fires immediately</option>
+      <option value="1" ${it?.course===1?'selected':''}>1 — Appetizer (fires first)</option>
+      <option value="2" ${it?.course===2?'selected':''}>2 — Main (held until apps are fired)</option>
+      <option value="3" ${it?.course===3?'selected':''}>3 — Dessert (held until fired)</option>
+    </select>
+    <div class="panel-sub" style="margin:2px 0 0">Course 2+ items are held back when the check is sent — use "Send to Kitchen/Bar" for apps, then a separate button releases the held items when you're ready.</div>
     ${canCost ? `
     <label class="field-label">Recipe / Ingredient Costing</label>
     <div id="miRecipeRows" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px">
@@ -4824,12 +4940,13 @@ window.saveMenuItem = async function(itemId){
   const active = document.getElementById('miActive').checked;
   const description = document.getElementById('miDesc').value.trim() || null;
   const loyalty_eligible = document.getElementById('miLoyaltyEligible').checked;
+  const course = document.getElementById('miCourse').value ? parseInt(document.getElementById('miCourse').value) : null;
   let id = itemId;
   if (id){
-    const { error } = await sb.from('menu_items').update({ name, category_id, ticket_destination_id, price, active, description, loyalty_eligible }).eq('id', id);
+    const { error } = await sb.from('menu_items').update({ name, category_id, ticket_destination_id, price, active, description, loyalty_eligible, course }).eq('id', id);
     if (error){ alert('Error: '+error.message); return; }
   } else {
-    const { data, error } = await sb.from('menu_items').insert({ name, category_id, ticket_destination_id, price, active, description, loyalty_eligible, sort_order: state.menuItems.length }).select().single();
+    const { data, error } = await sb.from('menu_items').insert({ name, category_id, ticket_destination_id, price, active, description, loyalty_eligible, course, sort_order: state.menuItems.length }).select().single();
     if (error){ alert('Error: '+error.message); return; }
     id = data.id;
   }
