@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.90';
+const APP_VERSION = '1.92';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -3358,6 +3358,10 @@ function renderOrdersTab(){
 function renderCheckDetail(check){
   const items = state.checkItems.filter(ci => ci.check_id === check.id && ci.status !== 'voided');
   const isEmpty = !state.checkItems.some(ci => ci.check_id === check.id);
+  // Deletable whenever nothing on it has actually gone out yet — items still sitting
+  // 'open' (rung in but not sent) or 'voided' don't block it, only something fired,
+  // held, ready, or delivered does. Matches the checks_delete RLS policy server-side.
+  const canDeleteCheck = !state.checkItems.some(ci => ci.check_id === check.id && !['open','voided'].includes(ci.status));
   const subtotal = items.reduce((s,ci)=>s+checkItemTotal(ci), 0);
   const canOrder = can('take_orders');
   const canPay = can('take_payment');
@@ -3393,6 +3397,7 @@ function renderCheckDetail(check){
         ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="openSplitCheckModal('${check.id}')">Split</button>` : ''}
         ${(canOrder||canPay) ? `<button class="btn btn-sm btn-secondary" onclick="openDiscretionaryDiscountModal('${check.id}')">Discount</button>` : ''}
         ${(canOrder||canPay) ? `<button class="btn btn-sm btn-secondary" onclick="openTransferCheckModal('${check.id}')">Transfer</button>` : ''}
+        ${canOrder && canDeleteCheck && !isEmpty ? `<button class="btn btn-sm btn-danger" onclick="deleteEmptyCheck('${check.id}')">Delete Order</button>` : ''}
         ${canOrder && isEmpty ? `<button class="btn btn-sm btn-danger" onclick="deleteEmptyCheck('${check.id}')">Delete Check</button>` : ''}
         ${canPay && balance > 0 ? `<button class="btn btn-sm btn-primary" onclick="openPaymentModal('${check.id}')">Take Payment</button>` : ''}
       </div>
@@ -3495,14 +3500,27 @@ window.openNewCheckModal = function(){
 // today (host forgot to tap Seat, or a walk-in got matched to a phone booking).
 // Seated reservations are preferred and, among those, the most recently seated
 // one wins, since a table can cycle through more than one party in a night.
-function findGuestForTable(tableId){
+//
+// Queries the DB directly rather than trusting state.reservations/state.guests —
+// those are only loaded once at sign-in and refreshed by specific actions on the
+// Reservations tab, not by the Orders-tab polling loop. A phone that's been sitting
+// on Orders all shift would otherwise never learn a host seated someone on another
+// device moments ago, and silently create an unlinked check instead.
+async function findGuestForTable(tableId){
   if (!tableId) return null;
-  const todays = state.reservations.filter(r => r.table_id === tableId && r.reservation_date === todayISO() && !['cancelled','no_show'].includes(r.status));
+  const { data: todaysRaw } = await sb.from('reservations').select('*')
+    .eq('table_id', tableId).eq('reservation_date', todayISO());
+  const todays = (todaysRaw || []).filter(r => !['cancelled','no_show'].includes(r.status));
   if (!todays.length) return null;
   const seated = todays.filter(r => r.status === 'seated').sort((a,b) => (b.seated_at||'').localeCompare(a.seated_at||''));
   const r = seated[0] || todays.find(r => ['confirmed','pending'].includes(r.status));
   if (!r) return null;
-  const g = guestById(r.guest_id);
+  let g = guestById(r.guest_id);
+  if (!g){
+    const { data } = await sb.from('guests').select('*').eq('id', r.guest_id).maybeSingle();
+    g = data;
+    if (g) state.guests = [...state.guests, g]; // cache for the rest of this session
+  }
   if (!g) return null;
   return { reservation: r, guest: g };
 }
@@ -3523,7 +3541,7 @@ function buildGuestInfoNote(guest, reservation){
 }
 window.createCheck = async function(){
   const label = document.getElementById('ncLabel').value.trim() || null;
-  const match = findGuestForTable(state.ordersActiveTableId);
+  const match = await findGuestForTable(state.ordersActiveTableId);
   const payload = { table_id: state.ordersActiveTableId, server_id: currentStaff.id, guest_label: label };
   if (match){
     payload.reservation_id = match.reservation.id;
@@ -3545,11 +3563,13 @@ window.editCheckNotes = async function(checkId){
   if (error){ alert('Error: '+error.message); return; }
   await loadOrdersData();
 };
-// Only reachable when the check has never had an item rung onto it (button is hidden
-// otherwise) — RLS double-checks the same thing server-side, so this can't be used to
-// quietly make a real order disappear.
+// Only reachable when nothing on the check has actually fired to the kitchen/bar yet
+// (button is hidden otherwise) — RLS double-checks the same thing server-side, so this
+// can't be used to quietly make a real, in-progress order disappear. Deleting the check
+// row cascades to delete any of its still-unsent items too.
 window.deleteEmptyCheck = async function(checkId){
-  if (!confirm('Delete this check? This can\'t be undone.')) return;
+  const hasItems = state.checkItems.some(ci => ci.check_id === checkId);
+  if (!confirm(hasItems ? 'Delete this order and everything rung in on it? This can\'t be undone.' : 'Delete this check? This can\'t be undone.')) return;
   const { error } = await sb.from('checks').delete().eq('id', checkId);
   if (error){ alert('Error: '+error.message); return; }
   if (state.ordersActiveCheckId === checkId) state.ordersActiveCheckId = null;
