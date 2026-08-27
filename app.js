@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.87';
+const APP_VERSION = '1.89';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -641,25 +641,24 @@ window.lockTerminalNow = function(){
   showTerminalLockOverlay();
 };
 function showTerminalLockOverlay(){
-  const sel = document.getElementById('lockEmployee');
-  if (sel){
-    const eligible = state.staffList.filter(s => s.active && staffHasPermission(s.id, 'take_orders'));
-    sel.innerHTML = eligible.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('') || '<option value="">No eligible staff found</option>';
-  }
   const pinEl = document.getElementById('lockPin');
   if (pinEl) pinEl.value = '';
   const errEl = document.getElementById('lockError');
   if (errEl) errEl.textContent = '';
   document.getElementById('terminalLockOverlay')?.classList.remove('hidden');
+  pinEl?.focus();
 }
+// PIN-only unlock — no name picker. identify_staff_by_pin checks the PIN against every
+// active, order-taking-eligible staff member server-side and returns a match only if
+// exactly one person's PIN fits, which is why PINs must be unique (enforced in
+// set_staff_pin) — a shared PIN would make this lookup ambiguous and always fail closed.
 window.unlockTerminal = async function(){
-  const staffId = document.getElementById('lockEmployee')?.value;
-  const pin = document.getElementById('lockPin')?.value;
+  const pinEl = document.getElementById('lockPin');
+  const pin = pinEl?.value;
   const errEl = document.getElementById('lockError');
-  if (!staffId){ if (errEl) errEl.textContent = 'Select your name.'; return; }
   if (!pin){ if (errEl) errEl.textContent = 'Enter your PIN.'; return; }
-  const { data: ok, error } = await sb.rpc('verify_staff_pin', { target_staff_id: staffId, pin });
-  if (error || !ok){ if (errEl) errEl.textContent = 'Incorrect PIN.'; return; }
+  const { data: staffId, error } = await sb.rpc('identify_staff_by_pin', { p_pin: pin, p_permission: 'take_orders' });
+  if (error || !staffId){ if (errEl) errEl.textContent = 'Incorrect PIN.'; if (pinEl) pinEl.value = ''; pinEl?.focus(); return; }
   const staffRow = state.staffList.find(s => s.id === staffId);
   if (!staffRow){ if (errEl) errEl.textContent = 'Could not find that staff record — try again.'; return; }
   currentStaff = staffRow;
@@ -788,6 +787,20 @@ async function onSignedIn(){
   if (settingsSectionParam){
     state.tab = 'settings';
     state.focusedSettingsSection = settingsSectionParam;
+  }
+
+  // The "History" link on a check opens a *new* browser window (window.open, same origin,
+  // so the already-signed-in Supabase session just carries over via localStorage) pointed at
+  // this same app with ?guestHistory=<id>. That's a small, focused popup — not the full tabbed
+  // app — so it skips the normal tab render entirely, along with the terminal lock and the
+  // background polling loops, none of which are relevant to a short-lived read view.
+  const guestHistoryParam = new URLSearchParams(location.search).get('guestHistory');
+  if (guestHistoryParam){
+    const nav = document.getElementById('tabnav');
+    if (nav) nav.style.display = 'none';
+    document.getElementById('lockNowBtn')?.classList.add('hidden');
+    await renderGuestHistoryView(guestHistoryParam);
+    return;
   }
 
   render();
@@ -3341,6 +3354,7 @@ function renderCheckDetail(check){
   const autoFireStatus = hasHeld ? courseAutoFireStatus(check) : null;
   const loyaltyMember = check.loyalty_member_id ? state.loyaltyMembers.find(m=>m.id===check.loyalty_member_id) : null;
   const loyaltyGuest = loyaltyMember ? state.guests.find(g=>g.id===loyaltyMember.guest_id) : null;
+  const linkedGuest = check.guest_id ? state.guests.find(g=>g.id===check.guest_id) : null;
   const cocktailsLeft = loyaltyMember ? cocktailsRemaining(loyaltyMember) : 0;
   const canRedeemLoyalty = loyaltyMember && cocktailsLeft > 0 && can('apply_loyalty_payment');
   const hasLoyaltyDiscount = state.checkDiscounts.some(d=>d.check_id===check.id && d.type==='loyalty_discount');
@@ -3374,6 +3388,9 @@ function renderCheckDetail(check){
       ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="holdMainsLonger('${check.id}')">Hold longer</button>` : ''}
     </div>` : ''}
     <div class="panel-sub" style="margin-bottom:4px">Server: ${esc(state.staffList.find(s=>s.id===check.server_id)?.name || '?')}</div>
+    <div class="panel-sub" style="margin-bottom:4px">
+      ${linkedGuest ? `👤 Guest: ${esc(guestName(linkedGuest))} · <span class="linkBtn" style="cursor:pointer" onclick="openGuestHistoryWindow('${linkedGuest.id}')">📜 History</span>` : (canOrder ? `<span class="linkBtn" style="cursor:pointer" onclick="openLinkGuestModal('${check.id}')">+ Link guest</span>` : '')}
+    </div>
     <div class="panel-sub" style="margin-bottom:8px">
       ${loyaltyGuest ? `💳 Linked: ${esc(loyaltyGuest.first_name)} ${esc(loyaltyGuest.last_name)} (${esc(loyaltyMember.locked_tier_name || state.loyaltyTiers.find(t=>t.key===loyaltyMember.tier_key)?.name || loyaltyMember.tier_key)}) · 🍸 ${cocktailsLeft} free drink${cocktailsLeft===1?'':'s'} left this month${(!hasLoyaltyDiscount && can('apply_loyalty_payment')) ? ` · <span class="linkBtn" style="cursor:pointer" onclick="applyLoyaltyDiscount('${check.id}')">Apply membership discount</span>` : ''}` : (canOrder ? `<span class="linkBtn" style="cursor:pointer" onclick="openLinkLoyaltyModal('${check.id}')">+ Link loyalty membership</span>` : '')}
     </div>
@@ -3492,6 +3509,7 @@ window.createCheck = async function(){
   const payload = { table_id: state.ordersActiveTableId, server_id: currentStaff.id, guest_label: label };
   if (match){
     payload.reservation_id = match.reservation.id;
+    payload.guest_id = match.guest.id;
     payload.notes = buildGuestInfoNote(match.guest, match.reservation);
     if (!label) payload.guest_label = guestName(match.guest);
   }
@@ -3801,10 +3819,125 @@ window.renderLinkLoyaltyResults = function(checkId, q){
   }).join('') || '<span class="panel-sub" style="margin:0">No active members match.</span>';
 };
 window.linkLoyaltyToCheck = async function(checkId, memberId){
-  const { error } = await sb.from('checks').update({ loyalty_member_id: memberId }).eq('id', checkId);
+  const member = state.loyaltyMembers.find(m=>m.id===memberId);
+  const patch = { loyalty_member_id: memberId };
+  // Linking a membership always resolves to a specific guest — tie the check to their
+  // permanent record too so this visit shows up in their history, same as linkGuestToCheck.
+  if (member) patch.guest_id = member.guest_id;
+  const { error } = await sb.from('checks').update(patch).eq('id', checkId);
   if (error){ alert('Error: '+error.message); return; }
   closeModal('formModal');
   await loadOrdersData();
+};
+// Manual version of the same idea for guests with no loyalty membership and no
+// reservation match (e.g. a walk-in the host didn't tie to a booking) — lets staff
+// attach the check to an existing guest profile after the fact so it counts toward
+// that guest's permanent visit history.
+window.openLinkGuestModal = function(checkId){
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>Link Guest</h3>
+    <p class="panel-sub" style="margin-top:-4px">Ties this check to a guest's permanent profile so it shows up in their visit history.</p>
+    <label class="field-label">Search guest</label>
+    <input type="text" class="modal-input" id="linkGuestSearch" oninput="renderLinkGuestResults('${checkId}', this.value)" placeholder="Name or phone…"/>
+    <div id="linkGuestResults" style="max-height:220px;overflow-y:auto;margin-top:8px"></div>
+    <div class="modal-actions"><button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Close</button></div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.renderLinkGuestResults = function(checkId, q){
+  const div = document.getElementById('linkGuestResults');
+  const query = q.trim().toLowerCase();
+  if (!query){ div.innerHTML = ''; return; }
+  const matches = state.guests.filter(g => guestName(g).toLowerCase().includes(query) || (g.phone||'').includes(query)).slice(0,10);
+  div.innerHTML = matches.map(g => `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;cursor:pointer" onclick="linkGuestToCheck('${checkId}','${g.id}')">
+      <span>${esc(guestName(g))}${g.phone?' — '+esc(g.phone):''}</span>
+    </div>`).join('') || '<span class="panel-sub" style="margin:0">No guests match.</span>';
+};
+window.linkGuestToCheck = async function(checkId, guestId){
+  const check = state.checks.find(c=>c.id===checkId);
+  const guest = state.guests.find(g=>g.id===guestId);
+  const patch = { guest_id: guestId };
+  // Only auto-fill the notes banner if the check doesn't already have notes of its own —
+  // never silently overwrite something a waiter already typed.
+  if (guest && !check?.notes) patch.notes = buildGuestInfoNote(guest, null);
+  const { error } = await sb.from('checks').update(patch).eq('id', checkId);
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await loadOrdersData();
+};
+
+// ---- Guest visit history (opens in its own browser window/tab) ------------
+// Every check tied to a guest (guest_id, set automatically off a reservation match or
+// manually via "+ Link guest") counts toward their permanent history here — past items
+// ordered, per-visit notes, and totals — regardless of how long ago the check closed.
+window.openGuestHistoryWindow = function(guestId){
+  window.open('index.html?guestHistory='+encodeURIComponent(guestId), '_blank', 'width=560,height=780,noopener');
+};
+async function renderGuestHistoryView(guestId){
+  const c = document.getElementById('content');
+  c.innerHTML = '<div class="panel-sub">Loading history…</div>';
+  const [{ data: guest }, { data: checks }] = await Promise.all([
+    sb.from('guests').select('*').eq('id', guestId).maybeSingle(),
+    sb.from('checks').select('*').eq('guest_id', guestId).order('opened_at', { ascending: false }),
+  ]);
+  if (!guest){ c.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🔍</div>Guest not found.</div>'; return; }
+  const checkIds = (checks||[]).map(ch=>ch.id);
+  const [itemsRes, discountsRes] = checkIds.length ? await Promise.all([
+    sb.from('check_items').select('*').in('check_id', checkIds),
+    sb.from('check_discounts').select('*').in('check_id', checkIds),
+  ]) : [{ data: [] }, { data: [] }];
+  const items = itemsRes.data || [];
+  const discounts = discountsRes.data || [];
+
+  // "Today's visit" = whatever open check this guest has today, if any — that's the one the
+  // quick-note box below writes to, so a waiter can jot something down mid-service without
+  // digging back to the Orders tab.
+  const todaysOpenCheck = (checks||[]).find(ch => ch.status === 'open' && ch.opened_at?.slice(0,10) === todayISO());
+
+  const rows = (checks||[]).map(ch => {
+    const chItems = items.filter(i => i.check_id === ch.id && i.status !== 'voided');
+    const subtotal = chItems.reduce((s,ci)=>s+checkItemTotal(ci), 0);
+    const chDiscounts = discounts.filter(d=>d.check_id===ch.id && d.type!=='comp_item');
+    const discountTotal = chDiscounts.reduce((s,d)=>s+(d.percent ? subtotal*(d.percent/100) : (Number(d.amount)||0)), 0);
+    const total = Math.max(0, subtotal - discountTotal);
+    const table = tableById(ch.table_id);
+    const server = state.staffList.find(s=>s.id===ch.server_id);
+    const statusBadge = ch.status==='closed' ? 'confirmed' : ch.status==='open' ? 'pending' : 'cancelled';
+    return `
+    <div class="card" style="margin-bottom:12px">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
+        <div>
+          <strong>${new Date(ch.opened_at).toLocaleDateString([], {month:'short',day:'numeric',year:'numeric'})}</strong>
+          <span class="panel-sub" style="margin:0">${new Date(ch.opened_at).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}${table?' · '+esc(tableDisplayLabel(table)):''}${server?' · server '+esc(server.name):''}</span>
+        </div>
+        <span class="badge badge-${statusBadge}">${esc(ch.status)}</span>
+      </div>
+      ${chItems.length ? `<table class="data-table" style="margin-top:8px"><tbody>${chItems.map(ci=>`<tr><td style="width:30px">${ci.quantity}</td><td>${esc(ci.name_snapshot)}${(ci.modifiers||[]).length?`<div class="panel-sub" style="margin:0">${ci.modifiers.map(m=>esc(m.name)).join(', ')}</div>`:''}</td><td style="text-align:right;width:70px">$${checkItemTotal(ci).toFixed(2)}</td></tr>`).join('')}</tbody></table>` : '<div class="panel-sub" style="margin-top:6px">No items on this visit.</div>'}
+      <div style="text-align:right;font-weight:600;margin-top:6px">Total: $${total.toFixed(2)}</div>
+      ${ch.notes ? `<div class="res-meta" style="background:#f4f4f5;border-radius:6px;padding:6px 10px;margin-top:8px;white-space:pre-line">📝 ${esc(ch.notes)}</div>` : ''}
+    </div>`;
+  }).join('') || '<div class="empty-state"><div class="empty-state-icon">📭</div>No visits on record yet.</div>';
+
+  c.innerHTML = `
+  <div class="panel-header"><div>
+    <h2 class="panel-title">${esc(guestName(guest))} — Visit History</h2>
+    <div class="panel-sub">${guest.vip?'⭐ VIP · ':''}${(checks||[]).length} visit${(checks||[]).length===1?'':'s'} on record${guest.phone?' · '+esc(guest.phone):''}</div>
+  </div></div>
+  ${guest.allergies ? `<div class="panel-sub">⚠️ Allergy/dietary: ${esc(guest.allergies)}</div>` : ''}
+  ${guest.notes ? `<div class="panel-sub" style="margin-bottom:10px">📝 Standing note: ${esc(guest.notes)}</div>` : ''}
+  ${todaysOpenCheck ? `
+  <div class="card" style="margin-bottom:14px;background:#eef2ff">
+    <div class="panel-sub" style="margin-bottom:6px">Note for today's visit:</div>
+    <textarea class="modal-textarea" id="historyNewNote" placeholder="e.g. celebrating an anniversary, asked for extra napkins…">${esc(todaysOpenCheck.notes||'')}</textarea>
+    <div class="modal-actions" style="padding-top:8px;justify-content:flex-start"><button class="btn btn-primary btn-sm" onclick="saveHistoryNote('${todaysOpenCheck.id}')">Save Note</button></div>
+  </div>` : ''}
+  ${rows}`;
+}
+window.saveHistoryNote = async function(checkId){
+  const val = document.getElementById('historyNewNote')?.value || '';
+  const { error } = await sb.from('checks').update({ notes: val.trim() || null }).eq('id', checkId);
+  if (error){ alert('Error: '+error.message); return; }
+  alert('Note saved.');
 };
 
 // ============================================================================

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
 <title>Legend Reservations</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🍽️</text></svg>">
-<link rel="stylesheet" href="styles.css?v=1.87"/>
+<link rel="stylesheet" href="styles.css?v=1.89"/>
 </head>
 <body>
 
@@ -48,9 +48,8 @@
   <div class="loginBox">
     <div class="loginLogo">🔒</div>
     <h2>Terminal Locked</h2>
-    <p>This is a shared terminal. Pick your name and enter your PIN to continue.</p>
-    <select id="lockEmployee" class="modal-select" style="width:100%;margin-bottom:10px"></select>
-    <input type="password" inputmode="numeric" maxlength="6" id="lockPin" placeholder="PIN" autocomplete="off" onkeydown="if(event.key==='Enter')unlockTerminal()"/>
+    <p>This is a shared terminal. Enter your PIN to continue.</p>
+    <input type="password" inputmode="numeric" maxlength="6" id="lockPin" placeholder="PIN" autocomplete="off" autofocus onkeydown="if(event.key==='Enter')unlockTerminal()"/>
     <button class="loginBtn" onclick="unlockTerminal()">Unlock</button>
     <div class="loginError" id="lockError"></div>
   </div>
@@ -114,6 +113,6 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
-<script src="app.js?v=1.87"></script>
+<script src="app.js?v=1.89"></script>
 </body>
 </html>
