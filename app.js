@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.98';
+const APP_VERSION = '2.00';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -3688,10 +3688,15 @@ window.setOrderPickerSeat = function(checkId, seatNum){
   _orderPickerSeat = seatNum;
   refreshItemPickerModal(checkId);
 };
+// Always route through the quantity/notes modal, even for items with no modifier
+// groups (e.g. a soda) — previously those skipped straight to a single qty-1 add,
+// so whether you got a quantity option at all depended on an invisible detail
+// (does this item happen to have modifiers configured). openItemModifierModal
+// already renders fine with an empty group list — it just shows the quantity/
+// notes fields with nothing above them.
 window.pickMenuItem = function(checkId, itemId){
   const groupIds = state.menuItemModifierGroups.filter(x=>x.item_id===itemId).map(x=>x.group_id);
-  if (groupIds.length) openItemModifierModal(checkId, itemId, groupIds);
-  else addItemToCheck(checkId, itemId, [], 1, null);
+  openItemModifierModal(checkId, itemId, groupIds);
 };
 function openItemModifierModal(checkId, itemId, groupIds){
   const it = state.menuItems.find(x=>x.id===itemId);
@@ -4019,7 +4024,9 @@ async function renderGuestHistoryView(guestId){
   <div class="panel-header"><div>
     <h2 class="panel-title">${esc(guestName(guest))} — Visit History</h2>
     <div class="panel-sub">${guest.vip?'⭐ VIP · ':''}${(checks||[]).length} visit${(checks||[]).length===1?'':'s'} on record${guest.phone?' · '+esc(guest.phone):''}</div>
-  </div></div>
+  </div>
+  <button class="btn btn-secondary btn-sm" onclick="window.close()">✕ Close</button>
+  </div>
   ${guest.allergies ? `<div class="panel-sub">⚠️ Allergy/dietary: ${esc(guest.allergies)}</div>` : ''}
   ${guest.notes ? `<div class="panel-sub" style="margin-bottom:10px">📝 Standing note: ${esc(guest.notes)}</div>` : ''}
   ${todaysOpenCheck ? `
