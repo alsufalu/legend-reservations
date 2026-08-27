@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.92';
+const APP_VERSION = '1.93';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -3306,8 +3306,8 @@ function renderOrdersTab(){
       ${can('take_payment')?`<button class="btn btn-secondary btn-sm" onclick="openRecentPaymentsModal()">Recent Payments</button>`:''}
     </div>
   </div>
-  <div style="display:flex;gap:16px;align-items:flex-start">
-    <div class="card" style="flex:0 0 240px;max-height:75vh;overflow-y:auto">
+  <div class="orders-layout">
+    <div class="card orders-sidebar">
       ${Object.keys(grouped).length ? `<div style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:4px">
         <span class="linkBtn" style="cursor:pointer;font-size:12px" onclick='setOrdersAreasCollapsed(${JSON.stringify(Object.keys(grouped))})'>Collapse all</span>
         <span class="linkBtn" style="cursor:pointer;font-size:12px" onclick="setOrdersAreasCollapsed([])">Expand all</span>
@@ -3331,10 +3331,10 @@ function renderOrdersTab(){
       }).join('') || '<div class="panel-sub">No tables set up yet.</div>'}
     </div>
 
-    <div style="flex:1;min-width:0">
+    <div class="orders-main">
       ${!state.ordersActiveTableId ? `<div class="card"><div class="panel-sub" style="margin:0">Pick a table on the left to open or view its checks.</div></div>` : `
         <div class="card" style="margin-bottom:12px">
-          <div style="display:flex;justify-content:space-between;align-items:center">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
             <h3 style="margin:0">${esc(tableById(state.ordersActiveTableId)?.label||'')}</h3>
             <button class="btn btn-secondary btn-sm" onclick="openNewCheckModal()">+ New Check</button>
           </div>
@@ -3417,6 +3417,7 @@ function renderCheckDetail(check){
     <div class="panel-sub" style="margin-bottom:8px">
       ${loyaltyGuest ? `💳 Linked: ${esc(loyaltyGuest.first_name)} ${esc(loyaltyGuest.last_name)} (${esc(loyaltyMember.locked_tier_name || state.loyaltyTiers.find(t=>t.key===loyaltyMember.tier_key)?.name || loyaltyMember.tier_key)}) · 🍸 ${cocktailsLeft} free drink${cocktailsLeft===1?'':'s'} left this month${(!hasLoyaltyDiscount && can('apply_loyalty_payment')) ? ` · <span class="linkBtn" style="cursor:pointer" onclick="applyLoyaltyDiscount('${check.id}')">Apply membership discount</span>` : ''}` : (canOrder ? `<span class="linkBtn" style="cursor:pointer" onclick="openLinkLoyaltyModal('${check.id}')">+ Link loyalty membership</span>` : '')}
     </div>
+    <div class="table-scroll">
     <table class="data-table">
       <thead><tr><th>Qty</th><th>Item</th><th>Modifiers</th><th>Status</th><th>Price</th><th></th></tr></thead>
       <tbody>
@@ -3452,6 +3453,7 @@ function renderCheckDetail(check){
         }).join('') || `<tr><td colspan="6"><span class="panel-sub">No items yet.</span></td></tr>`}
       </tbody>
     </table>
+    </div>
     ${discounts.length ? `<div class="panel-sub" style="margin-top:8px">${discounts.map(d=>`${d.type==='comp_item'?'Comp':d.type==='loyalty_discount'?'Membership discount':d.type==='loyalty_free_item'?'🍸 Free drink (membership)':'Discount'}: ${d.percent?d.percent+'%':'$'+Number(d.amount).toFixed(2)}${d.reason?' — '+esc(d.reason):''}`).join('<br>')}</div>` : ''}
     <div style="text-align:right;padding-top:8px">
       <div>Subtotal: $${subtotal.toFixed(2)}</div>
