@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.93';
+const APP_VERSION = '1.94';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -3419,7 +3419,7 @@ function renderCheckDetail(check){
     </div>
     <div class="table-scroll">
     <table class="data-table">
-      <thead><tr><th>Qty</th><th>Item</th><th>Modifiers</th><th>Status</th><th>Price</th><th></th></tr></thead>
+      <thead><tr><th>Qty</th><th>Seat</th><th>Item</th><th>Modifiers</th><th>Status</th><th>Price</th><th></th></tr></thead>
       <tbody>
         ${items.map(ci => {
           const miEligible = canRedeemLoyalty && state.menuItems.find(m=>m.id===ci.menu_item_id)?.loyalty_eligible;
@@ -3444,13 +3444,14 @@ function renderCheckDetail(check){
           }
           return `<tr>
           <td>${ci.quantity}</td>
+          <td>${ci.seat_number ? `<span class="badge badge-pending">Seat ${ci.seat_number}</span>` : '<span class="panel-sub" style="margin:0">table</span>'}</td>
           <td>${esc(ci.name_snapshot)}${ci.notes?`<div class="panel-sub" style="margin:0">${esc(ci.notes)}</div>`:''}${courseToggleHtml ? `<div class="panel-sub" style="margin:0">${courseToggleHtml}</div>` : ''}</td>
           <td>${(ci.modifiers||[]).map(m=>esc(m.name)).join(', ')}</td>
           <td><span class="badge badge-${ci.status==='ready'?'confirmed':ci.status==='delivered'?'confirmed':'pending'}">${ci.status==='ready'?'🔔 ready':ci.status==='held'?'held (course 2)':esc(ci.status)}</span></td>
           <td>$${checkItemTotal(ci).toFixed(2)}</td>
           <td style="white-space:nowrap">${removable && canOrder ? `<button class="btn btn-sm btn-danger" onclick="removeCheckItem('${ci.id}')">Remove</button>` : ''}${compable && canOrder ? `<button class="btn btn-sm btn-danger" onclick="compCheckItem('${ci.id}')">Comp</button>` : ''}${miEligible ? `<button class="btn btn-sm btn-secondary" onclick="redeemLoyaltyFreeItem('${ci.id}')">🍸 Free Drink</button>` : ''}</td>
         </tr>`;
-        }).join('') || `<tr><td colspan="6"><span class="panel-sub">No items yet.</span></td></tr>`}
+        }).join('') || `<tr><td colspan="7"><span class="panel-sub">No items yet.</span></td></tr>`}
       </tbody>
     </table>
     </div>
@@ -3510,8 +3511,21 @@ window.openNewCheckModal = function(){
 // device moments ago, and silently create an unlinked check instead.
 async function findGuestForTable(tableId){
   if (!tableId) return null;
+  // A reservation for a combined party is seated against the COMBO table's id, not any
+  // individual member table's id — so a check opened on just "M2" (one member of an
+  // M2+M4+M6 combo) needs to also look up the combo's reservation, and vice versa.
+  // Sweep state.comboMembers (comboTableId -> [memberTableId,...]) for any group tableId
+  // belongs to, either as the combo itself or as one of its members, and search across
+  // every table id in that group.
+  const candidateIds = new Set([tableId]);
+  Object.entries(state.comboMembers || {}).forEach(([comboId, memberIds]) => {
+    if (comboId === tableId || (memberIds||[]).includes(tableId)){
+      candidateIds.add(comboId);
+      (memberIds||[]).forEach(id => candidateIds.add(id));
+    }
+  });
   const { data: todaysRaw } = await sb.from('reservations').select('*')
-    .eq('table_id', tableId).eq('reservation_date', todayISO());
+    .in('table_id', [...candidateIds]).eq('reservation_date', todayISO());
   const todays = (todaysRaw || []).filter(r => !['cancelled','no_show'].includes(r.status));
   if (!todays.length) return null;
   const seated = todays.filter(r => r.status === 'seated').sort((a,b) => (b.seated_at||'').localeCompare(a.seated_at||''));
@@ -3604,18 +3618,38 @@ window.transferCheck = async function(checkId){
 };
 
 let _orderPickerCategory = null;
+let _orderPickerSeat = null; // null = "Whole table" (no specific seat) — sticks across items added in the same picker session so a server can ring in a full seat's order without reselecting each time
 window.openItemPickerModal = function(checkId){
   _orderPickerCategory = null;
+  _orderPickerSeat = null;
   const box = document.getElementById('formModalBox');
   box.innerHTML = renderItemPickerBody(checkId);
   document.getElementById('formModal').classList.remove('hidden');
 };
+function refreshItemPickerModal(checkId){
+  // Re-renders the picker body without resetting the seat/category selection —
+  // used after adding an item so a server can ring in several items for the
+  // same seat in a row without re-tapping the seat button each time.
+  const box = document.getElementById('formModalBox');
+  if (box) box.innerHTML = renderItemPickerBody(checkId);
+}
 function renderItemPickerBody(checkId){
+  const check = state.checks.find(c=>c.id===checkId);
+  const table = check ? tableById(check.table_id) : null;
+  const seatCount = table?.seats || 0;
   const cats = state.menuCategories;
   const activeCat = _orderPickerCategory || (cats[0]?.id || null);
   const items = state.menuItems.filter(it => it.active && (activeCat ? it.category_id === activeCat : true));
   return `
     <h3>Add Items</h3>
+    ${seatCount > 0 ? `
+    <div style="margin-bottom:10px">
+      <label class="field-label" style="margin-bottom:4px;display:block">Seat (so expo knows where to deliver)</label>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        <button type="button" class="btn btn-sm ${_orderPickerSeat===null?'btn-primary':'btn-secondary'}" onclick="setOrderPickerSeat('${checkId}', null)">Whole table</button>
+        ${Array.from({length: seatCount}, (_, i) => i+1).map(n => `<button type="button" class="btn btn-sm ${_orderPickerSeat===n?'btn-primary':'btn-secondary'}" onclick="setOrderPickerSeat('${checkId}', ${n})">Seat ${n}</button>`).join('')}
+      </div>
+    </div>` : ''}
     <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
       ${cats.map(c => `<button type="button" class="btn btn-sm ${activeCat===c.id?'btn-primary':'btn-secondary'}" onclick="setOrderPickerCategory('${checkId}','${c.id}')">${esc(c.name)}</button>`).join('') || '<span class="panel-sub">No menu categories set up yet — add them in Settings.</span>'}
     </div>
@@ -3629,7 +3663,11 @@ function renderItemPickerBody(checkId){
 }
 window.setOrderPickerCategory = function(checkId, catId){
   _orderPickerCategory = catId;
-  document.getElementById('formModalBox').innerHTML = renderItemPickerBody(checkId);
+  refreshItemPickerModal(checkId);
+};
+window.setOrderPickerSeat = function(checkId, seatNum){
+  _orderPickerSeat = seatNum;
+  refreshItemPickerModal(checkId);
 };
 window.pickMenuItem = function(checkId, itemId){
   const groupIds = state.menuItemModifierGroups.filter(x=>x.item_id===itemId).map(x=>x.group_id);
@@ -3685,11 +3723,11 @@ async function addItemToCheck(checkId, itemId, modifiers, quantity, notes){
   const { error } = await sb.from('check_items').insert({
     check_id: checkId, menu_item_id: itemId, name_snapshot: it.name, price_snapshot: it.price,
     quantity, modifiers, notes, ticket_destination_id: it.ticket_destination_id, added_by: currentStaff.id,
-    course: it.course || null,
+    course: it.course || null, seat_number: _orderPickerSeat,
   });
   if (error){ alert('Error: '+error.message); return; }
   await loadOrdersData();
-  openItemPickerModal(checkId); // stay in the picker so a server can add several items in a row
+  refreshItemPickerModal(checkId); // stay in the picker, keeping the same seat/category selected, so a server can add several items for the same seat in a row
 }
 // Course firing: if the check has any appetizer-course item on it (fired or not), mains
 // (course 2+) get held back instead of firing immediately — the kitchen only sees them once
@@ -4425,7 +4463,7 @@ function renderKitchenTicket(t){
     </div>
     ${t.items.map(ci => `<div style="padding:4px 0;border-top:1px solid var(--border)">
       <div style="display:flex;justify-content:space-between;align-items:center">
-        <span>${ci.quantity}x ${esc(ci.name_snapshot)}</span>
+        <span>${ci.quantity}x ${esc(ci.name_snapshot)}${ci.seat_number ? ` <b>· Seat ${ci.seat_number}</b>` : ''}</span>
         <span class="badge badge-pending">${esc(ci.status)}</span>
       </div>
       ${(ci.modifiers||[]).length ? `<div class="panel-sub" style="margin:0">${(ci.modifiers||[]).map(m=>esc(m.name)).join(', ')}</div>` : ''}
@@ -4475,10 +4513,21 @@ function renderExpoTab(){
           <b>${esc(table?.label||'?')}${t.check.guest_label?' · '+esc(t.check.guest_label):''}</b>
           <span class="panel-sub" style="margin:0">${ticketElapsedMinutes(t.items[0]?.ready_at)}m ready</span>
         </div>
-        ${t.items.map(ci => `<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-top:1px solid var(--border)">
-          <span>${ci.quantity}x ${esc(ci.name_snapshot)}</span>
-          <button class="btn btn-sm btn-primary" onclick="markItemDelivered('${ci.id}')">Delivered</button>
-        </div>`).join('')}
+        ${(() => {
+          // Group by seat so expo can see at a glance which plate goes to which seat —
+          // "table" (no seat set) items are listed first, then seats in numeric order.
+          const bySeat = {};
+          t.items.forEach(ci => { const k = ci.seat_number || 'table'; (bySeat[k] ||= []).push(ci); });
+          const seatKeys = Object.keys(bySeat).sort((a,b) => a==='table' ? -1 : b==='table' ? 1 : Number(a)-Number(b));
+          return seatKeys.map(k => `
+            <div style="margin-top:6px">
+              <div class="panel-sub" style="margin:0;font-weight:600">${k==='table' ? 'Whole table' : 'Seat '+k}</div>
+              ${bySeat[k].map(ci => `<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-top:1px solid var(--border)">
+                <span>${ci.quantity}x ${esc(ci.name_snapshot)}</span>
+                <button class="btn btn-sm btn-primary" onclick="markItemDelivered('${ci.id}')">Delivered</button>
+              </div>`).join('')}
+            </div>`).join('');
+        })()}
         <div class="modal-actions" style="padding-top:8px;justify-content:flex-start"><button class="btn btn-sm btn-secondary" onclick="markTicketDelivered('${t.check.id}')">Mark All Delivered</button></div>
       </div>`;
     }).join('') || '<div class="panel-sub">Nothing ready right now.</div>'}
