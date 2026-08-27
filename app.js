@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.04';
+const APP_VERSION = '2.05';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -2315,10 +2315,15 @@ window.cycleTableStatus = async function(id){
   const t = tableById(id);
   const order = ['available','reserved','assigned','seated','dirty','blocked'];
   const next = order[(order.indexOf(t.status)+1) % order.length];
-  // Tapping the table to change its status is the host acting on it — clear any
-  // "paid up, ready to turn" flag at the same time so it doesn't linger onto the next
-  // party once this one's actually been bussed/turned.
-  await sb.from('dining_tables').update({ status: next, paid_up_at: null }).eq('id', id);
+  // Tapping any table to change its status is the host acting on it — clear the "paid
+  // up, ready to turn" flag across its WHOLE combo group at the same time (not just this
+  // one tile), since a combined table turned teal together as one party and should clear
+  // together too, rather than leaving the other tiles stuck teal after this one's reset.
+  const groupIds = await comboGroupTableIds(id);
+  await Promise.all([
+    sb.from('dining_tables').update({ status: next }).eq('id', id),
+    sb.from('dining_tables').update({ paid_up_at: null }).in('id', groupIds),
+  ]);
   await reloadTables();
   render();
 };
@@ -3568,28 +3573,36 @@ window.openNewCheckModal = function(){
 // Reservations tab, not by the Orders-tab polling loop. A phone that's been sitting
 // on Orders all shift would otherwise never learn a host seated someone on another
 // device moments ago, and silently create an unlinked check instead.
+// Returns every table id physically grouped with tableId — itself, plus (if it's part of
+// a combo) the combo's own id and every other member table, resolved in both directions
+// (tableId may itself be the combo, or one of its members). Queries table_combo_members
+// live rather than trusting the cached state.comboMembers snapshot (only loaded once at
+// app boot) — a device that's had the app open since before this combo existed, or since
+// before it had RLS permission to read it, would otherwise keep working off an empty/stale
+// snapshot forever and never resolve the group. Shared by anything that needs to treat a
+// combined table as one physical unit: guest lookup, and the "paid up" floor-plan flag.
+async function comboGroupTableIds(tableId){
+  const ids = new Set([tableId]);
+  const { data: comboRows } = await sb.from('table_combo_members').select('*')
+    .or(`combo_table_id.eq.${tableId},member_table_id.eq.${tableId}`);
+  (comboRows || []).forEach(row => { ids.add(row.combo_table_id); ids.add(row.member_table_id); });
+  // Also sweep the cached map as a defensive fallback (cheap, can't hurt).
+  Object.entries(state.comboMembers || {}).forEach(([comboId, memberIds]) => {
+    if (comboId === tableId || (memberIds||[]).includes(tableId)){
+      ids.add(comboId);
+      (memberIds||[]).forEach(id => ids.add(id));
+    }
+  });
+  return [...ids];
+}
 async function findGuestForTable(tableId){
   if (!tableId) return null;
   // A reservation for a combined party is seated against the COMBO table's id, not any
   // individual member table's id — so a check opened on just "M2" (one member of an
   // M2+M4+M6 combo) needs to also look up the combo's reservation, and vice versa.
-  // Query table_combo_members live rather than trusting state.comboMembers (which is
-  // only loaded once at app boot) — a device that's had the app open since before this
-  // combo existed, or since before it had RLS permission to read it, would otherwise
-  // keep working off an empty/stale snapshot forever and never resolve the group.
-  const candidateIds = new Set([tableId]);
-  const { data: comboRows } = await sb.from('table_combo_members').select('*')
-    .or(`combo_table_id.eq.${tableId},member_table_id.eq.${tableId}`);
-  (comboRows || []).forEach(row => { candidateIds.add(row.combo_table_id); candidateIds.add(row.member_table_id); });
-  // Also sweep the cached map as a defensive fallback (cheap, can't hurt).
-  Object.entries(state.comboMembers || {}).forEach(([comboId, memberIds]) => {
-    if (comboId === tableId || (memberIds||[]).includes(tableId)){
-      candidateIds.add(comboId);
-      (memberIds||[]).forEach(id => candidateIds.add(id));
-    }
-  });
+  const candidateIds = await comboGroupTableIds(tableId);
   const { data: todaysRaw } = await sb.from('reservations').select('*')
-    .in('table_id', [...candidateIds]).eq('reservation_date', todayISO());
+    .in('table_id', candidateIds).eq('reservation_date', todayISO());
   const todays = (todaysRaw || []).filter(r => !['cancelled','no_show'].includes(r.status));
   if (!todays.length) return null;
   const seated = todays.filter(r => r.status === 'seated').sort((a,b) => (b.seated_at||'').localeCompare(a.seated_at||''));
@@ -3631,9 +3644,12 @@ window.createCheck = async function(){
   }
   const { data, error } = await sb.from('checks').insert(payload).select().single();
   if (error){ alert('Error: '+error.message); return; }
-  // Clear any leftover "paid up, ready to turn" flag from the previous party — a fresh
-  // check means someone new just sat down, so the earlier flag no longer applies.
-  await sb.from('dining_tables').update({ paid_up_at: null }).eq('id', state.ordersActiveTableId);
+  // Clear any leftover "paid up, ready to turn" flag from the previous party across the
+  // whole combo group — a fresh check means someone new just sat down, so the earlier
+  // flag (which may have been set across several tiles at once) no longer applies to any
+  // of them.
+  const groupIds = await comboGroupTableIds(state.ordersActiveTableId);
+  await sb.from('dining_tables').update({ paid_up_at: null }).in('id', groupIds);
   closeModal('formModal');
   state.ordersActiveCheckId = data.id;
   await reloadTables();
@@ -4313,16 +4329,21 @@ async function maybeCloseCheck(checkId){
   const paid = (freshPayments||[]).reduce((s,p)=>s+Number(p.amount)-Number(p.refunded_amount||0),0);
   if (paid >= totalDue - 0.005){
     const { data: closedCheck } = await sb.from('checks').update({ status: 'closed', closed_at: new Date().toISOString() }).eq('id', checkId).select('table_id').maybeSingle();
-    // Flag the table as "paid up, ready to turn" for the floor plan — but only once
-    // EVERY check on it is settled (a table can have split/multiple checks, and closing
-    // one shouldn't flag the table while another is still open and unpaid). This can't be
-    // derived from state.checks at render time because that only ever holds OPEN checks
-    // (see loadOrdersData), so a closed check simply isn't there to look at anymore —
-    // the flag has to be persisted on the table row itself at the moment of closing.
+    // Flag the table as "paid up, ready to turn" for the floor plan — but only once EVERY
+    // check across its whole physical group is settled (a combo like M2+M4+M6 is one
+    // party across multiple physical tiles, and a table can also have split/multiple
+    // checks on its own — closing one shouldn't flag anything while another in the same
+    // group is still open and unpaid). This can't be derived from state.checks at render
+    // time because that only ever holds OPEN checks (see loadOrdersData), so a closed
+    // check simply isn't there to look at anymore — the flag has to be persisted on the
+    // table row(s) themselves at the moment of closing, and applied to every tile in the
+    // group so the whole combo turns teal together, not just whichever single table_id
+    // this particular check happened to be opened against.
     if (closedCheck?.table_id){
-      const { count } = await sb.from('checks').select('id', { count: 'exact', head: true }).eq('table_id', closedCheck.table_id).eq('status', 'open');
+      const groupIds = await comboGroupTableIds(closedCheck.table_id);
+      const { count } = await sb.from('checks').select('id', { count: 'exact', head: true }).in('table_id', groupIds).eq('status', 'open');
       if (!count){
-        await sb.from('dining_tables').update({ paid_up_at: new Date().toISOString() }).eq('id', closedCheck.table_id);
+        await sb.from('dining_tables').update({ paid_up_at: new Date().toISOString() }).in('id', groupIds);
       }
     }
   }
