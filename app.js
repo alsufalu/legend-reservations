@@ -6,15 +6,19 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.02';
+const APP_VERSION = '2.04';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // Table status color legend — customizable in Settings, persisted on
 // floor_plan_settings.status_colors. This default mirrors the original hardcoded
 // CSS colors so nothing changes visually until someone edits a color.
-const STATUS_LABELS = { available:'Available', reserved:'Reserved', assigned:'Assigned (Pre-Seated)', seated:'Seated', dirty:'Needs Bussing', blocked:'Blocked / Out of Service' };
-const STATUS_COLORS_DEFAULT = { available:'#16a34a', reserved:'#d97706', assigned:'#7c3aed', seated:'#dc2626', dirty:'#8492a6', blocked:'#9aa3b0' };
+const STATUS_LABELS = { available:'Available', reserved:'Reserved', assigned:'Assigned (Pre-Seated)', seated:'Seated', dirty:'Needs Bussing', blocked:'Blocked / Out of Service', paid_up:'Paid — Ready to Turn' };
+const STATUS_COLORS_DEFAULT = { available:'#16a34a', reserved:'#d97706', assigned:'#7c3aed', seated:'#dc2626', dirty:'#8492a6', blocked:'#9aa3b0', paid_up:'#0891b2' };
+// paid_up isn't a real dining_tables.status value that gets cycled through — it's a flag
+// (paid_up_at) layered on top of "seated" that swaps the tile's fill/border to its own
+// dedicated color instead of showing seated's color. Kept out of cycleTableStatus's order
+// list on purpose; it clears automatically on the next manual status change or new check.
 function statusColors(){ return { ...STATUS_COLORS_DEFAULT, ...(state.floorPlan?.status_colors || {}) }; }
 
 // ---- "Now" override — lets staff simulate a different current date/time than
@@ -2063,7 +2067,6 @@ function renderFloorPlanTab(){
       const areaName = state.areas.find(a => a.id === t.area_id)?.name;
       const section = state.serverSections.find(s => s.id === t.server_section_id);
       const serverName = section ? sectionAssigneeName(section) : null;
-      const statusColor = sc[t.status] || STATUS_COLORS_DEFAULT.dirty;
       const held = (!occ && ['assigned','reserved'].includes(t.status))
         ? pickHeldReservation(heldRes.filter(r => r.table_id === t.id))
         : null;
@@ -2073,20 +2076,24 @@ function renderFloorPlanTab(){
       const upcoming = (!state.serverView && !occ && !held)
         ? upcomingSoonReservation(heldRes.filter(r => r.table_id === t.id))
         : null;
-      // Once every open check with items on it is fully paid, flag the table so the host
-      // knows it's about to turn over — even though nobody's bussed it / marked it Dirty
-      // yet. Only relevant for tables currently shown as Seated.
-      const paidUp = !state.serverView && t.status === 'seated' && isTablePaidUp(t.id);
+      // Set server-side the moment every check on this table closes fully paid (see
+      // maybeCloseCheck) and cleared on the next manual status change or new check —
+      // read straight off the table row rather than derived from state.checks, since
+      // state.checks only ever holds OPEN checks and a just-paid check is already closed
+      // by the time this renders. Gets its own dedicated fill color (rather than a ring
+      // over the Seated color) so it reads clearly at a glance across the whole floor.
+      const paidUp = !state.serverView && t.status === 'seated' && !!t.paid_up_at;
+      const statusColor = paidUp ? (sc.paid_up || STATUS_COLORS_DEFAULT.paid_up) : (sc[t.status] || STATUS_COLORS_DEFAULT.dirty);
       colorStyle = state.serverView
         ? (section ? `border-color:${section.color};background:${section.color}22;` : 'opacity:.45;')
-        : `border-color:${statusColor};background:${statusColor}22;${upcoming ? 'box-shadow:inset 0 0 0 3px #f59e0b;' : paidUp ? 'box-shadow:inset 0 0 0 3px #16a34a;' : ''}`;
+        : `border-color:${statusColor};background:${statusColor}22;${upcoming ? 'box-shadow:inset 0 0 0 3px #f59e0b;' : ''}`;
       metaHtml = state.serverView
         ? `<div class="ft-meta">${section ? esc(section.name) : 'No section'}</div>${serverName ? `<div class="ft-meta">${esc(serverName)}</div>` : ''}`
         : `<div class="ft-meta">${t.seats} seats</div>${showingAll && areaName ? `<div class="ft-meta">${esc(areaName)}</div>` : ''}`
           + (occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>`
             : held ? `<div class="ft-meta">${esc(guestName(guestById(held.guest_id)))} · ${fmtTime(held.reservation_time)}</div>`
             : upcoming ? `<div class="ft-meta" style="color:#b45309;font-weight:600">⏰ ${esc(guestName(guestById(upcoming.guest_id)))} in ${timeToMinutes(upcoming.reservation_time) - timeToMinutes(nowHHMM())}m (${fmtTime(upcoming.reservation_time)})</div>` : '')
-          + (paidUp ? `<div class="ft-meta" style="color:#16a34a;font-weight:700">💵 Paid — ready to turn</div>` : '');
+          + (paidUp ? `<div class="ft-meta" style="color:${statusColor};font-weight:700">💵 Paid — ready to turn</div>` : '');
     }
 
     return `
@@ -2160,7 +2167,7 @@ function renderFloorLegend(sc){
     if (!state.serverSections.length) return `<div class="panel-sub" style="margin-bottom:10px">No server sections defined yet — add some in Settings.</div>`;
     return `<div class="floor-legend">${state.serverSections.map(s => `<span class="legend-chip"><span class="legend-swatch" style="background:${esc(s.color)}"></span>${esc(s.name)}</span>`).join('')}<span class="legend-chip"><span class="legend-swatch" style="background:#ccc;opacity:.45"></span>No section</span></div>`;
   }
-  return `<div class="floor-legend">${Object.keys(STATUS_LABELS).map(k => `<span class="legend-chip"><span class="legend-swatch" style="background:${sc[k]}"></span>${STATUS_LABELS[k]}</span>`).join('')}<span class="legend-chip"><span class="legend-swatch" style="background:#fff;box-shadow:inset 0 0 0 3px #f59e0b"></span>⏰ Reservation arriving soon</span><span class="legend-chip"><span class="legend-swatch" style="background:#fff;box-shadow:inset 0 0 0 3px #16a34a"></span>💵 Paid — ready to turn</span><span class="panel-sub" style="margin:0 0 0 4px">Customize the status colors in Settings → Table Status Colors.</span></div>`;
+  return `<div class="floor-legend">${Object.keys(STATUS_LABELS).map(k => `<span class="legend-chip"><span class="legend-swatch" style="background:${sc[k]}"></span>${STATUS_LABELS[k]}</span>`).join('')}<span class="legend-chip"><span class="legend-swatch" style="background:#fff;box-shadow:inset 0 0 0 3px #f59e0b"></span>⏰ Reservation arriving soon</span><span class="panel-sub" style="margin:0 0 0 4px">Customize the status colors in Settings → Table Status Colors.</span></div>`;
 }
 
 window.switchArea = function(id){ state.editMode = false; state.currentAreaId = id; render(); };
@@ -2308,7 +2315,10 @@ window.cycleTableStatus = async function(id){
   const t = tableById(id);
   const order = ['available','reserved','assigned','seated','dirty','blocked'];
   const next = order[(order.indexOf(t.status)+1) % order.length];
-  await sb.from('dining_tables').update({ status: next }).eq('id', id);
+  // Tapping the table to change its status is the host acting on it — clear any
+  // "paid up, ready to turn" flag at the same time so it doesn't linger onto the next
+  // party once this one's actually been bussed/turned.
+  await sb.from('dining_tables').update({ status: next, paid_up_at: null }).eq('id', id);
   await reloadTables();
   render();
 };
@@ -3288,18 +3298,6 @@ function checkTotalDue(checkId){
   const subtotal = items.reduce((s,ci)=>s+checkItemTotal(ci), 0);
   return Math.max(0, subtotal - checkDiscountTotal(checkId, subtotal));
 }
-// True once every open check on a table that actually has items on it has been paid down
-// to zero — signals to the host that the table is effectively done, even though nobody has
-// bussed it (changed its floor status to Dirty) yet. A check that's still totally empty
-// (opened but nothing rung in, nothing paid) doesn't count either way — it just means
-// no one's ordered, not that they're "paid up."
-function isTablePaidUp(tableId){
-  const openChecks = state.checks.filter(c => c.table_id === tableId && c.status === 'open');
-  if (!openChecks.length) return false;
-  const withItems = openChecks.filter(c => state.checkItems.some(ci => ci.check_id === c.id && ci.status !== 'voided'));
-  if (!withItems.length) return false;
-  return withItems.every(c => (checkTotalDue(c.id) - checkAmountPaid(c.id)) <= 0.01);
-}
 function checkAmountPaid(checkId){
   return state.payments.filter(p => p.check_id === checkId).reduce((s,p) => s + Number(p.amount) - Number(p.refunded_amount||0), 0);
 }
@@ -3633,8 +3631,12 @@ window.createCheck = async function(){
   }
   const { data, error } = await sb.from('checks').insert(payload).select().single();
   if (error){ alert('Error: '+error.message); return; }
+  // Clear any leftover "paid up, ready to turn" flag from the previous party — a fresh
+  // check means someone new just sat down, so the earlier flag no longer applies.
+  await sb.from('dining_tables').update({ paid_up_at: null }).eq('id', state.ordersActiveTableId);
   closeModal('formModal');
   state.ordersActiveCheckId = data.id;
+  await reloadTables();
   await loadOrdersData();
 };
 window.editCheckNotes = async function(checkId){
@@ -4310,7 +4312,19 @@ async function maybeCloseCheck(checkId){
   const { data: freshPayments } = await sb.from('payments').select('amount,refunded_amount').eq('check_id', checkId);
   const paid = (freshPayments||[]).reduce((s,p)=>s+Number(p.amount)-Number(p.refunded_amount||0),0);
   if (paid >= totalDue - 0.005){
-    await sb.from('checks').update({ status: 'closed', closed_at: new Date().toISOString() }).eq('id', checkId);
+    const { data: closedCheck } = await sb.from('checks').update({ status: 'closed', closed_at: new Date().toISOString() }).eq('id', checkId).select('table_id').maybeSingle();
+    // Flag the table as "paid up, ready to turn" for the floor plan — but only once
+    // EVERY check on it is settled (a table can have split/multiple checks, and closing
+    // one shouldn't flag the table while another is still open and unpaid). This can't be
+    // derived from state.checks at render time because that only ever holds OPEN checks
+    // (see loadOrdersData), so a closed check simply isn't there to look at anymore —
+    // the flag has to be persisted on the table row itself at the moment of closing.
+    if (closedCheck?.table_id){
+      const { count } = await sb.from('checks').select('id', { count: 'exact', head: true }).eq('table_id', closedCheck.table_id).eq('status', 'open');
+      if (!count){
+        await sb.from('dining_tables').update({ paid_up_at: new Date().toISOString() }).eq('id', closedCheck.table_id);
+      }
+    }
   }
 }
 window.openRecentPaymentsModal = async function(){
@@ -4372,10 +4386,14 @@ let _kdsPollInterval = null;
 function startKdsPolling(){
   stopKdsPolling();
   _kdsPollInterval = setInterval(() => {
-    // Also poll while on the Floor Plan / Split View tabs — that's what keeps the
-    // "paid up, ready to turn" indicator on table tiles from going stale while a
-    // host is sitting on the floor plan rather than the Orders screen.
     if (['kitchen','orders','expo','floorplan','split'].includes(state.tab)) loadOrdersData();
+    // dining_tables (status, and the "paid up, ready to turn" flag) has no realtime
+    // subscription and is otherwise only reloaded when THIS device makes a change —
+    // without this, one host's terminal closing out a table would never show up on a
+    // different device (e.g. a hostess's screen) until something on that screen happened
+    // to trigger its own reloadTables(). Only worth polling while a table grid is
+    // actually on screen.
+    if (['floorplan','split'].includes(state.tab)) reloadTables().then(render);
   }, 15000);
 }
 function stopKdsPolling(){ if (_kdsPollInterval){ clearInterval(_kdsPollInterval); _kdsPollInterval = null; } }
@@ -6116,7 +6134,7 @@ function renderTableColorsSection(){
   return `
   <div class="section-heading">Table Status Colors</div>
   <div class="card">
-    <div class="panel-sub" style="margin-bottom:10px">Define what each table color means on the Floor Plan. Tapping a table there cycles through these statuses in order: Available → Reserved → Assigned (Pre-Seated) → Seated → Needs Bussing → Blocked / Out of Service. "Assigned" is for a table held for a specific walk-in or reservation that hasn't sat down yet. The legend shown on the Floor Plan always reflects whatever colors you set here.</div>
+    <div class="panel-sub" style="margin-bottom:10px">Define what each table color means on the Floor Plan. Tapping a table there cycles through these statuses in order: Available → Reserved → Assigned (Pre-Seated) → Seated → Needs Bussing → Blocked / Out of Service. "Assigned" is for a table held for a specific walk-in or reservation that hasn't sat down yet. "Paid — Ready to Turn" isn't tapped into manually — it's set automatically the moment every check on a Seated table closes fully paid, and clears on the next tap or new check. The legend shown on the Floor Plan always reflects whatever colors you set here.</div>
     <table class="data-table">
       <thead><tr><th>Status</th><th>Color</th></tr></thead>
       <tbody>
