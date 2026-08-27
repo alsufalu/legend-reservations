@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.94';
+const APP_VERSION = '1.96';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -988,6 +988,12 @@ const CLOCK_GATED_ROLES = new Set(['host','waiter','bartender','kitchen','expo']
 const CLOCK_GATED_TABS = new Set(['reservations','floorplan','split','waitlist','guests','loyalty','orders','kitchen','expo']);
 function isClockedIn(){
   return !!currentStaff && state.timeClockEntries.some(e => e.staff_id === currentStaff.id && !e.clock_out_at);
+}
+// Same check as isClockedIn(), but for an arbitrary staff id rather than currentStaff —
+// used to gate check transfers so a check can't be handed to someone who isn't actually
+// on shift right now.
+function isStaffClockedIn(staffId){
+  return state.timeClockEntries.some(e => e.staff_id === staffId && !e.clock_out_at);
 }
 function needsClockGate(){
   return !!currentStaff && CLOCK_GATED_ROLES.has(currentStaff.role) && !isClockedIn();
@@ -3514,10 +3520,15 @@ async function findGuestForTable(tableId){
   // A reservation for a combined party is seated against the COMBO table's id, not any
   // individual member table's id — so a check opened on just "M2" (one member of an
   // M2+M4+M6 combo) needs to also look up the combo's reservation, and vice versa.
-  // Sweep state.comboMembers (comboTableId -> [memberTableId,...]) for any group tableId
-  // belongs to, either as the combo itself or as one of its members, and search across
-  // every table id in that group.
+  // Query table_combo_members live rather than trusting state.comboMembers (which is
+  // only loaded once at app boot) — a device that's had the app open since before this
+  // combo existed, or since before it had RLS permission to read it, would otherwise
+  // keep working off an empty/stale snapshot forever and never resolve the group.
   const candidateIds = new Set([tableId]);
+  const { data: comboRows } = await sb.from('table_combo_members').select('*')
+    .or(`combo_table_id.eq.${tableId},member_table_id.eq.${tableId}`);
+  (comboRows || []).forEach(row => { candidateIds.add(row.combo_table_id); candidateIds.add(row.member_table_id); });
+  // Also sweep the cached map as a defensive fallback (cheap, can't hurt).
   Object.entries(state.comboMembers || {}).forEach(([comboId, memberIds]) => {
     if (comboId === tableId || (memberIds||[]).includes(tableId)){
       candidateIds.add(comboId);
@@ -3591,16 +3602,20 @@ window.deleteEmptyCheck = async function(checkId){
   if (state.ordersActiveCheckId === checkId) state.ordersActiveCheckId = null;
   await loadOrdersData();
 };
+// A check can only be transferred to someone who is BOTH currently clocked in AND holds
+// take_orders permission — handing a table to someone off the clock (or without ordering
+// rights) would leave it effectively orphaned. eligibleApprovers('take_orders') already
+// covers the permission half; isStaffClockedIn() adds the on-shift half.
 window.openTransferCheckModal = function(checkId){
   const check = state.checks.find(c=>c.id===checkId);
-  const candidates = eligibleApprovers('take_orders').filter(s=>s.id!==check.server_id);
+  const candidates = eligibleApprovers('take_orders').filter(s=>s.id!==check.server_id && isStaffClockedIn(s.id));
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
     <h3>Transfer Check</h3>
     <p class="panel-sub">Currently: ${esc(state.staffList.find(s=>s.id===check.server_id)?.name || '?')}</p>
     <label class="field-label">Transfer to</label>
     <select class="modal-select" id="transferToStaff">
-      ${candidates.map(s=>`<option value="${s.id}">${esc(s.name)} (${esc(s.role)})</option>`).join('') || '<option value="">No other eligible staff</option>'}
+      ${candidates.map(s=>`<option value="${s.id}">${esc(s.name)} (${esc(s.role)})</option>`).join('') || '<option value="">No eligible staff — must be clocked in with order-taking permission</option>'}
     </select>
     <div class="modal-actions">
       <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
@@ -3611,6 +3626,10 @@ window.openTransferCheckModal = function(checkId){
 window.transferCheck = async function(checkId){
   const newServerId = document.getElementById('transferToStaff').value;
   if (!newServerId){ alert('No staff selected.'); return; }
+  // Re-validate on submit (not just at modal-open time) in case their clock or permission
+  // status changed while the modal was sitting open.
+  if (!isStaffClockedIn(newServerId)){ alert('That staff member is not currently clocked in — a check can only be transferred to someone on shift.'); return; }
+  if (!staffHasPermission(newServerId, 'take_orders')){ alert('That staff member does not have order-taking permission.'); return; }
   const { error } = await sb.from('checks').update({ server_id: newServerId }).eq('id', checkId);
   if (error){ alert('Error: '+error.message); return; }
   closeModal('formModal');
