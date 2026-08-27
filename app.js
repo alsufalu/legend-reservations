@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.00';
+const APP_VERSION = '2.01';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -1056,8 +1056,8 @@ function render(){
   _lastRenderedTab = state.tab;
   document.querySelectorAll('.tabbtn').forEach(b => b.classList.toggle('active', b.dataset.tab === state.tab));
   if (state.tab === 'reservations') { c.innerHTML = renderReservationsTab(); if (state.resView === 'timeline') scrollTimelineToNow(); }
-  else if (state.tab === 'floorplan') { c.innerHTML = renderFloorPlanTab(); fitFloorCanvasView(); }
-  else if (state.tab === 'split') { c.innerHTML = renderSplitViewTab(); fitFloorCanvasView(); }
+  else if (state.tab === 'floorplan') { renderFloorTabPreservingView(renderFloorPlanTab(), enteringTab); if (enteringTab) loadOrdersData(); }
+  else if (state.tab === 'split') { renderFloorTabPreservingView(renderSplitViewTab(), enteringTab); if (enteringTab) loadOrdersData(); }
   else if (state.tab === 'orders') { c.innerHTML = renderOrdersTab(); if (enteringTab) loadOrdersData(); }
   else if (state.tab === 'kitchen') { c.innerHTML = renderKitchenTab(); if (enteringTab) loadOrdersData(); }
   else if (state.tab === 'expo') { c.innerHTML = renderExpoTab(); if (enteringTab) loadOrdersData(); }
@@ -2069,15 +2069,20 @@ function renderFloorPlanTab(){
       const upcoming = (!state.serverView && !occ && !held)
         ? upcomingSoonReservation(heldRes.filter(r => r.table_id === t.id))
         : null;
+      // Once every open check with items on it is fully paid, flag the table so the host
+      // knows it's about to turn over — even though nobody's bussed it / marked it Dirty
+      // yet. Only relevant for tables currently shown as Seated.
+      const paidUp = !state.serverView && t.status === 'seated' && isTablePaidUp(t.id);
       colorStyle = state.serverView
         ? (section ? `border-color:${section.color};background:${section.color}22;` : 'opacity:.45;')
-        : `border-color:${statusColor};background:${statusColor}22;${upcoming ? 'box-shadow:inset 0 0 0 3px #f59e0b;' : ''}`;
+        : `border-color:${statusColor};background:${statusColor}22;${upcoming ? 'box-shadow:inset 0 0 0 3px #f59e0b;' : paidUp ? 'box-shadow:inset 0 0 0 3px #16a34a;' : ''}`;
       metaHtml = state.serverView
         ? `<div class="ft-meta">${section ? esc(section.name) : 'No section'}</div>${serverName ? `<div class="ft-meta">${esc(serverName)}</div>` : ''}`
         : `<div class="ft-meta">${t.seats} seats</div>${showingAll && areaName ? `<div class="ft-meta">${esc(areaName)}</div>` : ''}`
           + (occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>`
             : held ? `<div class="ft-meta">${esc(guestName(guestById(held.guest_id)))} · ${fmtTime(held.reservation_time)}</div>`
-            : upcoming ? `<div class="ft-meta" style="color:#b45309;font-weight:600">⏰ ${esc(guestName(guestById(upcoming.guest_id)))} in ${timeToMinutes(upcoming.reservation_time) - timeToMinutes(nowHHMM())}m (${fmtTime(upcoming.reservation_time)})</div>` : '');
+            : upcoming ? `<div class="ft-meta" style="color:#b45309;font-weight:600">⏰ ${esc(guestName(guestById(upcoming.guest_id)))} in ${timeToMinutes(upcoming.reservation_time) - timeToMinutes(nowHHMM())}m (${fmtTime(upcoming.reservation_time)})</div>` : '')
+          + (paidUp ? `<div class="ft-meta" style="color:#16a34a;font-weight:700">💵 Paid — ready to turn</div>` : '');
     }
 
     return `
@@ -2151,7 +2156,7 @@ function renderFloorLegend(sc){
     if (!state.serverSections.length) return `<div class="panel-sub" style="margin-bottom:10px">No server sections defined yet — add some in Settings.</div>`;
     return `<div class="floor-legend">${state.serverSections.map(s => `<span class="legend-chip"><span class="legend-swatch" style="background:${esc(s.color)}"></span>${esc(s.name)}</span>`).join('')}<span class="legend-chip"><span class="legend-swatch" style="background:#ccc;opacity:.45"></span>No section</span></div>`;
   }
-  return `<div class="floor-legend">${Object.keys(STATUS_LABELS).map(k => `<span class="legend-chip"><span class="legend-swatch" style="background:${sc[k]}"></span>${STATUS_LABELS[k]}</span>`).join('')}<span class="legend-chip"><span class="legend-swatch" style="background:#fff;box-shadow:inset 0 0 0 3px #f59e0b"></span>⏰ Reservation arriving soon</span><span class="panel-sub" style="margin:0 0 0 4px">Customize the status colors in Settings → Table Status Colors.</span></div>`;
+  return `<div class="floor-legend">${Object.keys(STATUS_LABELS).map(k => `<span class="legend-chip"><span class="legend-swatch" style="background:${sc[k]}"></span>${STATUS_LABELS[k]}</span>`).join('')}<span class="legend-chip"><span class="legend-swatch" style="background:#fff;box-shadow:inset 0 0 0 3px #f59e0b"></span>⏰ Reservation arriving soon</span><span class="legend-chip"><span class="legend-swatch" style="background:#fff;box-shadow:inset 0 0 0 3px #16a34a"></span>💵 Paid — ready to turn</span><span class="panel-sub" style="margin:0 0 0 4px">Customize the status colors in Settings → Table Status Colors.</span></div>`;
 }
 
 window.switchArea = function(id){ state.editMode = false; state.currentAreaId = id; render(); };
@@ -2225,6 +2230,40 @@ window.onPreviewTableClick = function(tableId){
   }
 };
 
+// Re-renders the floor plan (or split view) content while preserving whatever pan/zoom
+// the host currently has set, instead of always snapping back to the auto-fit view.
+// Necessary because the background poll that now also refreshes checks/payments while
+// on this tab (for the "paid up" indicator) triggers a full render every 15s — without
+// this, a host who'd manually zoomed into one area would get yanked back to the fit-all
+// view every 15 seconds. Only a genuine tab entry (or an area with no prior view yet)
+// re-fits from scratch; every other re-render just restores the previous transform/scroll.
+let _lastFloorViewSignature = null;
+function renderFloorTabPreservingView(html, enteringTab){
+  const c = document.getElementById('content');
+  const wrap = document.getElementById('floorCanvasWrap');
+  const canvas = document.getElementById('floorCanvas');
+  // Re-fit whenever the actual view selection changed (area filter, edit mode, server
+  // view, preview mode, or which tab) — only a "nothing changed, this render was just a
+  // background data refresh" case gets its pan/zoom preserved instead of reset.
+  const signature = JSON.stringify([state.tab, state.currentAreaId, state.editMode, state.serverView, state.previewMode]);
+  const signatureChanged = signature !== _lastFloorViewSignature;
+  _lastFloorViewSignature = signature;
+  const prevView = (!enteringTab && !signatureChanged && wrap && canvas)
+    ? { transform: canvas.style.transform, scale: canvas.dataset.scale, scrollLeft: wrap.scrollLeft, scrollTop: wrap.scrollTop }
+    : null;
+  c.innerHTML = html;
+  if (prevView){
+    const w2 = document.getElementById('floorCanvasWrap'), c2 = document.getElementById('floorCanvas');
+    if (w2 && c2){
+      c2.style.transform = prevView.transform;
+      c2.dataset.scale = prevView.scale;
+      w2.scrollLeft = prevView.scrollLeft;
+      w2.scrollTop = prevView.scrollTop;
+      return;
+    }
+  }
+  fitFloorCanvasView();
+}
 // Zoom/pan the canvas to fit the bounding box of whichever area's tables are
 // currently in view, so filtering by area frames just that part of the sketch.
 function fitFloorCanvasView(){
@@ -3244,6 +3283,18 @@ function checkTotalDue(checkId){
   const items = state.checkItems.filter(ci => ci.check_id === checkId && ci.status !== 'voided');
   const subtotal = items.reduce((s,ci)=>s+checkItemTotal(ci), 0);
   return Math.max(0, subtotal - checkDiscountTotal(checkId, subtotal));
+}
+// True once every open check on a table that actually has items on it has been paid down
+// to zero — signals to the host that the table is effectively done, even though nobody has
+// bussed it (changed its floor status to Dirty) yet. A check that's still totally empty
+// (opened but nothing rung in, nothing paid) doesn't count either way — it just means
+// no one's ordered, not that they're "paid up."
+function isTablePaidUp(tableId){
+  const openChecks = state.checks.filter(c => c.table_id === tableId && c.status === 'open');
+  if (!openChecks.length) return false;
+  const withItems = openChecks.filter(c => state.checkItems.some(ci => ci.check_id === c.id && ci.status !== 'voided'));
+  if (!withItems.length) return false;
+  return withItems.every(c => (checkTotalDue(c.id) - checkAmountPaid(c.id)) <= 0.01);
 }
 function checkAmountPaid(checkId){
   return state.payments.filter(p => p.check_id === checkId).reduce((s,p) => s + Number(p.amount) - Number(p.refunded_amount||0), 0);
@@ -4317,7 +4368,10 @@ let _kdsPollInterval = null;
 function startKdsPolling(){
   stopKdsPolling();
   _kdsPollInterval = setInterval(() => {
-    if (state.tab === 'kitchen' || state.tab === 'orders' || state.tab === 'expo') loadOrdersData();
+    // Also poll while on the Floor Plan / Split View tabs — that's what keeps the
+    // "paid up, ready to turn" indicator on table tiles from going stale while a
+    // host is sitting on the floor plan rather than the Orders screen.
+    if (['kitchen','orders','expo','floorplan','split'].includes(state.tab)) loadOrdersData();
   }, 15000);
 }
 function stopKdsPolling(){ if (_kdsPollInterval){ clearInterval(_kdsPollInterval); _kdsPollInterval = null; } }
