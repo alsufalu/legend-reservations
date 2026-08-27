@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.05';
+const APP_VERSION = '2.06';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -1609,7 +1609,7 @@ window.confirmSeat = async function(id){
     // Seating a combo also marks its member tables seated, so the floor plan
     // shows both physical tables occupied (combos don't get their own tile).
     const idsToMark = [tableId, ...(state.comboMembers[tableId] || [])];
-    await sb.from('dining_tables').update({ status:'seated' }).in('id', idsToMark);
+    await sb.from('dining_tables').update({ status:'seated', seated_at: new Date().toISOString() }).in('id', idsToMark);
   }
   closeModal('formModal');
   await Promise.all([reloadReservationsForDate(), reloadTables()]);
@@ -2084,16 +2084,21 @@ function renderFloorPlanTab(){
       // over the Seated color) so it reads clearly at a glance across the whole floor.
       const paidUp = !state.serverView && t.status === 'seated' && !!t.paid_up_at;
       const statusColor = paidUp ? (sc.paid_up || STATUS_COLORS_DEFAULT.paid_up) : (sc[t.status] || STATUS_COLORS_DEFAULT.dirty);
+      const waiting = !paidUp && tableWaitingForOrder(t);
+      const waitMin = waiting ? tableWaitMinutes(t) : 0;
+      const waitColor = waitMin >= 10 ? '#dc2626' : waitMin >= 5 ? '#d97706' : '#2563eb';
       colorStyle = state.serverView
         ? (section ? `border-color:${section.color};background:${section.color}22;` : 'opacity:.45;')
-        : `border-color:${statusColor};background:${statusColor}22;${upcoming ? 'box-shadow:inset 0 0 0 3px #f59e0b;' : ''}`;
+        : `border-color:${statusColor};background:${statusColor}22;${upcoming ? 'box-shadow:inset 0 0 0 3px #f59e0b;' : ''}${waiting ? `box-shadow:inset 0 0 0 3px ${waitColor};` : ''}`;
       metaHtml = state.serverView
         ? `<div class="ft-meta">${section ? esc(section.name) : 'No section'}</div>${serverName ? `<div class="ft-meta">${esc(serverName)}</div>` : ''}`
+          + (waiting ? `<div class="ft-meta" style="color:${waitColor};font-weight:700">⏳ Waiting ${waitMin}m</div>` : '')
         : `<div class="ft-meta">${t.seats} seats</div>${showingAll && areaName ? `<div class="ft-meta">${esc(areaName)}</div>` : ''}`
           + (occ ? `<div class="ft-meta">${esc(guestName(guestById(occ.guest_id)))}</div>`
             : held ? `<div class="ft-meta">${esc(guestName(guestById(held.guest_id)))} · ${fmtTime(held.reservation_time)}</div>`
             : upcoming ? `<div class="ft-meta" style="color:#b45309;font-weight:600">⏰ ${esc(guestName(guestById(upcoming.guest_id)))} in ${timeToMinutes(upcoming.reservation_time) - timeToMinutes(nowHHMM())}m (${fmtTime(upcoming.reservation_time)})</div>` : '')
-          + (paidUp ? `<div class="ft-meta" style="color:${statusColor};font-weight:700">💵 Paid — ready to turn</div>` : '');
+          + (paidUp ? `<div class="ft-meta" style="color:${statusColor};font-weight:700">💵 Paid — ready to turn</div>` : '')
+          + (waiting ? `<div class="ft-meta" style="color:${waitColor};font-weight:700">⏳ Waiting ${waitMin}m to order</div>` : '');
     }
 
     return `
@@ -2167,7 +2172,7 @@ function renderFloorLegend(sc){
     if (!state.serverSections.length) return `<div class="panel-sub" style="margin-bottom:10px">No server sections defined yet — add some in Settings.</div>`;
     return `<div class="floor-legend">${state.serverSections.map(s => `<span class="legend-chip"><span class="legend-swatch" style="background:${esc(s.color)}"></span>${esc(s.name)}</span>`).join('')}<span class="legend-chip"><span class="legend-swatch" style="background:#ccc;opacity:.45"></span>No section</span></div>`;
   }
-  return `<div class="floor-legend">${Object.keys(STATUS_LABELS).map(k => `<span class="legend-chip"><span class="legend-swatch" style="background:${sc[k]}"></span>${STATUS_LABELS[k]}</span>`).join('')}<span class="legend-chip"><span class="legend-swatch" style="background:#fff;box-shadow:inset 0 0 0 3px #f59e0b"></span>⏰ Reservation arriving soon</span><span class="panel-sub" style="margin:0 0 0 4px">Customize the status colors in Settings → Table Status Colors.</span></div>`;
+  return `<div class="floor-legend">${Object.keys(STATUS_LABELS).map(k => `<span class="legend-chip"><span class="legend-swatch" style="background:${sc[k]}"></span>${STATUS_LABELS[k]}</span>`).join('')}<span class="legend-chip"><span class="legend-swatch" style="background:#fff;box-shadow:inset 0 0 0 3px #f59e0b"></span>⏰ Reservation arriving soon</span><span class="legend-chip"><span class="legend-swatch" style="background:#fff;box-shadow:inset 0 0 0 3px #2563eb"></span>⏳ Waiting to order (amber at 5m, red at 10m)</span><span class="panel-sub" style="margin:0 0 0 4px">Customize the status colors in Settings → Table Status Colors.</span></div>`;
 }
 
 window.switchArea = function(id){ state.editMode = false; state.currentAreaId = id; render(); };
@@ -2282,7 +2287,7 @@ function fitFloorCanvasView(){
   const canvas = document.getElementById('floorCanvas');
   if (!wrap || !canvas) return;
 
-  const tables = state.currentAreaId === '__all' ? null
+  const tables = state.currentAreaId === '__all' ? state.tables
     : state.currentAreaId === '__unassigned' ? state.tables.filter(t => !t.area_id)
     : state.tables.filter(t => t.area_id === state.currentAreaId);
 
@@ -2310,6 +2315,16 @@ function fitFloorCanvasView(){
 function getCanvasScale(){
   return Number(document.getElementById('floorCanvas')?.dataset.scale) || 1;
 }
+// Re-fit the floor plan whenever the browser window/pane is resized (e.g. a
+// hostess un-maximizes the window, or rotates a tablet) so tables never sit
+// outside the visible area waiting for the next tab switch to fix themselves.
+// Debounced since 'resize' fires continuously while the user drags an edge.
+let _floorResizeTimer = null;
+window.addEventListener('resize', () => {
+  if (!['floorplan','split'].includes(state.tab)) return;
+  clearTimeout(_floorResizeTimer);
+  _floorResizeTimer = setTimeout(fitFloorCanvasView, 150);
+});
 
 window.cycleTableStatus = async function(id){
   const t = tableById(id);
@@ -2320,8 +2335,10 @@ window.cycleTableStatus = async function(id){
   // one tile), since a combined table turned teal together as one party and should clear
   // together too, rather than leaving the other tiles stuck teal after this one's reset.
   const groupIds = await comboGroupTableIds(id);
+  // seated_at drives the "waiting to order" timer/flag on Orders — start it the moment a
+  // table becomes Seated, clear it the moment it leaves Seated (cleared table, turned, etc).
   await Promise.all([
-    sb.from('dining_tables').update({ status: next }).eq('id', id),
+    sb.from('dining_tables').update({ status: next, seated_at: next === 'seated' ? new Date().toISOString() : null }).eq('id', id),
     sb.from('dining_tables').update({ paid_up_at: null }).in('id', groupIds),
   ]);
   await reloadTables();
@@ -3362,6 +3379,11 @@ function renderOrdersTab(){
   const activeCheck = state.checks.find(c => c.id === state.ordersActiveCheckId && c.status === 'open');
 
   const avgMin = avgOrderTimeMinutes();
+  // Seated tables nobody has rung an item in for yet — the whole point is that a waiter
+  // scanning Orders sees this before a table goes cold, without having to eyeball the
+  // floor plan. Sorted longest-waiting first so the most at-risk table is always on top.
+  const waitingTables = state.tables.filter(t => !t.is_combo && t.active && tableWaitingForOrder(t))
+    .sort((a,b) => tableWaitMinutes(b) - tableWaitMinutes(a));
   return `
   <div class="panel-header"><h2 class="panel-title">Orders</h2>
     <div style="display:flex;align-items:center;gap:12px">
@@ -3370,6 +3392,16 @@ function renderOrdersTab(){
       ${can('take_payment')?`<button class="btn btn-secondary btn-sm" onclick="openRecentPaymentsModal()">Recent Payments</button>`:''}
     </div>
   </div>
+  ${waitingTables.length ? `<div class="card" style="margin-bottom:12px;background:#eff6ff;border:1px solid #bfdbfe">
+    <div style="font-weight:700;margin-bottom:8px">⏳ Waiting to order</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px">
+      ${waitingTables.map(t => {
+        const m = tableWaitMinutes(t);
+        const color = m >= 10 ? '#dc2626' : m >= 5 ? '#d97706' : '#2563eb';
+        return `<div class="area-chip" style="cursor:pointer;border-color:${color};color:${color};font-weight:600" onclick="selectOrdersTable('${t.id}')">${esc(t.label)} · ${m}m</div>`;
+      }).join('')}
+    </div>
+  </div>` : ''}
   <div class="orders-layout">
     <div class="card orders-sidebar">
       ${Object.keys(grouped).length ? `<div style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:4px">
@@ -3386,9 +3418,15 @@ function renderOrdersTab(){
         </div>
         ${collapsed ? '' : grouped[areaName].map(t => {
           const count = state.checks.filter(c=>c.status==='open' && c.table_id===t.id).length;
+          const waiting = tableWaitingForOrder(t);
+          const waitMin = waiting ? tableWaitMinutes(t) : 0;
+          const waitColor = waitMin >= 10 ? '#dc2626' : waitMin >= 5 ? '#d97706' : '#2563eb';
           return `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:5px 6px;cursor:pointer;border-radius:6px;${state.ordersActiveTableId===t.id?'background:#eef2ff':''}" onclick="selectOrdersTable('${t.id}')">
             <span>${esc(t.label)}</span>
-            ${count?`<span class="badge badge-pending">${count} check${count>1?'s':''}</span>`:''}
+            <span style="display:flex;gap:4px;align-items:center">
+              ${waiting?`<span class="badge" style="background:${waitColor}22;color:${waitColor}">⏳ ${waitMin}m</span>`:''}
+              ${count?`<span class="badge badge-pending">${count} check${count>1?'s':''}</span>`:''}
+            </span>
           </div>`;
         }).join('')}
       `;
@@ -3594,6 +3632,36 @@ async function comboGroupTableIds(tableId){
     }
   });
   return [...ids];
+}
+// Synchronous, cache-only version of comboGroupTableIds — used only for the "waiting to
+// order" timer badge, a cosmetic display that self-corrects on the next table/combo
+// reload, so it's fine to trust state.comboMembers here rather than pay for a live query
+// on every render.
+function comboGroupTableIdsSync(tableId){
+  const ids = new Set([tableId]);
+  (state.comboMembers[tableId] || []).forEach(id => ids.add(id));
+  Object.entries(state.comboMembers || {}).forEach(([comboId, memberIds]) => {
+    if ((memberIds||[]).includes(tableId)){
+      ids.add(comboId);
+      (memberIds||[]).forEach(id => ids.add(id));
+    }
+  });
+  return [...ids];
+}
+// A table is "waiting to order" once it's Seated and nobody has rung in a single item yet
+// across any open check tied to its physical group (covers combos, and tables where a
+// check gets opened before the first item is picked). The timer conceptually "stops" the
+// instant this flips false — nothing needs to be written anywhere, it just stops being true.
+function tableWaitingForOrder(t){
+  if (t.status !== 'seated' || !t.seated_at) return false;
+  const groupIds = comboGroupTableIdsSync(t.id);
+  const hasItem = state.checkItems.some(ci => ci.status !== 'voided'
+    && state.checks.some(c => c.id === ci.check_id && c.status === 'open' && groupIds.includes(c.table_id)));
+  return !hasItem;
+}
+function tableWaitMinutes(t){
+  if (!t.seated_at) return 0;
+  return Math.max(0, Math.round((Date.now() - new Date(t.seated_at).getTime()) / 60000));
 }
 async function findGuestForTable(tableId){
   if (!tableId) return null;
@@ -4414,7 +4482,9 @@ function startKdsPolling(){
     // different device (e.g. a hostess's screen) until something on that screen happened
     // to trigger its own reloadTables(). Only worth polling while a table grid is
     // actually on screen.
-    if (['floorplan','split'].includes(state.tab)) reloadTables().then(render);
+    // Orders now also needs live table state so the "waiting to order" seated-timer
+    // banner (and its per-table badges) reflect another device's seating/status changes.
+    if (['floorplan','split','orders'].includes(state.tab)) reloadTables().then(render);
   }, 15000);
 }
 function stopKdsPolling(){ if (_kdsPollInterval){ clearInterval(_kdsPollInterval); _kdsPollInterval = null; } }
