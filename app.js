@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.01';
+const APP_VERSION = '2.02';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -649,15 +649,19 @@ function showTerminalLockOverlay(){
   pinEl?.focus();
 }
 // PIN-only unlock — no name picker. identify_staff_by_pin checks the PIN against every
-// active, order-taking-eligible staff member server-side and returns a match only if
-// exactly one person's PIN fits, which is why PINs must be unique (enforced in
-// set_staff_pin) — a shared PIN would make this lookup ambiguous and always fail closed.
+// active staff member server-side (no permission filter — this overlay gates the whole
+// shared terminal, not just ordering, so a host who only needs to clock in or check the
+// floor plan must be able to unlock it too) and returns a match only if exactly one
+// person's PIN fits, which is why PINs must be unique (enforced in set_staff_pin) — a
+// shared PIN would make this lookup ambiguous and always fail closed. Whatever the
+// unlocked person can actually do once they're in is still fully governed by the normal
+// per-tab/per-action permission checks elsewhere in the app.
 window.unlockTerminal = async function(){
   const pinEl = document.getElementById('lockPin');
   const pin = pinEl?.value;
   const errEl = document.getElementById('lockError');
   if (!pin){ if (errEl) errEl.textContent = 'Enter your PIN.'; return; }
-  const { data: staffId, error } = await sb.rpc('identify_staff_by_pin', { p_pin: pin, p_permission: 'take_orders' });
+  const { data: staffId, error } = await sb.rpc('identify_staff_by_pin', { p_pin: pin });
   if (error || !staffId){ if (errEl) errEl.textContent = 'Incorrect PIN.'; if (pinEl) pinEl.value = ''; pinEl?.focus(); return; }
   const staffRow = state.staffList.find(s => s.id === staffId);
   if (!staffRow){ if (errEl) errEl.textContent = 'Could not find that staff record — try again.'; return; }
