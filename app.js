@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '1.89';
+const APP_VERSION = '1.90';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -3214,6 +3214,18 @@ async function loadOrdersData(){
     state.checkDiscounts = [];
     state.payments = [];
   }
+  // guests/loyaltyMembers are loaded once at sign-in and never re-fetched wholesale — fine on
+  // the device that made a change (it reloads its own local copy right after), but a second
+  // device just sitting on Orders won't otherwise learn about a guest linked/created, or a
+  // membership linked, by someone else mid-shift. Top up only the specific rows this device's
+  // open checks now reference but doesn't have yet, so that resolves within one poll cycle
+  // instead of needing a full page reload.
+  const missingGuestIds = [...new Set(state.checks.map(c=>c.guest_id).filter(Boolean))].filter(id => !state.guests.some(g=>g.id===id));
+  const missingMemberIds = [...new Set(state.checks.map(c=>c.loyalty_member_id).filter(Boolean))].filter(id => !state.loyaltyMembers.some(m=>m.id===id));
+  const topUps = [];
+  if (missingGuestIds.length) topUps.push(sb.from('guests').select('*').in('id', missingGuestIds).then(r => { if (r.data?.length) state.guests = [...state.guests, ...r.data]; }));
+  if (missingMemberIds.length) topUps.push(sb.from('loyalty_members').select('*').in('id', missingMemberIds).then(r => { if (r.data?.length) state.loyaltyMembers = [...state.loyaltyMembers, ...r.data]; }));
+  if (topUps.length) await Promise.all(topUps);
   render();
 }
 // Discount total (dollars) currently applied to a check, excluding item comps (which already
@@ -3364,6 +3376,12 @@ function renderCheckDetail(check){
   const paid = checkAmountPaid(check.id);
   const balance = Math.max(0, totalDue - paid);
   const payments = state.payments.filter(p=>p.check_id===check.id);
+  // Whether the check currently has anything in the "apps" or "mains" bucket (by course,
+  // not menu-item default) — used below to hide the Fire-with-apps/Hold-with-mains toggles
+  // when there's nothing on the other side to join, since offering them then is misleading:
+  // with no apps at all, fireCheck() just sends everything together regardless of course.
+  const hasApps = items.some(ci => ci.course === 1);
+  const hasMains = items.some(ci => ci.course >= 2);
   return `
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
@@ -3405,13 +3423,13 @@ function renderCheckDetail(check){
           const overridden = naturalCourse>=2 && ci.course===1; // main reclassified to fire early with apps
           const heldToMains = naturalCourse===1 && ci.course>=2; // app reclassified to hold and fire with mains instead
           let courseToggleHtml = '';
-          if (naturalCourse>=2 && ci.course>=2 && removable){
+          if (naturalCourse>=2 && ci.course>=2 && removable && hasApps){
             courseToggleHtml = `<span class="linkBtn" style="cursor:pointer" onclick="fireItemWithApps('${ci.id}')">Fire with apps</span>`;
           } else if (overridden && ci.status==='open'){
             courseToggleHtml = `<span class="linkBtn" style="cursor:pointer" onclick="undoFireWithApps('${ci.id}')">Undo — hold with mains</span>`;
           } else if (overridden){
             courseToggleHtml = `<span style="color:var(--gray)">Fired with apps</span>`;
-          } else if (naturalCourse===1 && ci.course===1 && ci.status==='open'){
+          } else if (naturalCourse===1 && ci.course===1 && ci.status==='open' && hasMains){
             courseToggleHtml = `<span class="linkBtn" style="cursor:pointer" onclick="holdItemWithMains('${ci.id}')">Hold with mains</span>`;
           } else if (heldToMains && ci.status==='open'){
             courseToggleHtml = `<span class="linkBtn" style="cursor:pointer" onclick="undoHoldWithMains('${ci.id}')">Undo — fire with apps</span>`;
