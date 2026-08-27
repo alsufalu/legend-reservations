@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.06';
+const APP_VERSION = '2.07';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -2305,7 +2305,15 @@ function fitFloorCanvasView(){
   const maxY = Math.max(...tables.map(t => t.pos_y + t.height)) + PAD;
   const boxW = Math.max(1, maxX - minX), boxH = Math.max(1, maxY - minY);
 
-  const scale = Math.max(0.3, Math.min(4, Math.min(wrap.clientWidth / boxW, wrap.clientHeight / boxH)));
+  // Floor raised from 0.3 to 0.55 so "All Areas" (bounding box = the whole restaurant)
+  // never shrinks tables past a legible size — a very spread-out floor plan will scroll
+  // a little at this floor instead, which reads better than tiny illegible tiles. Ceiling
+  // raised from 4 to 8 so a single small area (a few tables close together, a small box)
+  // actually zooms in to fill the screen instead of hitting the old low ceiling almost
+  // every time — that hard cap was why switching between individual areas looked like it
+  // wasn't fitting at all: most single-area boxes are small enough to want >4x and were
+  // all landing on the exact same clamped value regardless of which area was picked.
+  const scale = Math.max(0.55, Math.min(8, Math.min(wrap.clientWidth / boxW, wrap.clientHeight / boxH)));
   canvas.style.transformOrigin = '0 0';
   canvas.style.transform = `scale(${scale})`;
   canvas.dataset.scale = String(scale);
