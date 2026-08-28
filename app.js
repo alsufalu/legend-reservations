@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.07';
+const APP_VERSION = '2.09';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -125,6 +125,7 @@ let state = {
   roster: [], // server_roster: name-only entries for section assignment, no login account
   servicePeriods: [],
   dashRange: 7,
+  reportRange: 7, reportStaffFilter: '',
   loyaltyTiers: [],    // club/society/founders terms — editable in Settings, not hardcoded
   loyaltyMembers: [],  // one row per enrolled guest (guests.id -> loyalty_members.guest_id)
   priorityHolidays: [], // dates where Founder's Circle gets the extended 14-day booking lead
@@ -954,6 +955,7 @@ const TAB_PERMISSIONS = {
   guests: ['manage_reservations','manage_loyalty_program'],
   loyalty: ['manage_loyalty_program'],
   dashboard: ['view_reports'],
+  reports: ['view_reports','manage_payroll'],
   settings: ['manage_reservations','manage_staff_permissions','manage_loyalty_program','manage_menu','manage_ingredients_costing','manage_inventory'],
   schedule: ['view_own_schedule','manage_schedule','clock_in_out','request_time_off'],
   orders: ['take_orders','take_payment'],
@@ -987,6 +989,7 @@ const PERMISSION_CATEGORIES = {
   manage_broadcasts: 'Messaging',
   manage_staff_permissions: 'Staff & Reports',
   view_reports: 'Staff & Reports',
+  manage_payroll: 'Staff & Reports',
 };
 const PERMISSION_CATEGORY_ORDER = ['Orders & Payments','Gift Cards','Kitchen & Expo','Menu & Inventory','Reservations & Loyalty','Schedule & Time','Messaging','Staff & Reports'];
 // Frontline roles must be on the clock to touch guest-facing/job-function screens — this keeps
@@ -1074,6 +1077,7 @@ function render(){
   else if (state.tab === 'loyalty') c.innerHTML = renderLoyaltyTab();
   else if (state.tab === 'schedule') { c.innerHTML = renderScheduleTab(); if (enteringTab) loadScheduleData(); }
   else if (state.tab === 'dashboard') { c.innerHTML = renderDashboardTab(); loadDashboard(); }
+  else if (state.tab === 'reports') { c.innerHTML = renderReportsTab(); loadLaborReport(); }
   else if (state.tab === 'settings') c.innerHTML = renderSettingsTab();
   if (focusPreserve){
     const el = document.getElementById(focusPreserve.id);
@@ -3280,6 +3284,161 @@ async function loadDashboard(){
 }
 
 // ============================================================================
+// REPORTS TAB — currently just Labor & Clock (who's on the clock right now and what
+// it's costing, plus a filterable historical view with hours/rate/tips per shift), built
+// as a picker so more report types can be added alongside it later without restructuring.
+// Gated behind manage_payroll (a viewer without it sees the tab but not the wage data —
+// the same boundary RLS enforces server-side on staff_pay_history/time_clock_entries).
+// ============================================================================
+function renderReportsTab(){
+  return `
+  <div class="panel-header"><h2 class="panel-title">Reports</h2></div>
+  <div class="orders-layout">
+    <div class="card orders-sidebar">
+      <div class="res-meta" style="font-weight:600;background:#eef2ff;padding:6px 8px;border-radius:6px">⏱️ Labor &amp; Clock</div>
+      <div class="panel-sub" style="margin-top:12px">More reports coming soon.</div>
+    </div>
+    <div class="orders-main">
+      <div id="laborReportBody"><div class="empty-state">Loading…</div></div>
+    </div>
+  </div>`;
+}
+function fmtHours(hrs){
+  if (!(hrs >= 0)) return '—';
+  const h = Math.floor(hrs), m = Math.round((hrs - h) * 60);
+  return `${h}h ${m}m`;
+}
+window.setReportRange = function(n){ state.reportRange = n; loadLaborReport(); };
+window.setReportStaffFilter = function(id){ state.reportStaffFilter = id; loadLaborReport(); };
+async function loadLaborReport(){
+  const el = document.getElementById('laborReportBody');
+  if (!el) return;
+  if (!can('manage_payroll')){
+    el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🔒</div>You don't have access to labor cost data.<br><span class="panel-sub">Ask an admin to grant the "Payroll &amp; Staff Records" permission in Settings → Staff Access.</span></div>`;
+    return;
+  }
+  const nowIso = new Date().toISOString();
+  const end = getNow();
+  const start = getNow();
+  start.setDate(end.getDate() - (state.reportRange - 1));
+  const startTs = new Date(toLocalISODate(start)+'T00:00:00').toISOString();
+  const endTs = new Date(toLocalISODate(end)+'T23:59:59.999').toISOString();
+
+  const [{ data: liveEntries }, { data: rangeEntries }, { data: payHistory }] = await Promise.all([
+    sb.from('time_clock_entries').select('*').is('clock_out_at', null).order('clock_in_at'),
+    sb.from('time_clock_entries').select('*').gte('clock_in_at', startTs).lte('clock_in_at', endTs).order('clock_in_at', { ascending: false }),
+    sb.from('staff_pay_history').select('*').order('effective_at'),
+  ]);
+  const allEntries = [...(liveEntries||[]), ...(rangeEntries||[])];
+  const staffIds = [...new Set(allEntries.map(e=>e.staff_id))];
+  // Tips/sales per shift are derived from payments on checks that staff member served,
+  // scoped to roughly this window — computed fresh each time rather than trusting
+  // time_clock_entries.computed_card_tips, which nothing has ever actually written to.
+  const { data: rangeChecks } = staffIds.length
+    ? await sb.from('checks').select('id,server_id,opened_at').in('server_id', staffIds).gte('opened_at', startTs).lte('opened_at', endTs)
+    : { data: [] };
+  const checkIds = (rangeChecks||[]).map(c=>c.id);
+  const { data: rangePayments } = checkIds.length ? await sb.from('payments').select('*').in('check_id', checkIds) : { data: [] };
+
+  // payHistory is fetched sorted ascending (globally) by effective_at — filtering to one
+  // staff_id preserves that relative order, so the last match still is the most recent
+  // rate in effect at-or-before the given timestamp (a shift's clock-in for historical
+  // rows, or right now for the live section) — this is what makes a raise mid-history
+  // apply only to shifts worked after it, not retroactively to earlier ones.
+  const rateForStaffAt = (staffId, atIso) => {
+    const at = new Date(atIso).getTime();
+    const rows = (payHistory||[]).filter(h => h.staff_id === staffId && new Date(h.effective_at).getTime() <= at);
+    return rows.length ? Number(rows[rows.length-1].hourly_rate) : null;
+  };
+  const nameFor = (id) => state.staffList.find(s=>s.id===id)?.name || '?';
+  const posFor = (id) => state.staffList.find(s=>s.id===id)?.position || '';
+  const tipsAndSalesFor = (staffId, fromIso, toIso) => {
+    const pays = (rangePayments||[]).filter(p => {
+      const chk = (rangeChecks||[]).find(c=>c.id===p.check_id);
+      return chk && chk.server_id === staffId && p.created_at >= fromIso && p.created_at <= toIso;
+    });
+    const cardTips = pays.reduce((s,p)=>s+Number(p.tip_amount||0),0);
+    const sales = pays.reduce((s,p)=>s+Number(p.amount)-Number(p.refunded_amount||0),0);
+    return { cardTips, sales };
+  };
+
+  const liveRows = (liveEntries||[]).map(e => {
+    const rate = rateForStaffAt(e.staff_id, nowIso);
+    const hrs = (Date.now() - new Date(e.clock_in_at).getTime()) / 3600000;
+    return { ...e, name: nameFor(e.staff_id), position: posFor(e.staff_id), rate, hrs, cost: rate!=null ? rate*hrs : null };
+  }).sort((a,b) => a.clock_in_at.localeCompare(b.clock_in_at));
+  const liveLaborTotal = liveRows.reduce((s,r)=>s+(r.cost||0),0);
+
+  const filteredEntries = (rangeEntries||[]).filter(e => !state.reportStaffFilter || e.staff_id === state.reportStaffFilter);
+  const histRows = filteredEntries.map(e => {
+    const rate = rateForStaffAt(e.staff_id, e.clock_in_at);
+    const outIso = e.clock_out_at || nowIso;
+    const hrs = (new Date(outIso) - new Date(e.clock_in_at)) / 3600000;
+    const { cardTips, sales } = tipsAndSalesFor(e.staff_id, e.clock_in_at, outIso);
+    const cashTips = Number(e.declared_cash_tips||0);
+    const totalTips = cardTips + cashTips;
+    return {
+      ...e, name: nameFor(e.staff_id), position: posFor(e.staff_id), rate, hrs,
+      cost: rate!=null ? rate*hrs : null, cardTips, cashTips, totalTips,
+      tipPct: sales ? (totalTips/sales*100) : null,
+    };
+  });
+  const histLaborTotal = histRows.reduce((s,r)=>s+(r.cost||0),0);
+  const histHoursTotal = histRows.reduce((s,r)=>s+r.hrs,0);
+  const histTipsTotal = histRows.reduce((s,r)=>s+r.totalTips,0);
+  const staffOptions = [...new Map(allEntries.map(e=>[e.staff_id, nameFor(e.staff_id)])).entries()].sort((a,b)=>a[1].localeCompare(b[1]));
+
+  const timeStr = (iso) => new Date(iso).toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
+  el.innerHTML = `
+    <div class="section-heading" style="margin-top:0">🟢 Currently Clocked In</div>
+    <div class="card" style="margin-bottom:20px">
+      <table class="data-table">
+        <thead><tr><th>Staff</th><th>Position</th><th>Clocked In</th><th>Elapsed</th><th>Rate</th><th>Running Cost</th></tr></thead>
+        <tbody>
+          ${liveRows.map(r=>`<tr><td>${esc(r.name)}</td><td>${esc(r.position||'—')}</td><td>${timeStr(r.clock_in_at)}</td><td>${fmtHours(r.hrs)}</td><td>${r.rate!=null?'$'+r.rate.toFixed(2)+'/hr':'—'}</td><td>${r.cost!=null?'$'+r.cost.toFixed(2):'—'}</td></tr>`).join('') || '<tr><td colspan="6"><span class="panel-sub">Nobody is currently clocked in.</span></td></tr>'}
+        </tbody>
+        ${liveRows.length ? `<tfoot><tr style="font-weight:700"><td colspan="5">Total running labor cost</td><td>$${liveLaborTotal.toFixed(2)}</td></tr></tfoot>` : ''}
+      </table>
+    </div>
+
+    <div class="panel-header" style="margin-bottom:8px">
+      <div class="section-heading" style="margin:0">📅 Historical</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        ${[1,7,14,30,90].map(n => `<span class="chip ${state.reportRange===n?'active':''}" onclick="setReportRange(${n})">${n===1?'Today':n+'d'}</span>`).join('')}
+        <select class="modal-select" style="margin:0;width:auto" onchange="setReportStaffFilter(this.value)">
+          <option value="">All Staff</option>
+          ${staffOptions.map(([id,name])=>`<option value="${id}" ${state.reportStaffFilter===id?'selected':''}>${esc(name)}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div class="grid grid-4" style="margin-bottom:16px">
+      <div class="kpi-card"><div class="kpi-value">${histHoursTotal.toFixed(1)}</div><div class="kpi-label">Hours Worked</div></div>
+      <div class="kpi-card"><div class="kpi-value">$${histLaborTotal.toFixed(2)}</div><div class="kpi-label">Labor Cost</div></div>
+      <div class="kpi-card"><div class="kpi-value">$${histTipsTotal.toFixed(2)}</div><div class="kpi-label">Total Tips</div></div>
+      <div class="kpi-card"><div class="kpi-value">${histRows.length}</div><div class="kpi-label">Shifts</div></div>
+    </div>
+    <div class="card">
+      <table class="data-table">
+        <thead><tr><th>Staff</th><th>Date</th><th>Clock In</th><th>Clock Out</th><th>Hours</th><th>Rate</th><th>Labor $</th><th>Cash Tips</th><th>Card Tips</th><th>Tip %</th></tr></thead>
+        <tbody>
+          ${histRows.map(r=>`<tr>
+            <td>${esc(r.name)}</td>
+            <td>${new Date(r.clock_in_at).toLocaleDateString()}</td>
+            <td>${timeStr(r.clock_in_at)}</td>
+            <td>${r.clock_out_at ? timeStr(r.clock_out_at) : '<span style="color:#16a34a">still clocked in</span>'}</td>
+            <td>${fmtHours(r.hrs)}</td>
+            <td>${r.rate!=null?'$'+r.rate.toFixed(2):'—'}</td>
+            <td>${r.cost!=null?'$'+r.cost.toFixed(2):'—'}</td>
+            <td>$${r.cashTips.toFixed(2)}</td>
+            <td>$${r.cardTips.toFixed(2)}</td>
+            <td>${r.tipPct!=null?r.tipPct.toFixed(1)+'%':'—'}</td>
+          </tr>`).join('') || '<tr><td colspan="10"><span class="panel-sub">No shifts in this range.</span></td></tr>'}
+        </tbody>
+      </table>
+    </div>`;
+}
+
+// ============================================================================
 // ORDERS TAB — table/check selection, item entry with modifiers, firing to
 // the kitchen/bar, check splitting (equal-ways or item-to-item move), and
 // linking a loyalty membership for automatic discounting at payment time
@@ -3319,9 +3478,33 @@ async function loadOrdersData(){
 }
 // Discount total (dollars) currently applied to a check, excluding item comps (which already
 // remove their own item from the subtotal by voiding it — counting them again would double-dip).
+// Multiple discounts on one check (loyalty free-drink redemptions, a membership
+// discount, a manual discretionary discount) used to each compute independently
+// against the full original subtotal, then get summed — so a 50%-off discount plus
+// several loyalty redemptions could add up to MORE than the check was ever worth
+// (seen in the wild: $102 of "discount" on a $68 subtotal, because the 50%-off was
+// computed against the pre-redemption $68 instead of what was actually still left).
+// Apply them sequentially instead, in the order they were added, each one working
+// off whatever's actually still left after the discounts before it — so a percent-off
+// discount added after a redemption is "50% off what's left," not "50% off the
+// original ticket," and the total can never exceed the subtotal. Shared by the live
+// Orders check view (via checkDiscountTotal, off state.checkDiscounts) and the guest
+// history popup (which fetches its own discount rows for possibly-closed checks that
+// aren't in state at all), so both agree on the same math.
+function sumDiscountsSequential(discs, subtotal){
+  const ordered = (discs||[]).filter(d => d.type !== 'comp_item')
+    .slice().sort((a,b) => (a.created_at||'').localeCompare(b.created_at||''));
+  let remaining = subtotal, total = 0;
+  ordered.forEach(d => {
+    const raw = d.percent ? remaining * (d.percent/100) : (Number(d.amount)||0);
+    const applied = Math.max(0, Math.min(raw, remaining));
+    total += applied;
+    remaining -= applied;
+  });
+  return total;
+}
 function checkDiscountTotal(checkId, subtotal){
-  return state.checkDiscounts.filter(d => d.check_id === checkId && d.type !== 'comp_item')
-    .reduce((s,d) => s + (d.percent ? subtotal * (d.percent/100) : (Number(d.amount)||0)), 0);
+  return sumDiscountsSequential(state.checkDiscounts.filter(d => d.check_id === checkId), subtotal);
 }
 function checkTotalDue(checkId){
   const items = state.checkItems.filter(ci => ci.check_id === checkId && ci.status !== 'voided');
@@ -4148,8 +4331,7 @@ async function renderGuestHistoryView(guestId){
   const rows = (checks||[]).map(ch => {
     const chItems = items.filter(i => i.check_id === ch.id && i.status !== 'voided');
     const subtotal = chItems.reduce((s,ci)=>s+checkItemTotal(ci), 0);
-    const chDiscounts = discounts.filter(d=>d.check_id===ch.id && d.type!=='comp_item');
-    const discountTotal = chDiscounts.reduce((s,d)=>s+(d.percent ? subtotal*(d.percent/100) : (Number(d.amount)||0)), 0);
+    const discountTotal = sumDiscountsSequential(discounts.filter(d=>d.check_id===ch.id), subtotal);
     const total = Math.max(0, subtotal - discountTotal);
     const table = tableById(ch.table_id);
     const server = state.staffList.find(s=>s.id===ch.server_id);
@@ -4275,17 +4457,26 @@ window.applyLoyaltyDiscount = async function(checkId){
   await loadOrdersData();
 };
 window.openPaymentModal = function(checkId){
+  const check = state.checks.find(c=>c.id===checkId);
   const subtotal = state.checkItems.filter(ci=>ci.check_id===checkId && ci.status!=='voided').reduce((s,ci)=>s+checkItemTotal(ci),0);
   const discountTotal = checkDiscountTotal(checkId, subtotal);
   const totalDue = checkTotalDue(checkId);
   const paid = checkAmountPaid(checkId);
   const balance = Math.max(0, totalDue - paid);
+  // On a split check, each round of "Take Payment" should default to one way's share, not
+  // the whole remaining balance — the guest-facing math already promises "N-way split ≈ $Y
+  // each", so charging the full balance on the first tap silently broke that promise. Once
+  // fewer than one full share is left (the last way, or a rounding remainder), fall back to
+  // whatever's actually still owed instead of overshooting it.
+  const ways = check?.split_ways > 1 ? check.split_ways : 1;
+  const perWay = totalDue / ways;
+  const defaultAmount = ways > 1 ? Math.min(balance, perWay) : balance;
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
     <h3>Take Payment</h3>
-    <div class="panel-sub" style="margin-bottom:10px">Subtotal $${subtotal.toFixed(2)}${discountTotal?` · Discounts -$${discountTotal.toFixed(2)}`:''} · Total due $${totalDue.toFixed(2)}${paid?` · Already paid $${paid.toFixed(2)}`:''}</div>
+    <div class="panel-sub" style="margin-bottom:10px">Subtotal $${subtotal.toFixed(2)}${discountTotal?` · Discounts -$${discountTotal.toFixed(2)}`:''} · Total due $${totalDue.toFixed(2)}${paid?` · Already paid $${paid.toFixed(2)}`:''}${ways>1?` · ${ways}-way split ≈ $${perWay.toFixed(2)} each`:''}</div>
     <div class="formgrid">
-      <div><label class="field-label">Amount ($)</label><input type="number" min="0.01" step="0.01" class="modal-input" id="payAmount" value="${balance.toFixed(2)}"/></div>
+      <div><label class="field-label">Amount ($)</label><input type="number" min="0.01" step="0.01" class="modal-input" id="payAmount" value="${defaultAmount.toFixed(2)}"/></div>
       <div><label class="field-label">Tip ($)</label><input type="number" min="0" step="0.01" class="modal-input" id="payTip" value="0"/></div>
     </div>
     <label class="field-label">Method</label>
@@ -4493,6 +4684,10 @@ function startKdsPolling(){
     // Orders now also needs live table state so the "waiting to order" seated-timer
     // banner (and its per-table badges) reflect another device's seating/status changes.
     if (['floorplan','split','orders'].includes(state.tab)) reloadTables().then(render);
+    // Keeps "Currently Clocked In" (elapsed time, running labor cost) live without the
+    // viewer having to re-pick the date range/staff filter — loadLaborReport() re-fetches
+    // both sections but is cheap at restaurant scale and this only runs while the tab is open.
+    if (state.tab === 'reports') loadLaborReport();
   }, 15000);
 }
 function stopKdsPolling(){ if (_kdsPollInterval){ clearInterval(_kdsPollInterval); _kdsPollInterval = null; } }
@@ -6410,28 +6605,90 @@ window.openEditStaffModal = function(staffId){
   const s = state.staffList.find(x => x.id === staffId);
   if (!s) return;
   const box = document.getElementById('formModalBox');
+  // Pay rate history and HR comments are sensitive (wages, disciplinary notes) — only
+  // shown here at all if this viewer holds manage_payroll, which also gates the RLS on
+  // both underlying tables, so hiding the section is UX rather than the security boundary.
+  const payrollAccess = can('manage_payroll');
   box.innerHTML = `
     <h3>Edit Staff Profile</h3>
     <p class="modal-user-email">Login email: ${esc(s.email)} — email isn't editable here since it's tied to their sign-in account.</p>
     <label class="field-label">Name</label>
     <input type="text" class="modal-input" id="editStaffName" value="${esc(s.name||'')}"/>
+    <label class="field-label">Position</label>
+    <input type="text" class="modal-input" id="editStaffPosition" value="${esc(s.position||'')}" placeholder="e.g. Line Cook, Head Bartender"/>
     <label class="field-label">Phone</label>
     <input type="tel" class="modal-input" id="editStaffPhone" value="${esc(s.phone||'')}" placeholder="(555) 555-5555"/>
     <label class="field-label">Address</label>
     <input type="text" class="modal-input" id="editStaffAddress" value="${esc(s.address||'')}" placeholder="Street, city, state, zip"/>
+    ${payrollAccess ? `
+    <div class="section-heading" style="margin-top:16px">Pay Rate History</div>
+    <div id="payHistoryBody" class="panel-sub">Loading…</div>
+    <div style="display:flex;gap:8px;align-items:center;margin:8px 0">
+      <input type="number" min="0" step="0.01" class="modal-input" style="margin:0;width:110px" id="newPayRate" placeholder="$/hr"/>
+      <input type="text" class="modal-input" style="margin:0;flex:1" id="newPayNote" placeholder="Note (e.g. annual raise)"/>
+      <button class="btn btn-secondary btn-sm" onclick="submitNewPayRate('${staffId}')">+ Set New Rate</button>
+    </div>
+    <div class="section-heading">Comments</div>
+    <div id="staffCommentsBody" class="panel-sub">Loading…</div>
+    <div style="display:flex;gap:8px;align-items:center;margin:8px 0">
+      <input type="text" class="modal-input" style="margin:0;flex:1" id="newStaffComment" placeholder="Add a note…"/>
+      <button class="btn btn-secondary btn-sm" onclick="submitNewStaffComment('${staffId}')">+ Add</button>
+    </div>` : ''}
     <div class="modal-actions">
       <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
       <button class="modal-btn modal-btn-primary" onclick="saveStaffProfile('${staffId}')">Save</button>
     </div>`;
   document.getElementById('formModal').classList.remove('hidden');
+  if (payrollAccess) loadStaffPayrollExtras(staffId);
+};
+
+// Pay rate rows are never edited or deleted once written — a raise (or a correction)
+// always adds a new row, so the exact rate in effect on any past date can be reconstructed
+// for historical labor-cost reporting, and nothing is ever silently overwritten.
+async function loadStaffPayrollExtras(staffId){
+  const [{ data: history }, { data: comments }] = await Promise.all([
+    sb.from('staff_pay_history').select('*').eq('staff_id', staffId).order('effective_at', { ascending: false }),
+    sb.from('staff_comments').select('*').eq('staff_id', staffId).order('created_at', { ascending: false }),
+  ]);
+  const hBody = document.getElementById('payHistoryBody');
+  if (hBody){
+    hBody.innerHTML = (history && history.length)
+      ? history.map((h,i) => `<div>${i===0?'<b>':''}$${Number(h.hourly_rate).toFixed(2)}/hr${i===0?' (current)':''}${i===0?'</b>':''} — effective ${new Date(h.effective_at).toLocaleDateString()}${h.note?' — '+esc(h.note):''}</div>`).join('')
+      : 'No pay rate on record yet.';
+  }
+  const cBody = document.getElementById('staffCommentsBody');
+  if (cBody){
+    cBody.innerHTML = (comments && comments.length)
+      ? comments.map(c => `<div style="margin-bottom:4px">${esc(c.comment)} <span style="opacity:.6">— ${new Date(c.created_at).toLocaleDateString()}</span></div>`).join('')
+      : 'No comments yet.';
+  }
+}
+window.submitNewPayRate = async function(staffId){
+  const rate = parseFloat(document.getElementById('newPayRate').value);
+  const note = document.getElementById('newPayNote').value.trim() || null;
+  if (!(rate >= 0)){ alert('Enter a valid hourly rate.'); return; }
+  const { error } = await sb.from('staff_pay_history').insert({ staff_id: staffId, hourly_rate: rate, note, created_by: currentStaff.id });
+  if (error){ alert('Error: '+error.message); return; }
+  document.getElementById('newPayRate').value = '';
+  document.getElementById('newPayNote').value = '';
+  await loadStaffPayrollExtras(staffId);
+};
+window.submitNewStaffComment = async function(staffId){
+  const comment = document.getElementById('newStaffComment').value.trim();
+  if (!comment) return;
+  const { error } = await sb.from('staff_comments').insert({ staff_id: staffId, comment, created_by: currentStaff.id });
+  if (error){ alert('Error: '+error.message); return; }
+  document.getElementById('newStaffComment').value = '';
+  await loadStaffPayrollExtras(staffId);
 };
 
 window.saveStaffProfile = async function(staffId){
   const name = document.getElementById('editStaffName').value.trim();
+  const position = document.getElementById('editStaffPosition')?.value.trim() || null;
   const phone = document.getElementById('editStaffPhone').value.trim() || null;
   const address = document.getElementById('editStaffAddress').value.trim() || null;
   if (!name){ alert('Name is required.'); return; }
-  const { error } = await sb.from('staff').update({ name, phone, address }).eq('id', staffId);
+  const { error } = await sb.from('staff').update({ name, position, phone, address }).eq('id', staffId);
   if (error){ alert('Error: '+error.message); return; }
   await reloadStaffList();
   closeModal('formModal');
