@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.09';
+const APP_VERSION = '2.10';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -126,6 +126,7 @@ let state = {
   servicePeriods: [],
   dashRange: 7,
   reportRange: 7, reportStaffFilter: '',
+  staffPositions: [],
   loyaltyTiers: [],    // club/society/founders terms — editable in Settings, not hardcoded
   loyaltyMembers: [],  // one row per enrolled guest (guests.id -> loyalty_members.guest_id)
   priorityHolidays: [], // dates where Founder's Circle gets the extended 14-day booking lead
@@ -855,19 +856,21 @@ async function loadAll(){
       sb.from('modifier_options').select('*').order('sort_order'),
       sb.from('menu_item_modifier_groups').select('*'),
     ]);
-    const [vendorsRes, poRes, poItemsRes, terminalsRes, clockRes, kitchenSettingsRes] = await Promise.all([
+    const [vendorsRes, poRes, poItemsRes, terminalsRes, clockRes, kitchenSettingsRes, positionsRes] = await Promise.all([
       sb.from('vendors').select('*').order('name'),
       sb.from('purchase_orders').select('*').order('created_at', { ascending: false }),
       sb.from('purchase_order_items').select('*'),
       sb.from('clock_terminals').select('*').order('created_at'),
       sb.from('time_clock_entries').select('*').order('clock_in_at', { ascending: false }).limit(300),
       sb.from('kitchen_settings').select('*').eq('id', true).maybeSingle(),
+      sb.from('staff_positions').select('*').order('name'),
     ]);
     state.vendors = vendorsRes.data || [];
     state.purchaseOrders = poRes.data || [];
     state.purchaseOrderItems = poItemsRes.data || [];
     state.clockTerminals = terminalsRes.data || [];
     state.timeClockEntries = clockRes.data || [];
+    state.staffPositions = positionsRes.data || [];
     state.kitchenSettings = kitchenSettingsRes.data || { course_hold_minutes: 12 };
     state.tables = tablesRes.data || [];
     state.areas = areasRes.data || [];
@@ -6542,6 +6545,53 @@ function renderStaffAccessSection(){
   </div>`;
 }
 
+function renderPositionsSection(){
+  return `
+  <div class="section-heading">Positions</div>
+  <div class="panel-sub" style="margin-bottom:10px">The managed list of job titles staff can be assigned to on their profile (separate from their login role, which drives permissions) — pick from here instead of typing a new one each time so titles stay consistent.</div>
+  <div class="card">
+    <table class="data-table">
+      <thead><tr><th>Name</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        ${state.staffPositions.map(p => `<tr>
+          <td>${esc(p.name)}</td>
+          <td>${p.active ? '<span class="badge badge-confirmed">active</span>' : '<span class="badge badge-pending">inactive</span>'}</td>
+          <td style="display:flex;gap:6px">
+            <button class="btn btn-sm btn-secondary" onclick="renamePosition('${p.id}')">Rename</button>
+            <button class="btn btn-sm ${p.active?'btn-danger':'btn-success'}" onclick="togglePositionActive('${p.id}', ${!p.active})">${p.active?'Deactivate':'Reactivate'}</button>
+          </td>
+        </tr>`).join('') || '<tr><td colspan="3"><span class="panel-sub">No positions defined yet.</span></td></tr>'}
+      </tbody>
+    </table>
+    <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="addPosition()">+ Add Position</button></div>
+  </div>`;
+}
+window.addPosition = async function(){
+  const name = prompt('New position title (e.g. Line Cook, Head Bartender):');
+  if (!name || !name.trim()) return;
+  const { error } = await sb.from('staff_positions').insert({ name: name.trim() });
+  if (error){ alert('Error: '+error.message); return; }
+  const { data } = await sb.from('staff_positions').select('*').order('name');
+  state.staffPositions = data || [];
+  render();
+};
+window.renamePosition = async function(id){
+  const p = state.staffPositions.find(x=>x.id===id);
+  const name = prompt('Rename position:', p?.name || '');
+  if (!name || !name.trim()) return;
+  const { error } = await sb.from('staff_positions').update({ name: name.trim() }).eq('id', id);
+  if (error){ alert('Error: '+error.message); return; }
+  const { data } = await sb.from('staff_positions').select('*').order('name');
+  state.staffPositions = data || [];
+  render();
+};
+window.togglePositionActive = async function(id, active){
+  await sb.from('staff_positions').update({ active }).eq('id', id);
+  const { data } = await sb.from('staff_positions').select('*').order('name');
+  state.staffPositions = data || [];
+  render();
+};
+
 // Registry driving both the Settings directory (link grid) and the focused single-section
 // pop-out windows opened from it — one source of truth for what sections exist, their gating,
 // and how to render them, so the two views can never drift out of sync with each other.
@@ -6558,6 +6608,7 @@ const SETTINGS_SECTIONS = [
   { key:'ingredients', label:'🧂 Ingredients & Costing',         can: () => can('manage_ingredients_costing'), render: renderIngredientsSection },
   { key:'inventory',   label:'📦 Inventory & Vendors',           can: () => can('manage_inventory'), render: renderInventorySection },
   { key:'staff',       label:'👤 Staff Access & Permissions',    can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderStaffAccessSection },
+  { key:'positions',   label:'🏷️ Positions',                    can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderPositionsSection },
 ];
 
 function renderSettingsDirectory(){
@@ -6615,7 +6666,11 @@ window.openEditStaffModal = function(staffId){
     <label class="field-label">Name</label>
     <input type="text" class="modal-input" id="editStaffName" value="${esc(s.name||'')}"/>
     <label class="field-label">Position</label>
-    <input type="text" class="modal-input" id="editStaffPosition" value="${esc(s.position||'')}" placeholder="e.g. Line Cook, Head Bartender"/>
+    <select class="modal-select" id="editStaffPosition">
+      <option value="">— None —</option>
+      ${state.staffPositions.filter(p => p.active || p.id===s.position_id).map(p => `<option value="${p.id}" ${p.id===s.position_id?'selected':''}>${esc(p.name)}${!p.active?' (inactive)':''}</option>`).join('')}
+    </select>
+    ${!state.staffPositions.length ? `<div class="panel-sub" style="margin:2px 0 0">No positions defined yet — add some in Settings → Positions.</div>` : ''}
     <label class="field-label">Phone</label>
     <input type="tel" class="modal-input" id="editStaffPhone" value="${esc(s.phone||'')}" placeholder="(555) 555-5555"/>
     <label class="field-label">Address</label>
@@ -6684,11 +6739,11 @@ window.submitNewStaffComment = async function(staffId){
 
 window.saveStaffProfile = async function(staffId){
   const name = document.getElementById('editStaffName').value.trim();
-  const position = document.getElementById('editStaffPosition')?.value.trim() || null;
+  const position_id = document.getElementById('editStaffPosition')?.value || null;
   const phone = document.getElementById('editStaffPhone').value.trim() || null;
   const address = document.getElementById('editStaffAddress').value.trim() || null;
   if (!name){ alert('Name is required.'); return; }
-  const { error } = await sb.from('staff').update({ name, position, phone, address }).eq('id', staffId);
+  const { error } = await sb.from('staff').update({ name, position_id, phone, address }).eq('id', staffId);
   if (error){ alert('Error: '+error.message); return; }
   await reloadStaffList();
   closeModal('formModal');
@@ -6705,9 +6760,17 @@ window.promptSetStaffPin = async function(staffId){
   render();
 };
 
+// The safe staff_directory() RPC (loaded for everyone at boot) already returns a joined
+// `position` display name. These full `select('*')` reloads (only reachable behind
+// manage_staff_permissions, for editing staff) get raw `position_id` instead — attach the
+// same `.position` name here so anything elsewhere reading `s.position` off state.staffList
+// (floor plan, labor report, etc.) keeps working no matter which load path populated it.
+function attachPositionNames(rows){
+  return (rows||[]).map(r => ({ ...r, position: state.staffPositions.find(p=>p.id===r.position_id)?.name || null }));
+}
 async function reloadStaffList(){
   const { data } = await sb.from('staff').select('*').order('created_at');
-  state.staffList = data || [];
+  state.staffList = attachPositionNames(data);
 }
 
 // ---- Per-employee permission overrides ------------------------------------
@@ -6937,14 +7000,14 @@ window.deleteServicePeriod = async function(id){
 window.toggleStaffActive = async function(id, active){
   await sb.from('staff').update({ active }).eq('id', id);
   const { data } = await sb.from('staff').select('*').order('created_at');
-  state.staffList = data || [];
+  state.staffList = attachPositionNames(data);
   render();
 };
 
 window.setStaffRole = async function(id, role){
   const { error } = await sb.from('staff').update({ role }).eq('id', id);
   const { data } = await sb.from('staff').select('*').order('created_at');
-  state.staffList = data || [];
+  state.staffList = attachPositionNames(data);
   if (error){ alert('Error: '+error.message); render(); return; }
 };
 
