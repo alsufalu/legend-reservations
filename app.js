@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.12';
+const APP_VERSION = '2.13';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -139,6 +139,12 @@ let state = {
   checks: [], checkItems: [], ordersActiveTableId: null, ordersActiveCheckId: null, ordersCollapsedAreas: [],
   checkDiscounts: [], payments: [],
   vendors: [], purchaseOrders: [], purchaseOrderItems: [],
+  reportType: 'labor', // Reports tab: 'labor' | 'payout'
+  payoutStart: null, payoutEnd: null, // set lazily to a default 14-day range on first render
+  payoutPeriods: [], payoutPeriodItems: [], payoutOpenPeriodId: null,
+  staffDocuments: [], // shared handbook/training library
+  myPayoutItems: [], myPayoutPeriods: [], // self-service: my own generated payroll report lines
+  myTipsRange: 14, myTipsRows: [],
 };
 
 // ============================================================================
@@ -857,7 +863,7 @@ async function loadAll(){
       sb.from('modifier_options').select('*').order('sort_order'),
       sb.from('menu_item_modifier_groups').select('*'),
     ]);
-    const [vendorsRes, poRes, poItemsRes, terminalsRes, clockRes, kitchenSettingsRes, positionsRes] = await Promise.all([
+    const [vendorsRes, poRes, poItemsRes, terminalsRes, clockRes, kitchenSettingsRes, positionsRes, docsRes] = await Promise.all([
       sb.from('vendors').select('*').order('name'),
       sb.from('purchase_orders').select('*').order('created_at', { ascending: false }),
       sb.from('purchase_order_items').select('*'),
@@ -865,6 +871,7 @@ async function loadAll(){
       sb.from('time_clock_entries').select('*').order('clock_in_at', { ascending: false }).limit(300),
       sb.from('kitchen_settings').select('*').eq('id', true).maybeSingle(),
       sb.from('staff_positions').select('*').order('name'),
+      sb.from('staff_documents').select('*').order('category').order('title'),
     ]);
     state.vendors = vendorsRes.data || [];
     state.purchaseOrders = poRes.data || [];
@@ -872,6 +879,7 @@ async function loadAll(){
     state.clockTerminals = terminalsRes.data || [];
     state.timeClockEntries = clockRes.data || [];
     state.staffPositions = positionsRes.data || [];
+    state.staffDocuments = docsRes.data || [];
     state.kitchenSettings = kitchenSettingsRes.data || { course_hold_minutes: 12 };
     state.tables = tablesRes.data || [];
     state.areas = areasRes.data || [];
@@ -1081,7 +1089,7 @@ function render(){
   else if (state.tab === 'loyalty') c.innerHTML = renderLoyaltyTab();
   else if (state.tab === 'schedule') { c.innerHTML = renderScheduleTab(); if (enteringTab) loadScheduleData(); }
   else if (state.tab === 'dashboard') { c.innerHTML = renderDashboardTab(); loadDashboard(); }
-  else if (state.tab === 'reports') { c.innerHTML = renderReportsTab(); loadLaborReport(); }
+  else if (state.tab === 'reports') { c.innerHTML = renderReportsTab(); if (state.reportType==='payout') loadPayoutReport(); else loadLaborReport(); }
   else if (state.tab === 'settings') c.innerHTML = renderSettingsTab();
   if (focusPreserve){
     const el = document.getElementById(focusPreserve.id);
@@ -3294,16 +3302,23 @@ async function loadDashboard(){
 // Gated behind manage_payroll (a viewer without it sees the tab but not the wage data —
 // the same boundary RLS enforces server-side on staff_pay_history/time_clock_entries).
 // ============================================================================
+window.setReportType = function(t){
+  state.reportType = t;
+  render();
+  if (t === 'labor') loadLaborReport();
+  else if (t === 'payout') loadPayoutReport();
+};
 function renderReportsTab(){
   return `
   <div class="panel-header"><h2 class="panel-title">Reports</h2></div>
   <div class="orders-layout">
     <div class="card orders-sidebar">
-      <div class="res-meta" style="font-weight:600;background:#eef2ff;padding:6px 8px;border-radius:6px">⏱️ Labor &amp; Clock</div>
+      <div class="res-meta" style="font-weight:600;padding:6px 8px;border-radius:6px;cursor:pointer;${state.reportType==='labor'?'background:#eef2ff':''}" onclick="setReportType('labor')">⏱️ Labor &amp; Clock</div>
+      <div class="res-meta" style="font-weight:600;padding:6px 8px;border-radius:6px;cursor:pointer;margin-top:4px;${state.reportType==='payout'?'background:#eef2ff':''}" onclick="setReportType('payout')">💵 Employee Payout Report</div>
       <div class="panel-sub" style="margin-top:12px">More reports coming soon.</div>
     </div>
     <div class="orders-main">
-      <div id="laborReportBody"><div class="empty-state">Loading…</div></div>
+      ${state.reportType==='labor' ? `<div id="laborReportBody"><div class="empty-state">Loading…</div></div>` : `<div id="payoutReportBody"><div class="empty-state">Loading…</div></div>`}
     </div>
   </div>`;
 }
@@ -3441,6 +3456,207 @@ async function loadLaborReport(){
       </table>
     </div>`;
 }
+
+// ---- Employee Payout Report: a manager-generated, saved-forever snapshot of hours/wages/
+// tips per employee for a chosen date range — unlike the Labor & Clock report above (which
+// recomputes live and can shift if timeclock entries get corrected), this is a stable record
+// once generated, so both "hand this to my payroll provider" and "let each employee see
+// exactly what was reported for them" have something that doesn't move underneath them.
+// Only completed shifts (already clocked out) are included.
+window.setPayoutDate = function(field, value){ state[field] = value; };
+async function loadPayoutReport(){
+  const el = document.getElementById('payoutReportBody');
+  if (!el) return;
+  if (!can('manage_payroll')){
+    el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🔒</div>You don't have access to payout data.<br><span class="panel-sub">Ask an admin to grant the "Payroll &amp; Staff Records" permission in Settings → Staff Access.</span></div>`;
+    return;
+  }
+  if (!state.payoutStart || !state.payoutEnd){
+    const end = getNow();
+    const start = getNow();
+    start.setDate(end.getDate() - 13);
+    state.payoutStart = toLocalISODate(start);
+    state.payoutEnd = toLocalISODate(end);
+  }
+  const { data: periods } = await sb.from('payroll_periods').select('*').order('period_start', { ascending: false });
+  state.payoutPeriods = periods || [];
+  let items = [];
+  if (state.payoutOpenPeriodId && state.payoutPeriods.some(p => p.id === state.payoutOpenPeriodId)){
+    const { data } = await sb.from('payroll_period_items').select('*').eq('period_id', state.payoutOpenPeriodId);
+    items = data || [];
+  } else {
+    state.payoutOpenPeriodId = null;
+  }
+  state.payoutPeriodItems = items;
+  renderPayoutReportBody();
+}
+function renderPayoutReportBody(){
+  const el = document.getElementById('payoutReportBody');
+  if (!el) return;
+  const openPeriod = state.payoutPeriods.find(p => p.id === state.payoutOpenPeriodId);
+  const nameFor = (id) => state.staffList.find(s=>s.id===id)?.name || '?';
+  const itemsTotal = state.payoutPeriodItems.reduce((acc,r) => ({
+    hours: acc.hours + Number(r.hours), gross: acc.gross + Number(r.gross_wages),
+    tips: acc.tips + Number(r.total_tips), payout: acc.payout + Number(r.total_payout),
+  }), { hours:0, gross:0, tips:0, payout:0 });
+  el.innerHTML = `
+    <div class="section-heading" style="margin-top:0">Generate a Payout Report</div>
+    <div class="card" style="margin-bottom:20px">
+      <div class="panel-sub" style="margin-bottom:10px">Summarizes each employee's hours, gross wages, and tips (cash + card) for a date range into a saved report — a stable snapshot you can hand to your payroll provider and that each employee can see for themselves under their own login. Only completed shifts (already clocked out) are included.</div>
+      <div class="formgrid">
+        <div><label class="field-label">Start date</label><input type="date" class="modal-input" id="payoutStartInput" value="${state.payoutStart}" onchange="setPayoutDate('payoutStart', this.value)"/></div>
+        <div><label class="field-label">End date</label><input type="date" class="modal-input" id="payoutEndInput" value="${state.payoutEnd}" onchange="setPayoutDate('payoutEnd', this.value)"/></div>
+      </div>
+      <div class="modal-actions" style="padding-top:10px;justify-content:flex-start">
+        <button class="btn btn-primary" onclick="generatePayoutReport()">Generate Payout Report</button>
+      </div>
+    </div>
+
+    <div class="section-heading">Generated Reports</div>
+    <div class="card" style="margin-bottom:20px">
+      <table class="data-table">
+        <thead><tr><th>Period</th><th>Created</th><th></th></tr></thead>
+        <tbody>
+          ${state.payoutPeriods.map(p => `<tr>
+            <td>${esc(p.label || (fmtDateHuman(p.period_start)+' – '+fmtDateHuman(p.period_end)))}</td>
+            <td>${new Date(p.created_at).toLocaleDateString()}</td>
+            <td><button class="btn btn-sm btn-secondary" onclick="openPayoutPeriod('${p.id}')">${state.payoutOpenPeriodId===p.id?'Viewing':'View'}</button></td>
+          </tr>`).join('') || '<tr><td colspan="3"><span class="panel-sub">No payout reports generated yet.</span></td></tr>'}
+        </tbody>
+      </table>
+    </div>
+
+    ${openPeriod ? `
+    <div class="panel-header" style="margin-bottom:8px">
+      <div class="section-heading" style="margin:0">${esc(openPeriod.label || '')}</div>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-sm btn-secondary" onclick="downloadPayoutCsv('${openPeriod.id}')">⬇ Download CSV</button>
+        <button class="btn btn-sm btn-danger" onclick="deletePayoutPeriod('${openPeriod.id}')">Delete</button>
+      </div>
+    </div>
+    <div class="grid grid-4" style="margin-bottom:16px">
+      <div class="kpi-card"><div class="kpi-value">${itemsTotal.hours.toFixed(1)}</div><div class="kpi-label">Hours</div></div>
+      <div class="kpi-card"><div class="kpi-value">$${itemsTotal.gross.toFixed(2)}</div><div class="kpi-label">Gross Wages</div></div>
+      <div class="kpi-card"><div class="kpi-value">$${itemsTotal.tips.toFixed(2)}</div><div class="kpi-label">Total Tips</div></div>
+      <div class="kpi-card"><div class="kpi-value">$${itemsTotal.payout.toFixed(2)}</div><div class="kpi-label">Total Payout</div></div>
+    </div>
+    <div class="card">
+      <table class="data-table">
+        <thead><tr><th>Employee</th><th>Hours</th><th>Gross Wages</th><th>Cash Tips</th><th>Card Tips</th><th>Total Tips</th><th>Total Payout</th></tr></thead>
+        <tbody>
+          ${state.payoutPeriodItems.map(r=>`<tr>
+            <td>${esc(nameFor(r.staff_id))}</td>
+            <td>${Number(r.hours).toFixed(1)}</td>
+            <td>$${Number(r.gross_wages).toFixed(2)}</td>
+            <td>$${Number(r.cash_tips).toFixed(2)}</td>
+            <td>$${Number(r.card_tips).toFixed(2)}</td>
+            <td>$${Number(r.total_tips).toFixed(2)}</td>
+            <td>$${Number(r.total_payout).toFixed(2)}</td>
+          </tr>`).join('') || '<tr><td colspan="7"><span class="panel-sub">No shifts for this period.</span></td></tr>'}
+        </tbody>
+      </table>
+    </div>` : ''}`;
+}
+window.generatePayoutReport = async function(){
+  const start = document.getElementById('payoutStartInput')?.value;
+  const end = document.getElementById('payoutEndInput')?.value;
+  if (!start || !end){ alert('Pick a start and end date.'); return; }
+  if (start > end){ alert('Start date must be before end date.'); return; }
+  state.payoutStart = start; state.payoutEnd = end;
+  const startTs = new Date(start+'T00:00:00').toISOString();
+  const endTs = new Date(end+'T23:59:59.999').toISOString();
+
+  const { data: entries, error: entriesErr } = await sb.from('time_clock_entries').select('*')
+    .gte('clock_in_at', startTs).lte('clock_in_at', endTs).not('clock_out_at', 'is', null).order('clock_in_at');
+  if (entriesErr){ alert('Error: '+entriesErr.message); return; }
+  if (!entries || !entries.length){ alert('No completed shifts in that range.'); return; }
+  const { data: payHistory } = await sb.from('staff_pay_history').select('*').order('effective_at');
+  const staffIds = [...new Set(entries.map(e=>e.staff_id))];
+  const { data: rangeChecks } = await sb.from('checks').select('id,server_id,opened_at').in('server_id', staffIds).gte('opened_at', startTs).lte('opened_at', endTs);
+  const checkIds = (rangeChecks||[]).map(c=>c.id);
+  const { data: rangePayments } = checkIds.length ? await sb.from('payments').select('*').in('check_id', checkIds) : { data: [] };
+
+  // Same "most recent rate at-or-before the shift's clock-in" logic as the Labor & Clock
+  // report, so a mid-period raise applies only to shifts worked after it.
+  const rateForStaffAt = (staffId, atIso) => {
+    const at = new Date(atIso).getTime();
+    const rows = (payHistory||[]).filter(h => h.staff_id === staffId && new Date(h.effective_at).getTime() <= at);
+    return rows.length ? Number(rows[rows.length-1].hourly_rate) : 0;
+  };
+  const cardTipsFor = (staffId, fromIso, toIso) => {
+    const pays = (rangePayments||[]).filter(p => {
+      const chk = (rangeChecks||[]).find(c=>c.id===p.check_id);
+      return chk && chk.server_id === staffId && p.created_at >= fromIso && p.created_at <= toIso;
+    });
+    return pays.reduce((s,p)=>s+Number(p.tip_amount||0),0);
+  };
+
+  const byStaff = {};
+  entries.forEach(e => {
+    const hrs = (new Date(e.clock_out_at) - new Date(e.clock_in_at)) / 3600000;
+    const rate = rateForStaffAt(e.staff_id, e.clock_in_at);
+    const cardTips = cardTipsFor(e.staff_id, e.clock_in_at, e.clock_out_at);
+    const cashTips = Number(e.declared_cash_tips||0);
+    const agg = byStaff[e.staff_id] || (byStaff[e.staff_id] = { hours:0, gross_wages:0, cash_tips:0, card_tips:0 });
+    agg.hours += hrs;
+    agg.gross_wages += hrs*rate;
+    agg.cash_tips += cashTips;
+    agg.card_tips += cardTips;
+  });
+
+  const label = `${fmtDateHuman(start)} – ${fmtDateHuman(end)}`;
+  const { data: period, error: perr } = await sb.from('payroll_periods').insert({ period_start: start, period_end: end, label, created_by: currentStaff.id }).select().single();
+  if (perr){ alert('Error: '+perr.message); return; }
+  const rows = Object.entries(byStaff).map(([staff_id, agg]) => ({
+    period_id: period.id, staff_id,
+    hours: agg.hours, gross_wages: agg.gross_wages,
+    cash_tips: agg.cash_tips, card_tips: agg.card_tips,
+    total_tips: agg.cash_tips + agg.card_tips,
+    total_payout: agg.gross_wages + agg.cash_tips + agg.card_tips,
+  }));
+  if (rows.length){
+    const { error: ierr } = await sb.from('payroll_period_items').insert(rows);
+    if (ierr){ alert('Period created, but line items failed: '+ierr.message); }
+  }
+  state.payoutOpenPeriodId = period.id;
+  await loadPayoutReport();
+};
+window.openPayoutPeriod = async function(id){
+  state.payoutOpenPeriodId = id;
+  const { data } = await sb.from('payroll_period_items').select('*').eq('period_id', id);
+  state.payoutPeriodItems = data || [];
+  renderPayoutReportBody();
+};
+window.deletePayoutPeriod = async function(id){
+  if (!confirm('Delete this payout report? Employees will no longer be able to see it. This cannot be undone.')) return;
+  await sb.from('payroll_periods').delete().eq('id', id);
+  state.payoutOpenPeriodId = null;
+  await loadPayoutReport();
+};
+window.downloadPayoutCsv = function(periodId){
+  const period = state.payoutPeriods.find(p=>p.id===periodId);
+  const nameFor = (id) => state.staffList.find(s=>s.id===id)?.name || '?';
+  const header = ['Employee','Period Start','Period End','Hours','Gross Wages','Cash Tips','Card Tips','Total Tips','Total Payout'];
+  const lines = [header.join(',')];
+  state.payoutPeriodItems.forEach(r => {
+    lines.push([
+      `"${(nameFor(r.staff_id)||'').replace(/"/g,'""')}"`,
+      period?.period_start || '', period?.period_end || '',
+      Number(r.hours).toFixed(2), Number(r.gross_wages).toFixed(2),
+      Number(r.cash_tips).toFixed(2), Number(r.card_tips).toFixed(2),
+      Number(r.total_tips).toFixed(2), Number(r.total_payout).toFixed(2),
+    ].join(','));
+  });
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `payout-report-${period?.period_start||'export'}-to-${period?.period_end||''}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+};
 
 // ============================================================================
 // ORDERS TAB — table/check selection, item entry with modifiers, firing to
@@ -4691,7 +4907,7 @@ function startKdsPolling(){
     // Keeps "Currently Clocked In" (elapsed time, running labor cost) live without the
     // viewer having to re-pick the date range/staff filter — loadLaborReport() re-fetches
     // both sections but is cheap at restaurant scale and this only runs while the tab is open.
-    if (state.tab === 'reports') loadLaborReport();
+    if (state.tab === 'reports' && state.reportType === 'labor') loadLaborReport();
   }, 15000);
 }
 function stopKdsPolling(){ if (_kdsPollInterval){ clearInterval(_kdsPollInterval); _kdsPollInterval = null; } }
@@ -4958,7 +5174,7 @@ async function loadScheduleData(){
   const today = todayISO();
   const from = toLocalISODate(new Date(new Date(today+'T00:00:00').getTime() - 7*86400000));
   const to = toLocalISODate(new Date(new Date(today+'T00:00:00').getTime() + 30*86400000));
-  const [shiftsRes, clockRes, offRes, groupsRes, groupMembersRes, threadsRes, participantsRes, messagesRes, swapsRes, terminalsRes] = await Promise.all([
+  const [shiftsRes, clockRes, offRes, groupsRes, groupMembersRes, threadsRes, participantsRes, messagesRes, swapsRes, terminalsRes, docsRes, myItemsRes] = await Promise.all([
     sb.from('schedule_shifts').select('*').gte('shift_date', from).lte('shift_date', to).order('shift_date').order('scheduled_start'),
     sb.from('time_clock_entries').select('*').order('clock_in_at', { ascending: false }).limit(300),
     sb.from('time_off_requests').select('*').order('requested_at', { ascending: false }),
@@ -4969,6 +5185,8 @@ async function loadScheduleData(){
     sb.from('messages').select('*').order('created_at', { ascending: false }).limit(300),
     sb.from('shift_swap_requests').select('*').order('created_at', { ascending: false }),
     sb.from('clock_terminals').select('*').order('created_at'),
+    sb.from('staff_documents').select('*').order('category').order('title'),
+    sb.from('payroll_period_items').select('*').eq('staff_id', currentStaff.id).order('created_at', { ascending: false }),
   ]);
   state.scheduleShifts = shiftsRes.data || [];
   state.timeClockEntries = clockRes.data || [];
@@ -4980,7 +5198,13 @@ async function loadScheduleData(){
   state.messages = messagesRes.data || [];
   state.shiftSwapRequests = swapsRes.data || [];
   state.clockTerminals = terminalsRes.data || [];
+  state.staffDocuments = docsRes.data || [];
+  state.myPayoutItems = myItemsRes.data || [];
+  const myPeriodIds = [...new Set(state.myPayoutItems.map(i=>i.period_id))];
+  const { data: myPeriods } = myPeriodIds.length ? await sb.from('payroll_periods').select('*').in('id', myPeriodIds) : { data: [] };
+  state.myPayoutPeriods = myPeriods || [];
   render();
+  if (can('view_own_schedule')) loadMyTipsReport();
 }
 
 function renderScheduleTab(){
@@ -5048,16 +5272,111 @@ function renderScheduleTab(){
     <div class="modal-actions" style="padding-top:10px;justify-content:flex-start"><button class="btn btn-secondary btn-sm" onclick="openTimeOffModal()">+ Request Time Off</button></div>
   </div>` : '';
 
+  const docsReportsCard = can('view_own_schedule') ? renderMyDocsReportsSection() : '';
+
   return `
   <div class="panel-header"><h2 class="panel-title">Schedule</h2></div>
   ${clockCard}
   ${kioskCard}
   ${scheduleCard}
   ${timeOffCard}
+  ${docsReportsCard}
   ${can('use_messaging') ? renderMessagesSection() : ''}
   ${can('manage_broadcasts') ? renderGroupsSection() : ''}
   ${can('manage_schedule') ? renderScheduleBuilder() : ''}
   ${can('manage_timecards') ? renderTimecardManagement() + renderClockTerminalsSection() : ''}`;
+}
+
+// ---- Per-employee "My Documents & Reports": each staff member's own private view of
+// company-wide handbooks/training guides, their own generated payout reports (see the
+// manager-side Employee Payout Report in the Reports tab), and a live daily tip breakdown
+// per shift. Everything here is scoped to currentStaff — RLS backs this up server-side
+// (payroll_period_items/staff_pay_history are staff_id=auth.uid()-gated), this is just the view.
+function renderMyDocsReportsSection(){
+  const docsByCat = { handbook: [], training: [], other: [] };
+  state.staffDocuments.forEach(d => (docsByCat[d.category] || docsByCat.other).push(d));
+  const catLabel = { handbook: '📘 Handbooks', training: '🎓 Training Guides', other: '📎 Other' };
+  const docsHtml = ['handbook','training','other'].map(cat => docsByCat[cat].length ? `
+    <div style="margin-bottom:10px"><b>${catLabel[cat]}</b>
+      ${docsByCat[cat].map(d => `<div class="res-meta" style="padding:3px 0">📄 <a href="${esc(sb.storage.from('staff-documents').getPublicUrl(d.storage_path).data.publicUrl)}" target="_blank" rel="noopener">${esc(d.title)}</a></div>`).join('')}
+    </div>` : '').join('');
+
+  const myPeriodRows = state.myPayoutItems.map(item => {
+    const period = state.myPayoutPeriods.find(p => p.id === item.period_id);
+    return { item, period };
+  }).filter(r => r.period).sort((a,b) => (b.period.period_start||'').localeCompare(a.period.period_start||''));
+
+  return `
+  <div class="section-heading">📁 My Documents &amp; Reports</div>
+  <div class="card" style="margin-bottom:14px">
+    <b>Handbooks &amp; Training</b>
+    <div style="margin-top:8px">${docsHtml || '<div class="panel-sub" style="margin:0">Nothing has been uploaded yet.</div>'}</div>
+  </div>
+  <div class="card" style="margin-bottom:14px">
+    <b>My Payroll Reports</b>
+    <table class="data-table" style="margin-top:8px">
+      <thead><tr><th>Period</th><th>Hours</th><th>Gross Wages</th><th>Tips</th><th>Total Payout</th></tr></thead>
+      <tbody>
+        ${myPeriodRows.map(({item,period}) => `<tr>
+          <td>${esc(period.label || (fmtDateHuman(period.period_start)+' – '+fmtDateHuman(period.period_end)))}</td>
+          <td>${Number(item.hours).toFixed(1)}</td>
+          <td>$${Number(item.gross_wages).toFixed(2)}</td>
+          <td>$${Number(item.total_tips).toFixed(2)}</td>
+          <td>$${Number(item.total_payout).toFixed(2)}</td>
+        </tr>`).join('') || '<tr><td colspan="5"><span class="panel-sub">No payroll reports generated for you yet.</span></td></tr>'}
+      </tbody>
+    </table>
+  </div>
+  <div class="card">
+    <b>My Daily Tips</b>
+    <div id="myTipsBody" style="margin-top:8px"><div class="empty-state">Loading…</div></div>
+  </div>`;
+}
+window.setMyTipsRange = function(n){ state.myTipsRange = n; loadMyTipsReport(); };
+async function loadMyTipsReport(){
+  if (!currentStaff) return;
+  const end = getNow();
+  const start = getNow();
+  start.setDate(end.getDate() - (state.myTipsRange - 1));
+  const startTs = new Date(toLocalISODate(start)+'T00:00:00').toISOString();
+  const endTs = new Date(toLocalISODate(end)+'T23:59:59.999').toISOString();
+  const { data: myEntries } = await sb.from('time_clock_entries').select('*')
+    .eq('staff_id', currentStaff.id).gte('clock_in_at', startTs).lte('clock_in_at', endTs).order('clock_in_at', { ascending: false });
+  // checks/payments SELECT is permission-gated (take_orders/take_payment/view_reports), not
+  // row-owner-gated — so this simply returns empty for a role that can't see checks at all
+  // (e.g. host), rather than erroring. Filtered to this staff member as server client-side.
+  const { data: myChecks } = await sb.from('checks').select('id,server_id,opened_at').eq('server_id', currentStaff.id).gte('opened_at', startTs).lte('opened_at', endTs);
+  const checkIds = (myChecks||[]).map(c=>c.id);
+  const { data: myPayments } = checkIds.length ? await sb.from('payments').select('*').in('check_id', checkIds) : { data: [] };
+  state.myTipsRows = (myEntries||[]).map(e => {
+    const outIso = e.clock_out_at || new Date().toISOString();
+    const hrs = (new Date(outIso) - new Date(e.clock_in_at)) / 3600000;
+    const pays = (myPayments||[]).filter(p => p.created_at >= e.clock_in_at && p.created_at <= outIso);
+    const cardTips = pays.reduce((s,p)=>s+Number(p.tip_amount||0),0);
+    const cashTips = Number(e.declared_cash_tips||0);
+    return { date: e.clock_in_at, hrs, cardTips, cashTips, totalTips: cardTips+cashTips, stillOpen: !e.clock_out_at };
+  });
+  renderMyTipsBody();
+}
+function renderMyTipsBody(){
+  const el = document.getElementById('myTipsBody');
+  if (!el) return;
+  const total = state.myTipsRows.reduce((s,r)=>s+r.totalTips,0);
+  el.innerHTML = `
+    <div style="display:flex;gap:8px;margin-bottom:10px">${[7,14,30].map(n=>`<span class="chip ${state.myTipsRange===n?'active':''}" onclick="setMyTipsRange(${n})">${n}d</span>`).join('')}</div>
+    <table class="data-table">
+      <thead><tr><th>Date</th><th>Hours</th><th>Cash Tips</th><th>Card Tips</th><th>Total</th></tr></thead>
+      <tbody>
+        ${state.myTipsRows.map(r=>`<tr>
+          <td>${new Date(r.date).toLocaleDateString()}${r.stillOpen?' <span class="panel-sub">(in progress)</span>':''}</td>
+          <td>${fmtHours(r.hrs)}</td>
+          <td>$${r.cashTips.toFixed(2)}</td>
+          <td>$${r.cardTips.toFixed(2)}</td>
+          <td>$${r.totalTips.toFixed(2)}</td>
+        </tr>`).join('') || '<tr><td colspan="5"><span class="panel-sub">No shifts in this range.</span></td></tr>'}
+      </tbody>
+      ${state.myTipsRows.length ? `<tfoot><tr style="font-weight:700"><td colspan="4">Total tips</td><td>$${total.toFixed(2)}</td></tr></tfoot>` : ''}
+    </table>`;
 }
 
 // ---- Messaging: threads, groups, shift swaps -------------------------------
@@ -6628,6 +6947,64 @@ window.togglePositionActive = async function(id, active){
   render();
 };
 
+function renderDocumentsSection(){
+  const catLabel = { handbook: '📘 Handbook', training: '🎓 Training Guide', other: '📎 Other' };
+  return `
+  <div class="section-heading">Staff Documents</div>
+  <div class="panel-sub" style="margin-bottom:10px">Handbooks and training guides uploaded here show up for every active staff member under Schedule → My Documents &amp; Reports.</div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="formgrid">
+      <div><label class="field-label">Title</label><input type="text" class="modal-input" id="newDocTitle" placeholder="e.g. Employee Handbook 2026"/></div>
+      <div><label class="field-label">Category</label><select class="modal-select" id="newDocCategory">
+        <option value="handbook">Handbook</option>
+        <option value="training">Training Guide</option>
+        <option value="other">Other</option>
+      </select></div>
+    </div>
+    <label class="field-label">File</label>
+    <input type="file" class="modal-input" id="newDocFile"/>
+    <div class="modal-actions" style="padding-top:10px;justify-content:flex-start"><button class="btn btn-primary" onclick="uploadStaffDocument()">Upload</button></div>
+  </div>
+  <div class="card">
+    <table class="data-table">
+      <thead><tr><th>Title</th><th>Category</th><th>Uploaded</th><th></th></tr></thead>
+      <tbody>
+        ${state.staffDocuments.map(d => `<tr>
+          <td>${esc(d.title)}</td>
+          <td>${catLabel[d.category] || d.category}</td>
+          <td>${new Date(d.created_at).toLocaleDateString()}</td>
+          <td><button class="btn btn-sm btn-danger" onclick="deleteStaffDocument('${d.id}')">Delete</button></td>
+        </tr>`).join('') || '<tr><td colspan="4"><span class="panel-sub">No documents uploaded yet.</span></td></tr>'}
+      </tbody>
+    </table>
+  </div>`;
+}
+window.uploadStaffDocument = async function(){
+  const title = document.getElementById('newDocTitle')?.value.trim();
+  const category = document.getElementById('newDocCategory')?.value || 'other';
+  const file = document.getElementById('newDocFile')?.files?.[0];
+  if (!title){ alert('Enter a title.'); return; }
+  if (!file){ alert('Choose a file.'); return; }
+  const ext = file.name.split('.').pop();
+  const path = `${Date.now()}-${Math.random().toString(36).slice(2,8)}.${ext}`;
+  const { error: upErr } = await sb.storage.from('staff-documents').upload(path, file);
+  if (upErr){ alert('Upload failed: '+upErr.message); return; }
+  const { error } = await sb.from('staff_documents').insert({ title, category, storage_path: path, file_name: file.name, uploaded_by: currentStaff.id });
+  if (error){ alert('Error: '+error.message); return; }
+  const { data } = await sb.from('staff_documents').select('*').order('category').order('title');
+  state.staffDocuments = data || [];
+  render();
+};
+window.deleteStaffDocument = async function(id){
+  if (!confirm('Delete this document? Staff will no longer be able to see or download it.')) return;
+  const doc = state.staffDocuments.find(d=>d.id===id);
+  await sb.from('staff_documents').delete().eq('id', id);
+  if (doc?.storage_path) await sb.storage.from('staff-documents').remove([doc.storage_path]);
+  const { data } = await sb.from('staff_documents').select('*').order('category').order('title');
+  state.staffDocuments = data || [];
+  render();
+};
+
 // Registry driving both the Settings directory (link grid) and the focused single-section
 // pop-out windows opened from it — one source of truth for what sections exist, their gating,
 // and how to render them, so the two views can never drift out of sync with each other.
@@ -6645,6 +7022,7 @@ const SETTINGS_SECTIONS = [
   { key:'inventory',   label:'📦 Inventory & Vendors',           can: () => can('manage_inventory'), render: renderInventorySection },
   { key:'staff',       label:'👤 Staff Access & Permissions',    can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderStaffAccessSection },
   { key:'positions',   label:'🏷️ Positions',                    can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderPositionsSection },
+  { key:'documents',   label:'📄 Documents',                     can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderDocumentsSection },
 ];
 
 function renderSettingsDirectory(){
