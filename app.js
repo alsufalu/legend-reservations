@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.10';
+const APP_VERSION = '2.11';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -127,6 +127,7 @@ let state = {
   dashRange: 7,
   reportRange: 7, reportStaffFilter: '',
   staffPositions: [],
+  kioskSelectedStaffId: null,
   loyaltyTiers: [],    // club/society/founders terms — editable in Settings, not hardcoded
   loyaltyMembers: [],  // one row per enrolled guest (guests.id -> loyalty_members.guest_id)
   priorityHolidays: [], // dates where Founder's Circle gets the extended 14-day booking lead
@@ -5009,8 +5010,17 @@ function renderScheduleTab(){
   const kioskEligibleStaff = state.staffList.filter(s => s.active && staffHasPermission(s.id, 'clock_in_out'));
   // Default the picker to whoever's currently PIN-active on this terminal (if they're
   // clock-eligible) instead of just the first name alphabetically — on a shared terminal
-  // that's almost always who actually walked up to punch in.
-  const kioskDefaultId = kioskEligibleStaff.some(s => s.id === currentStaff.id) ? currentStaff.id : kioskEligibleStaff[0]?.id;
+  // that's almost always who actually walked up to punch in. BUT once someone actually
+  // picks a different name from the dropdown, that choice has to stick across re-renders —
+  // this tab re-renders in the background every ~8s (the messaging poll) regardless of
+  // whether anyone's mid-punch, and re-deriving the default from currentStaff every time
+  // was silently reverting the picker back to the active operator (e.g. "Admin") a few
+  // seconds after someone selected a coworker, before they could even type their PIN.
+  // state.kioskSelectedStaffId is the escape hatch: once set, it wins until cleared
+  // (on a successful punch, or if that person stops being clock-eligible).
+  const kioskDefaultId = (state.kioskSelectedStaffId && kioskEligibleStaff.some(s => s.id === state.kioskSelectedStaffId))
+    ? state.kioskSelectedStaffId
+    : (kioskEligibleStaff.some(s => s.id === currentStaff.id) ? currentStaff.id : kioskEligibleStaff[0]?.id);
   const kioskFirstOpen = kioskDefaultId && state.timeClockEntries.some(e => e.staff_id === kioskDefaultId && !e.clock_out_at);
   const kioskCard = thisDeviceIsTerminal ? `
   <div class="section-heading">Staff Time Clock (This Terminal)</div>
@@ -5553,10 +5563,12 @@ window.kioskPunch = async function(){
     if (error){ alert(error.message); return; }
   }
   if (pinInput) pinInput.value = '';
+  state.kioskSelectedStaffId = null; // this person's done — next render defaults back to whoever's PIN-active on this terminal
   await loadScheduleData();
 };
 window.kioskUpdateButtonLabel = function(){
   const staffId = document.getElementById('kioskEmployee')?.value;
+  state.kioskSelectedStaffId = staffId || null; // see kioskDefaultId — makes the pick sticky across background re-renders
   const btn = document.getElementById('kioskPunchBtn');
   if (!btn) return;
   const openEntry = state.timeClockEntries.find(e => e.staff_id === staffId && !e.clock_out_at);
