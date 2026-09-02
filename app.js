@@ -1,12 +1,12 @@
 // ============================================================================
-// LEGEND RESERVATIONS — Host Stand & Management Console
+// AGENT — Host Stand & Management Console (formerly "Legend Reservations" / "PM Ops")
 // Vanilla HTML/CSS/JS + Supabase (auth, Postgres, RLS). No build step.
 // ============================================================================
 
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.13';
+const APP_VERSION = '2.14';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -145,6 +145,8 @@ let state = {
   staffDocuments: [], // shared handbook/training library
   myPayoutItems: [], myPayoutPeriods: [], // self-service: my own generated payroll report lines
   myTipsRange: 14, myTipsRows: [],
+  ingFilterCategory: '',
+  menuInvSection: 'menu',
 };
 
 // ============================================================================
@@ -968,7 +970,8 @@ const TAB_PERMISSIONS = {
   loyalty: ['manage_loyalty_program'],
   dashboard: ['view_reports'],
   reports: ['view_reports','manage_payroll'],
-  settings: ['manage_reservations','manage_staff_permissions','manage_loyalty_program','manage_menu','manage_ingredients_costing','manage_inventory'],
+  settings: ['manage_reservations','manage_staff_permissions','manage_loyalty_program'],
+  menuinv: ['manage_menu','manage_ingredients_costing','manage_inventory'],
   schedule: ['view_own_schedule','manage_schedule','clock_in_out','request_time_off'],
   orders: ['take_orders','take_payment'],
   kitchen: ['view_kitchen_station'],
@@ -1090,6 +1093,7 @@ function render(){
   else if (state.tab === 'schedule') { c.innerHTML = renderScheduleTab(); if (enteringTab) loadScheduleData(); }
   else if (state.tab === 'dashboard') { c.innerHTML = renderDashboardTab(); loadDashboard(); }
   else if (state.tab === 'reports') { c.innerHTML = renderReportsTab(); if (state.reportType==='payout') loadPayoutReport(); else loadLaborReport(); }
+  else if (state.tab === 'menuinv') c.innerHTML = renderMenuInvTab();
   else if (state.tab === 'settings') c.innerHTML = renderSettingsTab();
   if (focusPreserve){
     const el = document.getElementById(focusPreserve.id);
@@ -5079,7 +5083,7 @@ function renderKitchenTicket(t){
     </div>
     ${t.items.map(ci => `<div style="padding:4px 0;border-top:1px solid var(--border)">
       <div style="display:flex;justify-content:space-between;align-items:center">
-        <span>${ci.quantity}x ${esc(ci.name_snapshot)}${ci.seat_number ? ` <b>· Seat ${ci.seat_number}</b>` : ''}</span>
+        <span>${ci.quantity}x <span style="cursor:pointer;text-decoration:underline dotted" title="View recipe" onclick="openRecipePopup('${ci.menu_item_id}')">📖 ${esc(ci.name_snapshot)}</span>${ci.seat_number ? ` <b>· Seat ${ci.seat_number}</b>` : ''}</span>
         <span class="badge badge-pending">${esc(ci.status)}</span>
       </div>
       ${(ci.modifiers||[]).length ? `<div class="panel-sub" style="margin:0">${(ci.modifiers||[]).map(m=>esc(m.name)).join(', ')}</div>` : ''}
@@ -5139,7 +5143,7 @@ function renderExpoTab(){
             <div style="margin-top:6px">
               <div class="panel-sub" style="margin:0;font-weight:600">${k==='table' ? 'Whole table' : 'Seat '+k}</div>
               ${bySeat[k].map(ci => `<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-top:1px solid var(--border)">
-                <span>${ci.quantity}x ${esc(ci.name_snapshot)}</span>
+                <span>${ci.quantity}x <span style="cursor:pointer;text-decoration:underline dotted" title="View recipe" onclick="openRecipePopup('${ci.menu_item_id}')">📖 ${esc(ci.name_snapshot)}</span></span>
                 <button class="btn btn-sm btn-primary" onclick="markItemDelivered('${ci.id}')">Delivered</button>
               </div>`).join('')}
             </div>`).join('');
@@ -6029,10 +6033,48 @@ window.correctMissingPunch = async function(shiftId){
 // ============================================================================
 function ticketDestName(id){ return state.ticketDestinations.find(t=>t.id===id)?.name || '—'; }
 function menuCategoryName(id){ return state.menuCategories.find(c=>c.id===id)?.name || '—'; }
+
+// Recipe lookup — the 📖 link on kitchen/bar/expo ticket items. Opens a small standalone
+// window (not a normal SPA route) so a cook/bartender can glance at it without losing their
+// place on the ticket screen. Read-only, just ingredients + quantities/units + any notes.
+window.openRecipePopup = function(menuItemId){
+  const it = state.menuItems.find(m=>m.id===menuItemId);
+  if (!it){ alert('Recipe not found for this item.'); return; }
+  const recipe = state.itemIngredients.filter(ii=>ii.item_id===menuItemId);
+  const rowsHtml = recipe.length ? recipe.map(r => {
+    const ing = state.ingredients.find(x=>x.id===r.ingredient_id);
+    return `<li>${Number(r.quantity)} ${esc(r.unit || ing?.unit || '')} — ${esc(ing?.name || 'Unknown ingredient')}</li>`;
+  }).join('') : '<li style="color:#888">No recipe/ingredients recorded for this item yet.</li>';
+  const win = window.open('', '_blank', 'width=440,height=620');
+  if (!win){ alert('Pop-up blocked — allow pop-ups for this site to view recipes.'); return; }
+  win.document.write(`<!DOCTYPE html><html><head><title>${esc(it.name)} — Recipe</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <style>
+      body{font-family:-apple-system,system-ui,sans-serif;padding:24px;max-width:440px;margin:0}
+      h1{font-size:22px;margin:0 0 4px}
+      .sub{color:#666;font-size:13px;margin-bottom:16px}
+      .desc{margin:12px 0;padding:12px;background:#f5f5f7;border-radius:8px;font-size:14px;line-height:1.4}
+      h3{font-size:15px;margin:18px 0 8px}
+      ul{padding-left:22px;line-height:1.7;font-size:15px}
+      .closebtn{margin-top:24px;padding:8px 16px;border:1px solid #ccc;border-radius:6px;background:#f5f5f7;cursor:pointer;font-size:14px}
+    </style></head>
+    <body>
+      <h1>${esc(it.name)}</h1>
+      <div class="sub">${esc(menuCategoryName(it.category_id))}${it.course?' · Course '+it.course:''}</div>
+      ${it.description ? `<div class="desc">${esc(it.description)}</div>` : ''}
+      <h3>Ingredients</h3>
+      <ul>${rowsHtml}</ul>
+      <button class="closebtn" onclick="window.close()">Close</button>
+    </body></html>`);
+  win.document.close();
+};
 function itemCost(itemId){
   return state.itemIngredients.filter(ii=>ii.item_id===itemId).reduce((sum,ii) => {
     const ing = state.ingredients.find(x=>x.id===ii.ingredient_id);
-    return sum + (ing ? ing.cost_per_unit * ii.quantity : 0);
+    if (!ing) return sum;
+    const converted = convertRecipeQty(ii.quantity, ii.unit || ing.unit, ing.unit);
+    const effectiveQty = converted != null ? converted : ii.quantity;
+    return sum + ing.cost_per_unit * effectiveQty;
   }, 0);
 }
 async function reloadMenuData(){
@@ -6057,6 +6099,33 @@ async function reloadMenuData(){
   state.modifierOptions = moRes.data || [];
   state.menuItemModifierGroups = mimgRes.data || [];
   render();
+}
+
+// ============================================================================
+// MENU & INVENTORY TAB — Menu Items, Ingredients & Costing, and Inventory & Vendors used
+// to live as three separate Settings sections; pulled out into their own top-level tab
+// (same sidebar-switcher pattern as Reports) since they're worked in constantly, not just
+// occasionally like the rest of Settings.
+// ============================================================================
+window.setMenuInvSection = function(key){ state.menuInvSection = key; render(); };
+function renderMenuInvTab(){
+  const sections = [
+    { key:'menu', label:'🍽️ Menu Items', can: can('manage_menu'), render: renderMenuSection },
+    { key:'ingredients', label:'🧂 Ingredients & Costing', can: can('manage_ingredients_costing'), render: renderIngredientsSection },
+    { key:'inventory', label:'📦 Inventory & Vendors', can: can('manage_inventory'), render: renderInventorySection },
+  ].filter(s => s.can);
+  if (!sections.length){
+    return `<div class="panel-header"><h2 class="panel-title">Menu &amp; Inventory</h2></div><div class="card"><div class="panel-sub" style="margin:0">You don't have permission to view this section.</div></div>`;
+  }
+  const active = sections.find(s => s.key === state.menuInvSection) || sections[0];
+  return `
+  <div class="panel-header"><h2 class="panel-title">Menu &amp; Inventory</h2></div>
+  <div class="orders-layout">
+    <div class="card orders-sidebar">
+      ${sections.map(s => `<div class="res-meta" style="font-weight:600;padding:6px 8px;border-radius:6px;cursor:pointer;margin-bottom:4px;${active.key===s.key?'background:#eef2ff':''}" onclick="setMenuInvSection('${s.key}')">${s.label}</div>`).join('')}
+    </div>
+    <div class="orders-main">${active.render()}</div>
+  </div>`;
 }
 
 function renderMenuSection(){
@@ -6151,28 +6220,55 @@ window.deleteMenuCategory = async function(id){
   await reloadMenuData();
 };
 
-function renderRecipeRow(ingredientId, qty){
+// Unit conversion for recipe-line costing: lets a recipe call for an ingredient in a
+// different (but compatible) unit than the one it's priced in — e.g. a recipe line of
+// "50 g" for an ingredient costed per "kg", or "0.5 oz" for one costed per "ml". Units
+// outside these two tables (dash, wedge, twist, each, bottle, etc.) have no fixed size —
+// for those, the entered quantity is used literally against cost_per_unit, same as before
+// this feature existed.
+const VOLUME_TO_ML = { ml:1, l:1000, oz:29.5735, cup:236.588, tbsp:14.7868, tsp:4.92892, pint:473.176, quart:946.353, gallon:3785.41 };
+const WEIGHT_TO_G = { g:1, kg:1000, lb:453.592 };
+function convertRecipeQty(qty, fromUnit, toUnit){
+  if (!fromUnit || !toUnit || fromUnit === toUnit) return qty;
+  if (VOLUME_TO_ML[fromUnit] != null && VOLUME_TO_ML[toUnit] != null) return qty * VOLUME_TO_ML[fromUnit] / VOLUME_TO_ML[toUnit];
+  if (WEIGHT_TO_G[fromUnit] != null && WEIGHT_TO_G[toUnit] != null) return qty * WEIGHT_TO_G[fromUnit] / WEIGHT_TO_G[toUnit];
+  return null; // not a convertible pair — caller falls back to a literal 1:1 multiplier
+}
+function renderRecipeRow(ingredientId, qty, unit){
+  const ing = state.ingredients.find(x=>x.id===ingredientId);
+  const effectiveUnit = unit || ing?.unit || 'oz';
   return `<div style="display:flex;gap:6px;align-items:center" class="miRecipeRow">
-    <select class="modal-select miRecipeIngredient" style="margin:0;flex:1" onchange="recalcMenuItemCost()">${state.ingredients.map(ing=>`<option value="${ing.id}" ${ing.id===ingredientId?'selected':''}>${esc(ing.name)} (${esc(ing.unit)})</option>`).join('')}</select>
-    <input type="number" min="0" step="0.01" class="modal-input miRecipeQty" style="margin:0;width:80px" value="${qty??0}" oninput="recalcMenuItemCost()"/>
+    <select class="modal-select miRecipeIngredient" style="margin:0;flex:1.4" onchange="onRecipeIngredientChange(this)">${state.ingredients.map(i=>`<option value="${i.id}" ${i.id===ingredientId?'selected':''}>${esc(i.name)} (${esc(i.unit)})</option>`).join('')}</select>
+    <input type="number" min="0" step="0.01" class="modal-input miRecipeQty" style="margin:0;width:70px" value="${qty??0}" oninput="recalcMenuItemCost()"/>
+    <select class="modal-select miRecipeUnit" style="margin:0;width:120px" onchange="recalcMenuItemCost()">${ingredientUnitSelectHtml(effectiveUnit)}</select>
     <button type="button" class="btn btn-sm btn-danger" onclick="this.closest('.miRecipeRow').remove(); recalcMenuItemCost();">×</button>
   </div>`;
 }
+window.onRecipeIngredientChange = function(selectEl){
+  const ing = state.ingredients.find(x=>x.id===selectEl.value);
+  const unitSel = selectEl.closest('.miRecipeRow')?.querySelector('.miRecipeUnit');
+  if (unitSel && ing && Array.from(unitSel.options).some(o=>o.value===ing.unit)) unitSel.value = ing.unit;
+  recalcMenuItemCost();
+};
 window.addRecipeRow = function(){
   if (!state.ingredients.length){ alert('Add ingredients first (Ingredients &amp; Costing section).'); return; }
-  document.getElementById('miRecipeRows').insertAdjacentHTML('beforeend', renderRecipeRow(state.ingredients[0].id, 0));
+  document.getElementById('miRecipeRows').insertAdjacentHTML('beforeend', renderRecipeRow(state.ingredients[0].id, 0, state.ingredients[0].unit));
   recalcMenuItemCost();
 };
 // Live-updates the cost/margin readout under the recipe builder as ingredients, quantities,
-// or the menu price change — before anything is saved, so pricing decisions happen up front.
+// units, or the menu price change — before anything is saved, so pricing decisions happen up front.
 window.recalcMenuItemCost = function(){
   const summaryEl = document.getElementById('miCostSummary');
   if (!summaryEl) return;
   const rows = Array.from(document.querySelectorAll('#miRecipeRows .miRecipeRow'));
   const cost = rows.reduce((sum, row) => {
     const ing = state.ingredients.find(x => x.id === row.querySelector('.miRecipeIngredient').value);
+    if (!ing) return sum;
     const qty = parseFloat(row.querySelector('.miRecipeQty').value) || 0;
-    return sum + (ing ? ing.cost_per_unit * qty : 0);
+    const lineUnit = row.querySelector('.miRecipeUnit')?.value || ing.unit;
+    const converted = convertRecipeQty(qty, lineUnit, ing.unit);
+    const effectiveQty = converted != null ? converted : qty;
+    return sum + ing.cost_per_unit * effectiveQty;
   }, 0);
   const price = parseFloat(document.getElementById('miPrice')?.value) || 0;
   const margin = price - cost;
@@ -6214,7 +6310,7 @@ window.openMenuItemModal = function(itemId){
     ${canCost ? `
     <label class="field-label">Recipe / Ingredient Costing</label>
     <div id="miRecipeRows" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px">
-      ${recipe.map(r => renderRecipeRow(r.ingredient_id, r.quantity)).join('')}
+      ${recipe.map(r => renderRecipeRow(r.ingredient_id, r.quantity, r.unit)).join('')}
     </div>
     <button type="button" class="btn btn-secondary btn-sm" onclick="addRecipeRow()">+ Add Ingredient</button>
     <div class="panel-sub" id="miCostSummary" style="margin:8px 0 0"></div>
@@ -6256,6 +6352,7 @@ window.saveMenuItem = async function(itemId){
       item_id: id,
       ingredient_id: row.querySelector('.miRecipeIngredient').value,
       quantity: parseFloat(row.querySelector('.miRecipeQty').value) || 0,
+      unit: row.querySelector('.miRecipeUnit')?.value || null,
     })).filter(r => r.ingredient_id);
     if (rows.length) await sb.from('item_ingredients').insert(rows);
   }
@@ -6331,7 +6428,11 @@ window.deleteModifierGroup = async function(id){
   await reloadMenuData();
 };
 
+window.setIngFilterCategory = function(id){ state.ingFilterCategory = id; render(); };
 function renderIngredientsSection(){
+  const filtered = state.ingFilterCategory
+    ? (state.ingFilterCategory === '__none' ? state.ingredients.filter(ing => !ing.category_id) : state.ingredients.filter(ing => ing.category_id === state.ingFilterCategory))
+    : state.ingredients;
   return `
   <div class="section-heading">Ingredient Categories</div>
   <div class="card">
@@ -6345,11 +6446,16 @@ function renderIngredientsSection(){
   </div>
 
   <div class="section-heading">Ingredients &amp; Costing</div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+    <span class="chip ${!state.ingFilterCategory?'active':''}" onclick="setIngFilterCategory('')">All (${state.ingredients.length})</span>
+    ${state.ingredientCategories.map(c => `<span class="chip ${state.ingFilterCategory===c.id?'active':''}" onclick="setIngFilterCategory('${c.id}')">${esc(c.name)} (${state.ingredients.filter(i=>i.category_id===c.id).length})</span>`).join('')}
+    <span class="chip ${state.ingFilterCategory==='__none'?'active':''}" onclick="setIngFilterCategory('__none')">Uncategorized (${state.ingredients.filter(i=>!i.category_id).length})</span>
+  </div>
   <div class="card">
     <table class="data-table">
       <thead><tr><th>Ingredient</th><th>Brand</th><th>Category</th><th>Unit</th><th>ABV</th><th>Package</th><th>Cost / Unit</th><th></th></tr></thead>
       <tbody>
-        ${state.ingredients.map(ing => `<tr>
+        ${filtered.map(ing => `<tr>
           <td>${esc(ing.name)}</td>
           <td>${esc(ing.brand||'—')}</td>
           <td>${esc(state.ingredientCategories.find(c=>c.id===ing.category_id)?.name || '—')}</td>
@@ -6358,7 +6464,7 @@ function renderIngredientsSection(){
           <td>${ing.package_label ? `${esc(ing.package_label)}${ing.package_cost!=null?' · $'+Number(ing.package_cost).toFixed(2):''}` : '<span class="panel-sub" style="margin:0">not set</span>'}</td>
           <td>$<input type="number" min="0" step="0.01" class="modal-input" style="margin:0;width:80px;padding:4px 8px;display:inline-block" value="${ing.cost_per_unit}" onchange="setIngredientCost('${ing.id}', this.value)"/></td>
           <td style="display:flex;gap:6px"><button class="btn btn-sm btn-secondary" onclick="openIngredientModal('${ing.id}')">Edit</button><button class="btn btn-sm btn-danger" onclick="deleteIngredient('${ing.id}')">Delete</button></td>
-        </tr>`).join('') || `<tr><td colspan="8"><span class="panel-sub">No ingredients yet.</span></td></tr>`}
+        </tr>`).join('') || `<tr><td colspan="8"><span class="panel-sub">No ingredients${state.ingFilterCategory?' in this category':''}.</span></td></tr>`}
       </tbody>
     </table>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openIngredientModal()">+ Add Ingredient</button></div>
@@ -7017,9 +7123,6 @@ const SETTINGS_SECTIONS = [
   { key:'sections',    label:'📍 Server Sections',               can: () => can('manage_reservations'), render: renderServerSectionsSection },
   { key:'combos',      label:'🔗 Table Combinations',            can: () => can('manage_reservations'), render: renderTableCombosSection },
   { key:'periods',     label:'⏰ Service Periods',                can: () => can('manage_reservations'), render: renderServicePeriodsSection },
-  { key:'menu',        label:'🍽️ Menu, Items & Modifiers',      can: () => can('manage_menu'), render: renderMenuSection },
-  { key:'ingredients', label:'🧂 Ingredients & Costing',         can: () => can('manage_ingredients_costing'), render: renderIngredientsSection },
-  { key:'inventory',   label:'📦 Inventory & Vendors',           can: () => can('manage_inventory'), render: renderInventorySection },
   { key:'staff',       label:'👤 Staff Access & Permissions',    can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderStaffAccessSection },
   { key:'positions',   label:'🏷️ Positions',                    can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderPositionsSection },
   { key:'documents',   label:'📄 Documents',                     can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderDocumentsSection },
