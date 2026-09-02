@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.15';
+const APP_VERSION = '2.16';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -147,6 +147,7 @@ let state = {
   myTipsRange: 14, myTipsRows: [],
   ingFilterCategory: '',
   menuInvSection: 'menu',
+  appSettings: {}, // key -> value, loaded once at boot from app_settings (feature toggles)
 };
 
 // ============================================================================
@@ -865,7 +866,7 @@ async function loadAll(){
       sb.from('modifier_options').select('*').order('sort_order'),
       sb.from('menu_item_modifier_groups').select('*'),
     ]);
-    const [vendorsRes, poRes, poItemsRes, terminalsRes, clockRes, kitchenSettingsRes, positionsRes, docsRes] = await Promise.all([
+    const [vendorsRes, poRes, poItemsRes, terminalsRes, clockRes, kitchenSettingsRes, positionsRes, docsRes, appSettingsRes] = await Promise.all([
       sb.from('vendors').select('*').order('name'),
       sb.from('purchase_orders').select('*').order('created_at', { ascending: false }),
       sb.from('purchase_order_items').select('*'),
@@ -874,6 +875,7 @@ async function loadAll(){
       sb.from('kitchen_settings').select('*').eq('id', true).maybeSingle(),
       sb.from('staff_positions').select('*').order('name'),
       sb.from('staff_documents').select('*').order('category').order('title'),
+      sb.from('app_settings').select('*'),
     ]);
     state.vendors = vendorsRes.data || [];
     state.purchaseOrders = poRes.data || [];
@@ -882,6 +884,7 @@ async function loadAll(){
     state.timeClockEntries = clockRes.data || [];
     state.staffPositions = positionsRes.data || [];
     state.staffDocuments = docsRes.data || [];
+    state.appSettings = Object.fromEntries((appSettingsRes.data || []).map(r => [r.key, r.value]));
     state.kitchenSettings = kitchenSettingsRes.data || { course_hold_minutes: 12 };
     state.tables = tablesRes.data || [];
     state.areas = areasRes.data || [];
@@ -3903,6 +3906,38 @@ function renderCheckDetail(check){
   // with no apps at all, fireCheck() just sends everything together regardless of course.
   const hasApps = items.some(ci => ci.course === 1);
   const hasMains = items.some(ci => ci.course >= 2);
+  // Allergen conflicts: computed fresh at render time (not stored) so it stays correct even
+  // if the table's flagged allergies get edited, or an item's recipe/allergen tags change,
+  // after the item was already rung in. Feature-gated so it costs nothing when turned off.
+  const allergenFeatureOn = settingEnabled('allergen_check_enabled', true);
+  const tableAllergens = check.guest_allergens || [];
+  const itemAllergenFlags = {}; // check_item id -> matching allergens for that line
+  let anyAllergenConflict = false;
+  if (allergenFeatureOn && tableAllergens.length){
+    items.forEach(ci => {
+      const flagged = [...itemAllergenSet(ci.menu_item_id)].filter(a => tableAllergens.includes(a));
+      if (flagged.length){ itemAllergenFlags[ci.id] = flagged; anyAllergenConflict = true; }
+    });
+  }
+  // Built as a plain string ahead of the main template (rather than inline) so the
+  // conditional logic doesn't turn into several levels of nested template literals.
+  let allergenBannerHtml = '';
+  if (allergenFeatureOn){
+    if (tableAllergens.length){
+      const bg = anyAllergenConflict ? '#fee2e2' : '#f0fdf4';
+      const border = anyAllergenConflict ? '#fca5a5' : '#86efac';
+      const icon = anyAllergenConflict ? '🚨' : '✅';
+      const tail = anyAllergenConflict ? ' — one or more items below contain a flagged allergen' : ' — nothing on this check flagged so far';
+      const editLink = canOrder ? ` · <span class="linkBtn" style="cursor:pointer" onclick="openAllergenCheckModal('${check.id}')">Edit</span>` : '';
+      allergenBannerHtml = '<div class="res-meta" style="background:'+bg+';border:1px solid '+border+';border-radius:6px;padding:6px 10px;margin-bottom:8px">'
+        + icon + ' Table allergies: <strong>' + esc(tableAllergens.join(', ')) + '</strong>' + tail + editLink + '</div>';
+    } else if (check.allergens_confirmed_at){
+      const editLink = canOrder ? ` · <span class="linkBtn" style="cursor:pointer" onclick="openAllergenCheckModal('${check.id}')">Edit</span>` : '';
+      allergenBannerHtml = '<div class="panel-sub" style="margin-bottom:8px">✅ No known allergies for this table' + editLink + '</div>';
+    } else if (canOrder){
+      allergenBannerHtml = '<div class="panel-sub" style="margin-bottom:8px"><span class="linkBtn" style="cursor:pointer" onclick="openAllergenCheckModal(\''+check.id+'\')">⚠️ Confirm allergies for this table</span></div>';
+    }
+  }
   return `
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
@@ -3924,6 +3959,7 @@ function renderCheckDetail(check){
       ${check.notes ? esc(check.notes) : '<span style="color:var(--gray)">No notes for this check.</span>'}
       ${canOrder ? ` <span class="linkBtn" style="cursor:pointer" onclick="editCheckNotes('${check.id}')">${check.notes?'Edit':'+ Add note'}</span>` : ''}
     </div>` : ''}
+    ${allergenBannerHtml}
     ${autoFireStatus && autoFireStatus.remainingMin <= 3 ? `<div class="res-meta" style="background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:6px 10px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:10px">
       <span>🔥 Mains fire automatically in ${Math.ceil(autoFireStatus.remainingMin)} min${canOrder?'':' — apps are all delivered'}</span>
       ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="holdMainsLonger('${check.id}')">Hold longer</button>` : ''}
@@ -3963,7 +3999,7 @@ function renderCheckDetail(check){
           return `<tr>
           <td>${ci.quantity}</td>
           <td>${ci.seat_number ? `<span class="badge badge-pending">Seat ${ci.seat_number}</span>` : '<span class="panel-sub" style="margin:0">table</span>'}</td>
-          <td>${esc(ci.name_snapshot)}${ci.notes?`<div class="panel-sub" style="margin:0">${esc(ci.notes)}</div>`:''}${courseToggleHtml ? `<div class="panel-sub" style="margin:0">${courseToggleHtml}</div>` : ''}</td>
+          <td>${esc(ci.name_snapshot)}${ci.notes?`<div class="panel-sub" style="margin:0">${esc(ci.notes)}</div>`:''}${itemAllergenFlags[ci.id] ? `<div style="color:#dc2626;font-weight:600;font-size:12px">⚠️ Contains ${esc(itemAllergenFlags[ci.id].join(', '))}</div>` : ''}${courseToggleHtml ? `<div class="panel-sub" style="margin:0">${courseToggleHtml}</div>` : ''}</td>
           <td>${(ci.modifiers||[]).map(m=>esc(m.name)).join(', ')}</td>
           <td><span class="badge badge-${ci.status==='ready'?'confirmed':ci.status==='delivered'?'confirmed':'pending'}">${ci.status==='ready'?'🔔 ready':ci.status==='held'?'held (course 2)':esc(ci.status)}</span></td>
           <td>$${checkItemTotal(ci).toFixed(2)}</td>
@@ -4002,6 +4038,72 @@ window.selectOrdersTable = function(tableId){
 window.selectOrdersCheck = function(checkId){
   state.ordersActiveCheckId = checkId;
   render();
+  maybePromptAllergenCheck(checkId);
+};
+// Opens the allergen checklist the first time a server lands on a check that hasn't been
+// confirmed yet (checks.allergens_confirmed_at is still null) — gated behind the Settings
+// toggle and take_orders, and only fires from explicit navigation (selecting/creating a
+// check), never from the background render/poll loop, so it can't reopen itself on top of
+// whatever the server is doing a few seconds later.
+function maybePromptAllergenCheck(checkId){
+  if (!settingEnabled('allergen_check_enabled', true)) return;
+  if (!can('take_orders')) return;
+  const check = state.checks.find(c => c.id === checkId);
+  if (!check || check.allergens_confirmed_at) return;
+  openAllergenCheckModal(checkId);
+}
+// Builds the checklist modal. Free-text allergy signals already captured on the guest
+// profile or the reservation (see buildGuestInfoNote) are surfaced at the top and used to
+// pre-check matching boxes as a starting point — the server still has to confirm/adjust,
+// since free text isn't guaranteed to map cleanly onto the 9 standard allergens.
+window.openAllergenCheckModal = function(checkId){
+  const check = state.checks.find(c => c.id === checkId);
+  if (!check) return;
+  const linkedGuest = check.guest_id ? state.guests.find(g => g.id === check.guest_id) : null;
+  const reservation = check.reservation_id ? state.reservations.find(r => r.id === check.reservation_id) : null;
+  const noteBits = [];
+  if (linkedGuest?.allergies) noteBits.push(`Guest profile: ${linkedGuest.allergies}`);
+  if (reservation?.special_requests) noteBits.push(`Reservation notes: ${reservation.special_requests}`);
+  const freeText = noteBits.join('  ·  ');
+  const lower = freeText.toLowerCase();
+  const suggested = MAJOR_ALLERGENS.filter(a => lower.includes(a.toLowerCase()) || (a === 'Tree Nuts' && /\bnuts?\b/.test(lower)));
+  const already = check.guest_allergens || [];
+  const checkedSet = already.length ? already : suggested;
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>⚠️ Confirm Table Allergies</h3>
+    ${freeText ? `<div class="res-meta" style="background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:8px 10px;margin-bottom:10px">
+      <strong>Known from reservation/guest profile:</strong><br>${esc(freeText)}
+    </div>` : ''}
+    <p class="panel-sub" style="margin:0 0 10px">Check off any allergies for this table so the check can warn you if something added to it contains them.</p>
+    <label style="display:flex;align-items:center;gap:8px;font-weight:600;margin-bottom:10px;cursor:pointer">
+      <input type="checkbox" id="allergenNoneChk" ${!checkedSet.length && already.length ? 'checked' : ''} onchange="toggleAllergenNone(this.checked)"/> No known allergies
+    </label>
+    <div id="allergenChkList" style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px">
+      ${MAJOR_ALLERGENS.map(a => `<label style="display:flex;align-items:center;gap:5px;font-size:13px;cursor:pointer">
+        <input type="checkbox" class="allergenChk" value="${a}" ${checkedSet.includes(a)?'checked':''}/> ${a}
+      </label>`).join('')}
+    </div>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-primary" onclick="saveAllergenCheck('${checkId}')">Confirm</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.toggleAllergenNone = function(checked){
+  document.querySelectorAll('.allergenChk').forEach(el => { if (checked) el.checked = false; el.disabled = checked; });
+};
+window.saveAllergenCheck = async function(checkId){
+  const none = document.getElementById('allergenNoneChk').checked;
+  const selected = none ? [] : Array.from(document.querySelectorAll('.allergenChk:checked')).map(el => el.value);
+  if (!none && !selected.length){ alert('Check off any allergies this table has, or check "No known allergies".'); return; }
+  const { error } = await sb.from('checks').update({
+    guest_allergens: selected,
+    allergens_confirmed_at: new Date().toISOString(),
+    allergens_confirmed_by: currentStaff.id,
+  }).eq('id', checkId);
+  if (error){ alert('Error: '+error.message); return; }
+  closeModal('formModal');
+  await loadOrdersData();
 };
 window.openNewCheckModal = function(){
   const box = document.getElementById('formModalBox');
@@ -4138,6 +4240,7 @@ window.createCheck = async function(){
   state.ordersActiveCheckId = data.id;
   await reloadTables();
   await loadOrdersData();
+  maybePromptAllergenCheck(data.id);
 };
 window.editCheckNotes = async function(checkId){
   const check = state.checks.find(c=>c.id===checkId);
@@ -4357,6 +4460,17 @@ window.confirmAddItemWithModifiers = function(checkId, itemId){
   }
   const quantity = parseInt(document.getElementById('pickQty').value) || 1;
   const notes = document.getElementById('pickNotes').value.trim() || null;
+  if (settingEnabled('allergen_check_enabled', true)){
+    const check = state.checks.find(c => c.id === checkId);
+    const flagged = check && (check.guest_allergens||[]).length
+      ? [...itemAllergenSet(itemId)].filter(a => check.guest_allergens.includes(a))
+      : [];
+    if (flagged.length){
+      const it = state.menuItems.find(x => x.id === itemId);
+      const proceed = confirm(`⚠️ Allergy warning: this table flagged ${flagged.join(', ')}.\n\n"${it?.name || 'This item'}" contains: ${flagged.join(', ')}.\n\nAdd it to the check anyway?`);
+      if (!proceed) return;
+    }
+  }
   addItemToCheck(checkId, itemId, modifiers, quantity, notes);
 };
 async function addItemToCheck(checkId, itemId, modifiers, quantity, notes){
@@ -6537,6 +6651,22 @@ function renderIngredientsSection(){
 // screen (and anywhere else that shows a recipe) can flag them to a server who's asked
 // about a guest's allergy, without them having to know the recipe by heart.
 const MAJOR_ALLERGENS = ['Milk','Eggs','Fish','Shellfish','Tree Nuts','Peanuts','Wheat','Soy','Sesame'];
+// The set of MAJOR_ALLERGENS present anywhere in a menu item's recipe — shared by the
+// Item Lookup detail view and the check-panel allergy-conflict warnings so both draw
+// from one place instead of two copies of the same ingredient-walk logic.
+function itemAllergenSet(itemId){
+  const recipe = state.itemIngredients.filter(ii => ii.item_id === itemId);
+  const set = new Set();
+  recipe.forEach(r => (state.ingredients.find(x => x.id === r.ingredient_id)?.allergens || []).forEach(a => set.add(a)));
+  return set;
+}
+// Generic feature-toggle reader for app_settings — a row missing entirely (feature never
+// toggled, or added to the app before the toggle existed) falls back to defaultVal rather
+// than silently reading as off.
+function settingEnabled(key, defaultVal){
+  const v = state.appSettings ? state.appSettings[key] : undefined;
+  return v === undefined ? defaultVal : !!v;
+}
 const INGREDIENT_UNIT_GROUPS = {
   'Bar / Cocktail': ['oz','dash','splash','barspoon','part','cube','sprig','wedge','twist','slice'],
   'Volume': ['ml','l','cup','tbsp','tsp','pint','quart','gallon'],
@@ -7184,6 +7314,37 @@ window.deleteStaffDocument = async function(id){
   render();
 };
 
+function renderAllergenSettingsSection(){
+  const enabled = settingEnabled('allergen_check_enabled', true);
+  return `
+  <div class="panel-header"><h2 class="panel-title">⚠️ Allergen Checks</h2></div>
+  <div class="card">
+    <label style="display:flex;align-items:center;gap:10px;font-size:15px;font-weight:600;cursor:pointer">
+      <input type="checkbox" ${enabled?'checked':''} onchange="toggleAllergenCheckSetting(this.checked)"/>
+      Require servers to confirm table allergies on the Orders screen
+    </label>
+    <p class="panel-sub" style="margin-top:10px;line-height:1.5">
+      When this is on, opening a check prompts the server to check off any major allergens for
+      that table (or confirm "No known allergies"). Any allergy notes already on the reservation
+      or guest profile are shown at the top of that prompt and pre-checked as a starting point.
+      Once confirmed, adding an item that contains a flagged allergen asks the server to confirm
+      before it's rung in, and a warning stays visible on the check next to that item.
+    </p>
+    <p class="panel-sub" style="margin-top:8px;line-height:1.5">
+      Turn this off if your team doesn't want the extra prompt — servers can still use
+      "🔍 Look Up Item" on any check to check an item's allergens manually.
+    </p>
+  </div>`;
+}
+window.toggleAllergenCheckSetting = async function(checked){
+  const { error } = await sb.from('app_settings').upsert({
+    key: 'allergen_check_enabled', value: checked, updated_by: currentStaff.id, updated_at: new Date().toISOString(),
+  });
+  if (error){ alert('Error: '+error.message); return; }
+  state.appSettings['allergen_check_enabled'] = checked;
+  render();
+};
+
 // Registry driving both the Settings directory (link grid) and the focused single-section
 // pop-out windows opened from it — one source of truth for what sections exist, their gating,
 // and how to render them, so the two views can never drift out of sync with each other.
@@ -7199,6 +7360,7 @@ const SETTINGS_SECTIONS = [
   { key:'staff',       label:'👤 Staff Access & Permissions',    can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderStaffAccessSection },
   { key:'positions',   label:'🏷️ Positions',                    can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderPositionsSection },
   { key:'documents',   label:'📄 Documents',                     can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderDocumentsSection },
+  { key:'allergen',    label:'⚠️ Allergen Checks',               can: () => can('manage_reservations'), render: renderAllergenSettingsSection },
 ];
 
 function renderSettingsDirectory(){
