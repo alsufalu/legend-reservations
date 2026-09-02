@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.11';
+const APP_VERSION = '2.12';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -5478,6 +5478,22 @@ window.deleteClockTerminal = async function(id){
   await loadScheduleData();
 };
 
+// Shared by the personal Clock In button and the shared-terminal kiosk: when someone
+// tries to clock in with no scheduled shift found for today, don't just let them (or just
+// block them) — a manager/admin has to approve it by entering their own PIN. Keeps the
+// "not on the schedule" message, but makes continuing past it require real approval instead
+// of a plain confirm() dialog anyone could click through.
+async function approveUnscheduledClockIn(whoLabel){
+  const proceed = confirm(`No scheduled shift found ${whoLabel} today.\n\nIf you want to continue, a manager needs to approve this clock-in — you'll be prompted for their PIN next.`);
+  if (!proceed) return false;
+  const mgrPin = prompt('Manager/Admin PIN to approve this clock-in:');
+  if (!mgrPin) return false;
+  const { data: mgrOk, error: mgrErr } = await sb.rpc('verify_manager_pin', { p_pin: mgrPin });
+  if (mgrErr){ alert('Could not verify that PIN — please try again.\n\n' + mgrErr.message); return false; }
+  if (!mgrOk){ alert('Incorrect PIN, or that PIN does not belong to a manager/admin.'); return false; }
+  return true;
+}
+
 window.clockIn = async function(){
   // punch_clock_in stamps auth.uid() (the real signed-in browser session), not
   // currentStaff — wrong on a shared terminal where currentStaff may be a PIN-swapped
@@ -5486,14 +5502,20 @@ window.clockIn = async function(){
   const pin = prompt('Enter your PIN to clock in:');
   if (!pin) return;
   const { data: ok, error: pinErr } = await sb.rpc('verify_staff_pin', { target_staff_id: currentStaff.id, pin });
-  if (pinErr || !ok){ alert('Incorrect PIN.'); return; }
+  // Treat a network/server error separately from an actually-wrong PIN — conflating the two
+  // was the cause of "I have to enter my PIN 2-3 times": a transient RPC hiccup (e.g. an
+  // auth token silently refreshing mid-call) was being reported as "Incorrect PIN", forcing
+  // a retry that then succeeded once the hiccup cleared, even though the PIN was right the
+  // first time.
+  if (pinErr){ alert('Could not verify PIN — connection hiccup, please try again.\n\n' + pinErr.message); return; }
+  if (!ok){ alert('Incorrect PIN.'); return; }
   const now = getNow();
   const today = todayISO();
   const todaysShifts = state.scheduleShifts.filter(s => s.staff_id === currentStaff.id && s.shift_date === today && s.published);
   let shift = todaysShifts.find(s => now.getTime() >= new Date(today+'T'+s.scheduled_start).getTime() - 10*60000) || todaysShifts[0];
   if (!shift){
-    if (!can('manage_timecards')){ alert('No scheduled shift found for you today — ask a manager to clock you in.'); return; }
-    if (!confirm('No scheduled shift found for today — clock in anyway?')) return;
+    const approved = await approveUnscheduledClockIn('for you');
+    if (!approved) return;
   } else {
     const start = new Date(today+'T'+shift.scheduled_start);
     if (now.getTime() < start.getTime() - 10*60000){
@@ -5515,7 +5537,8 @@ window.clockOut = async function(){
   const pin = prompt('Enter your PIN to clock out:');
   if (!pin) return;
   const { data: ok, error: pinErr } = await sb.rpc('verify_staff_pin', { target_staff_id: currentStaff.id, pin });
-  if (pinErr || !ok){ alert('Incorrect PIN.'); return; }
+  if (pinErr){ alert('Could not verify PIN — connection hiccup, please try again.\n\n' + pinErr.message); return; }
+  if (!ok){ alert('Incorrect PIN.'); return; }
   const cashTipsInput = prompt(`Card tips this shift: $${Number(entry.computed_card_tips||0).toFixed(2)} (tracked automatically once Payments is live — nothing to enter for that part).\n\nCash tips you received this shift ($):`, '0');
   if (cashTipsInput === null) return;
   const cashTips = Number(cashTipsInput);
@@ -5550,7 +5573,8 @@ window.kioskPunch = async function(){
     const todaysShifts = state.scheduleShifts.filter(s => s.staff_id === staffId && s.shift_date === today && s.published);
     let shift = todaysShifts.find(s => now.getTime() >= new Date(today+'T'+s.scheduled_start).getTime() - 10*60000) || todaysShifts[0];
     if (!shift){
-      if (!confirm('No scheduled shift found for this employee today — clock in anyway?')) return;
+      const approved = await approveUnscheduledClockIn('for this employee');
+      if (!approved) return;
     } else {
       const start = new Date(today+'T'+shift.scheduled_start);
       if (now.getTime() < start.getTime() - 10*60000){
