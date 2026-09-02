@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.14';
+const APP_VERSION = '2.15';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -3909,6 +3909,7 @@ function renderCheckDetail(check){
       <h3 style="margin:0">${esc(check.guest_label || 'Check')}</h3>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="openItemPickerModal('${check.id}')">+ Add Items</button>` : ''}
+        ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="openItemLookupModal()">🔍 Look Up Item</button>` : ''}
         ${canOrder && hasUnfired ? `<button class="btn btn-sm btn-primary" onclick="fireCheck('${check.id}')">Send to Kitchen/Bar</button>` : ''}
         ${canOrder && hasHeld ? `<button class="btn btn-sm btn-primary" onclick="releaseHeldCourse('${check.id}')">Send Mains to Kitchen</button>` : ''}
         ${canOrder ? `<button class="btn btn-sm btn-secondary" onclick="openSplitCheckModal('${check.id}')">Split</button>` : ''}
@@ -4191,6 +4192,67 @@ window.transferCheck = async function(checkId){
   closeModal('formModal');
   await loadOrdersData();
 };
+
+// ---- Item Lookup: a read-only twin of the Add Items picker below, for when a server needs
+// to check a recipe or allergens (e.g. answering a guest's allergy question) without adding
+// anything to the check. Reuses the same category/grid layout so it feels familiar.
+let _itemLookupCategory = null;
+window.openItemLookupModal = function(){
+  _itemLookupCategory = null;
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = renderItemLookupBody(null);
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.setItemLookupCategory = function(catId){
+  _itemLookupCategory = catId;
+  const box = document.getElementById('formModalBox');
+  if (box) box.innerHTML = renderItemLookupBody(null);
+};
+window.showItemLookupDetail = function(itemId){
+  const box = document.getElementById('formModalBox');
+  if (box) box.innerHTML = renderItemLookupBody(itemId);
+};
+function renderItemLookupBody(selectedItemId){
+  const cats = state.menuCategories;
+  const activeCat = _itemLookupCategory || (cats[0]?.id || null);
+  const items = state.menuItems.filter(it => it.active && (activeCat ? it.category_id === activeCat : true));
+  return `
+    <h3>🔍 Item Lookup</h3>
+    <p class="panel-sub" style="margin:0 0 10px">Check a recipe or allergens — nothing here gets added to the check.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+      ${cats.map(c => `<button type="button" class="btn btn-sm ${activeCat===c.id?'btn-primary':'btn-secondary'}" onclick="setItemLookupCategory('${c.id}')">${esc(c.name)}</button>`).join('') || '<span class="panel-sub">No menu categories set up yet.</span>'}
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;max-height:240px;overflow-y:auto;margin-bottom:12px">
+      ${items.map(it => `<button type="button" class="btn ${selectedItemId===it.id?'btn-primary':'btn-secondary'}" style="text-align:left;height:auto;padding:8px" onclick="showItemLookupDetail('${it.id}')">
+        <div style="font-weight:600;font-size:13px">${esc(it.name)}</div>
+        <div class="panel-sub" style="margin:2px 0 0">$${Number(it.price).toFixed(2)}</div>
+      </button>`).join('') || '<span class="panel-sub">No items in this category.</span>'}
+    </div>
+    ${selectedItemId ? renderItemLookupDetail(selectedItemId) : ''}
+    <div class="modal-actions"><button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Close</button></div>`;
+}
+function renderItemLookupDetail(itemId){
+  const it = state.menuItems.find(x=>x.id===itemId);
+  if (!it) return '';
+  const recipe = state.itemIngredients.filter(ii=>ii.item_id===itemId);
+  const allergenSet = new Set();
+  recipe.forEach(r => (state.ingredients.find(x=>x.id===r.ingredient_id)?.allergens||[]).forEach(a=>allergenSet.add(a)));
+  return `
+  <div class="card" style="background:#f9fafb">
+    <b>${esc(it.name)}</b>${it.description?`<div class="panel-sub" style="margin:2px 0 0">${esc(it.description)}</div>`:''}
+    ${allergenSet.size
+      ? `<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px">${[...allergenSet].map(a=>`<span class="badge badge-pending" style="background:#fef3c7;color:#92400e">⚠️ ${esc(a)}</span>`).join('')}</div>`
+      : `<div class="panel-sub" style="margin-top:8px">No flagged allergens recorded for this item.</div>`}
+    <div class="section-heading" style="margin:12px 0 6px">Ingredients</div>
+    <ul style="margin:0;padding-left:20px;line-height:1.6">
+      ${recipe.length ? recipe.map(r => {
+        const ing = state.ingredients.find(x=>x.id===r.ingredient_id);
+        const tag = (ing?.allergens||[]).length ? ` <span style="color:#b45309">⚠️ ${esc(ing.allergens.join(', '))}</span>` : '';
+        return `<li>${Number(r.quantity)} ${esc(r.unit || ing?.unit || '')} — ${esc(ing?.name||'Unknown ingredient')}${tag}</li>`;
+      }).join('') : '<li style="color:#888">No recipe recorded for this item yet.</li>'}
+    </ul>
+  </div>`;
+}
 
 let _orderPickerCategory = null;
 let _orderPickerSeat = null; // null = "Whole table" (no specific seat) — sticks across items added in the same picker session so a server can ring in a full seat's order without reselecting each time
@@ -6453,7 +6515,7 @@ function renderIngredientsSection(){
   </div>
   <div class="card">
     <table class="data-table">
-      <thead><tr><th>Ingredient</th><th>Brand</th><th>Category</th><th>Unit</th><th>ABV</th><th>Package</th><th>Cost / Unit</th><th></th></tr></thead>
+      <thead><tr><th>Ingredient</th><th>Brand</th><th>Category</th><th>Unit</th><th>ABV</th><th>Allergens</th><th>Package</th><th>Cost / Unit</th><th></th></tr></thead>
       <tbody>
         ${filtered.map(ing => `<tr>
           <td>${esc(ing.name)}</td>
@@ -6461,15 +6523,20 @@ function renderIngredientsSection(){
           <td>${esc(state.ingredientCategories.find(c=>c.id===ing.category_id)?.name || '—')}</td>
           <td>${esc(ing.unit)}</td>
           <td>${ing.abv_percent!=null ? ing.abv_percent+'%' : '—'}</td>
+          <td>${(ing.allergens||[]).length ? `<span style="color:#b45309;font-size:12px">⚠️ ${esc(ing.allergens.join(', '))}</span>` : '<span class="panel-sub" style="margin:0">—</span>'}</td>
           <td>${ing.package_label ? `${esc(ing.package_label)}${ing.package_cost!=null?' · $'+Number(ing.package_cost).toFixed(2):''}` : '<span class="panel-sub" style="margin:0">not set</span>'}</td>
           <td>$<input type="number" min="0" step="0.01" class="modal-input" style="margin:0;width:80px;padding:4px 8px;display:inline-block" value="${ing.cost_per_unit}" onchange="setIngredientCost('${ing.id}', this.value)"/></td>
           <td style="display:flex;gap:6px"><button class="btn btn-sm btn-secondary" onclick="openIngredientModal('${ing.id}')">Edit</button><button class="btn btn-sm btn-danger" onclick="deleteIngredient('${ing.id}')">Delete</button></td>
-        </tr>`).join('') || `<tr><td colspan="8"><span class="panel-sub">No ingredients${state.ingFilterCategory?' in this category':''}.</span></td></tr>`}
+        </tr>`).join('') || `<tr><td colspan="9"><span class="panel-sub">No ingredients${state.ingFilterCategory?' in this category':''}.</span></td></tr>`}
       </tbody>
     </table>
     <div class="modal-actions" style="padding-top:14px"><button class="btn btn-primary" onclick="openIngredientModal()">+ Add Ingredient</button></div>
   </div>`;
 }
+// FDA's 9 major food allergens — tagged per-ingredient so the Item Lookup on the Orders
+// screen (and anywhere else that shows a recipe) can flag them to a server who's asked
+// about a guest's allergy, without them having to know the recipe by heart.
+const MAJOR_ALLERGENS = ['Milk','Eggs','Fish','Shellfish','Tree Nuts','Peanuts','Wheat','Soy','Sesame'];
 const INGREDIENT_UNIT_GROUPS = {
   'Bar / Cocktail': ['oz','dash','splash','barspoon','part','cube','sprig','wedge','twist','slice'],
   'Volume': ['ml','l','cup','tbsp','tsp','pint','quart','gallon'],
@@ -6543,6 +6610,11 @@ window.openIngredientModal = function(ingredientId){
     <label class="field-label">ABV % <span class="panel-sub" style="margin:0">(alcoholic ingredients only — leave blank otherwise)</span></label>
     <input type="number" min="0" max="100" step="0.1" class="modal-input" id="ingAbv" value="${ing?.abv_percent!=null?ing.abv_percent:''}" placeholder="e.g. 40"/>
 
+    <label class="field-label" style="margin-top:10px">Allergens <span class="panel-sub" style="margin:0">(flagged on the Item Lookup for servers)</span></label>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;margin:4px 0 10px">
+      ${MAJOR_ALLERGENS.map(a => `<label style="display:flex;align-items:center;gap:5px;font-size:13px"><input type="checkbox" class="ingAllergenChk" value="${a}" ${(ing?.allergens||[]).includes(a)?'checked':''}/> ${a}</label>`).join('')}
+    </div>
+
     <div class="section-heading" style="margin-top:4px">Price by the Package</div>
     <p class="panel-sub" style="margin:0 0 8px">Enter what you actually bought — a bottle, a case, a lemon — and its cost. Cost per unit below is calculated for you.</p>
     <label class="field-label">Package <span class="panel-sub" style="margin:0">(e.g. "750ml bottle", "Case of 24", "1 lemon")</span></label>
@@ -6580,7 +6652,8 @@ window.saveIngredient = async function(ingredientId){
   if (package_cost!=null && (isNaN(package_cost) || package_cost<0)){ alert('Package cost must be a positive number.'); return; }
   if (package_yield!=null && (isNaN(package_yield) || package_yield<=0)){ alert('Package yield must be greater than 0.'); return; }
   const cost_per_unit = parseFloat(document.getElementById('ingCost').value) || 0;
-  const payload = { name, brand, category_id, unit, abv_percent, package_label, package_cost, package_yield, cost_per_unit };
+  const allergens = Array.from(document.querySelectorAll('.ingAllergenChk:checked')).map(el=>el.value);
+  const payload = { name, brand, category_id, unit, abv_percent, package_label, package_cost, package_yield, cost_per_unit, allergens };
   const { error } = ingredientId
     ? await sb.from('ingredients').update(payload).eq('id', ingredientId)
     : await sb.from('ingredients').insert(payload);
