@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
 <title>Agent</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🍽️</text></svg>">
-<link rel="stylesheet" href="styles.css?v=2.17"/>
+<link rel="stylesheet" href="styles.css?v=2.18"/>
 </head>
 <body>
 
@@ -80,6 +80,7 @@
     <div class="topbar-actions">
       <span id="topbarClock" class="topbar-clock"></span>
       <span id="syncStatus" class="sync-status">☁ Connecting…</span>
+      <button class="account-topbar-btn hidden" id="alertBellBtn" style="position:relative" onclick="openAgentAlertsModal()">🔔<span id="alertBellCount" class="badge badge-pending hidden" style="position:absolute;top:-6px;right:-6px;font-size:10px;padding:1px 5px">0</span></button>
       <button class="account-topbar-btn hidden" id="lockNowBtn" onclick="lockTerminalNow()">🔒 Lock</button>
       <button class="account-topbar-btn" onclick="openAccountModal()">👤 <span id="topbarName">Account</span></button>
     </div>
@@ -115,6 +116,6 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
-<script src="app.js?v=2.17"></script>
+<script src="app.js?v=2.18"></script>
 </body>
 </html>

@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.17';
+const APP_VERSION = '2.18';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -149,6 +149,7 @@ let state = {
   menuInvSection: 'menu',
   appSettings: {}, // key -> value, loaded once at boot from app_settings (feature toggles)
   badgeDefinitions: [], staffBadges: [],
+  agentAlerts: [],
 };
 
 // ============================================================================
@@ -829,6 +830,7 @@ async function onSignedIn(){
   startKdsPolling();
   startMessagePolling();
   startCourseAutoFirePolling();
+  startAgentScanPolling();
 }
 
 // ============================================================================
@@ -867,7 +869,7 @@ async function loadAll(){
       sb.from('modifier_options').select('*').order('sort_order'),
       sb.from('menu_item_modifier_groups').select('*'),
     ]);
-    const [vendorsRes, poRes, poItemsRes, terminalsRes, clockRes, kitchenSettingsRes, positionsRes, docsRes, appSettingsRes, badgeDefRes, staffBadgesRes] = await Promise.all([
+    const [vendorsRes, poRes, poItemsRes, terminalsRes, clockRes, kitchenSettingsRes, positionsRes, docsRes, appSettingsRes, badgeDefRes, staffBadgesRes, agentAlertsRes] = await Promise.all([
       sb.from('vendors').select('*').order('name'),
       sb.from('purchase_orders').select('*').order('created_at', { ascending: false }),
       sb.from('purchase_order_items').select('*'),
@@ -879,6 +881,7 @@ async function loadAll(){
       sb.from('app_settings').select('*'),
       sb.from('badge_definitions').select('*').order('sort_order'),
       sb.from('staff_badges').select('*'),
+      sb.from('agent_alerts').select('*').order('created_at', { ascending: false }).limit(200),
     ]);
     state.vendors = vendorsRes.data || [];
     state.purchaseOrders = poRes.data || [];
@@ -890,6 +893,7 @@ async function loadAll(){
     state.appSettings = Object.fromEntries((appSettingsRes.data || []).map(r => [r.key, r.value]));
     state.badgeDefinitions = badgeDefRes.data || [];
     state.staffBadges = staffBadgesRes.data || [];
+    state.agentAlerts = agentAlertsRes.data || [];
     state.kitchenSettings = kitchenSettingsRes.data || { course_hold_minutes: 12 };
     state.tables = tablesRes.data || [];
     state.areas = areasRes.data || [];
@@ -1087,6 +1091,7 @@ function render(){
   applyPermissionGating();
   renderNowBanner();
   renderTopbarClock();
+  renderAlertBell();
   const c = document.getElementById('content');
   const active = document.activeElement;
   const focusPreserve = (active && active.id && c.contains(active) && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA'))
@@ -5104,6 +5109,10 @@ function startKdsPolling(){
     // viewer having to re-pick the date range/staff filter — loadLaborReport() re-fetches
     // both sections but is cheap at restaurant scale and this only runs while the tab is open.
     if (state.tab === 'reports' && state.reportType === 'labor') loadLaborReport();
+    // Alerts a different session's scan raised (or resolved) since our own last scan/render —
+    // cheap enough to refresh unconditionally regardless of tab, so the bell count and panel
+    // never lag behind what's actually still true.
+    reloadAgentAlerts().then(render);
   }, 15000);
 }
 function stopKdsPolling(){ if (_kdsPollInterval){ clearInterval(_kdsPollInterval); _kdsPollInterval = null; } }
@@ -5196,6 +5205,237 @@ function ticketElapsedMinutes(firedAt){
   if (!firedAt) return 0;
   return Math.max(0, Math.floor((getNow().getTime() - new Date(firedAt).getTime()) / 60000));
 }
+
+// ============================================================================
+// PROACTIVE MONITORING AGENT — background rule checks that flag floor problems
+// before they compound: a table nobody's taken an order from, a hostess
+// overbooking a pacing slot, an ingredient about to run out with nothing on
+// order, a kitchen/bar ticket sitting fired too long. In-app delivery only (no
+// SMS/email), per the original design decision — alerts land in agent_alerts
+// and surface via the 🔔 bell in the topbar to whoever they target, plus any
+// manager. This app has no server-side cron (client + Supabase only), so — same
+// pattern as the badge recalculation — detection runs from whichever eligible
+// session happens to have the app open, polling like the KDS/message loops
+// above. Every scan both raises new alerts (deduped by agent_alerts' partial
+// unique index on rule_key+entity_key) and resolves ones whose condition has
+// since cleared, so the bell only ever reflects what's still actually true.
+// ============================================================================
+const AGENT_TABLE_WAIT_MINUTES = 10;
+const AGENT_TICKET_STUCK_MINUTES = 15;
+function isAgentManager(){ return currentStaff.role === 'admin' || can('manage_reservations'); }
+function timeAgoLabel(iso){
+  const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+async function raiseAlert(ruleKey, entityKey, { severity = 'warning', title, message, targetStaffId = null, notifyManagers = true }){
+  const { error } = await sb.from('agent_alerts').insert({
+    rule_key: ruleKey, entity_key: entityKey, severity, title, message,
+    target_staff_id: targetStaffId, notify_managers: notifyManagers,
+  });
+  // 23505 = unique_violation — an active alert for this rule+entity already exists, which is
+  // the expected/common case (another session beat us to it, or this same condition was
+  // already flagged on a previous scan), not a real error.
+  if (error && error.code !== '23505') console.warn('agent alert insert failed', ruleKey, entityKey, error.message);
+}
+async function resolveStaleAlerts(ruleKey, stillActiveEntityKeys){
+  const toResolve = state.agentAlerts.filter(a => a.rule_key === ruleKey && !a.resolved_at && !stillActiveEntityKeys.has(a.entity_key));
+  if (!toResolve.length) return;
+  await sb.from('agent_alerts').update({ resolved_at: new Date().toISOString() }).in('id', toResolve.map(a => a.id));
+}
+// Rule 1: a seated table with nothing rung in yet past AGENT_TABLE_WAIT_MINUTES — alerts that
+// table's assigned server (if a check already exists for it) plus any manager. Runs its own
+// lightweight queries rather than trusting state.checks/state.checkItems, which are only
+// populated while the Orders/Kitchen/Expo tabs are open on THIS device.
+async function scanTableWaitingRule(){
+  const seated = state.tables.filter(t => !t.is_combo && t.active && t.status === 'seated' && t.seated_at);
+  if (!seated.length){ await resolveStaleAlerts('table_waiting', new Set()); return; }
+  const { data: openChecksRaw } = await sb.from('checks').select('id,table_id,server_id').eq('status', 'open');
+  const openChecks = openChecksRaw || [];
+  const checkIds = openChecks.map(c => c.id);
+  let checkIdsWithItems = new Set();
+  if (checkIds.length){
+    const { data: items } = await sb.from('check_items').select('check_id').in('check_id', checkIds).neq('status', 'voided');
+    checkIdsWithItems = new Set((items || []).map(i => i.check_id));
+  }
+  const active = new Set();
+  for (const t of seated){
+    const groupIds = comboGroupTableIdsSync(t.id);
+    const tableChecks = openChecks.filter(c => groupIds.includes(c.table_id));
+    if (tableChecks.some(c => checkIdsWithItems.has(c.id))) continue; // already ordered
+    const waitMin = tableWaitMinutes(t);
+    if (waitMin < AGENT_TABLE_WAIT_MINUTES) continue;
+    active.add(t.id);
+    await raiseAlert('table_waiting', t.id, {
+      severity: 'critical',
+      title: `${t.label} waiting ${waitMin}m to order`,
+      message: `${t.label} has been seated ${waitMin} minutes with nothing rung in yet.`,
+      targetStaffId: tableChecks[0]?.server_id || null,
+      notifyManagers: true,
+    });
+  }
+  await resolveStaleAlerts('table_waiting', active);
+}
+// Rule 2: any 15-minute pacing slot (see PACING_SLOT_MINUTES) whose booked covers exceed an
+// area's max_covers_per_slot, across today through the next 13 days (the usual booking
+// window) — reuses the exact same pacingSlotStart/coversInSlot math the reservation form's
+// live pacing warning uses, so "overbooked" here means the same thing it means there.
+async function scanOverbookingRule(){
+  const areasWithCap = state.areas.filter(a => a.max_covers_per_slot);
+  if (!areasWithCap.length){ await resolveStaleAlerts('overbooked_slot', new Set()); return; }
+  const fromDate = todayISO();
+  const toDate = toLocalISODate(new Date(Date.now() + 13 * 86400000));
+  const { data: resRows } = await sb.from('reservations')
+    .select('id,party_size,reservation_date,reservation_time,table_id,preferred_area_id,status,created_by')
+    .gte('reservation_date', fromDate).lte('reservation_date', toDate);
+  const rows = (resRows || []).filter(r => !['cancelled', 'no_show'].includes(r.status));
+  const active = new Set();
+  for (const area of areasWithCap){
+    const byDate = {};
+    rows.forEach(r => { if (reservationAreaId(r) === area.id) (byDate[r.reservation_date] = byDate[r.reservation_date] || []).push(r); });
+    for (const [date, dayRows] of Object.entries(byDate)){
+      const slots = new Set(dayRows.map(r => pacingSlotStart(timeToMinutes(r.reservation_time))));
+      for (const slot of slots){
+        const covers = coversInSlot(dayRows, area.id, slot, null);
+        if (covers <= area.max_covers_per_slot) continue;
+        const entityKey = `${area.id}|${date}|${slot}`;
+        active.add(entityKey);
+        const latest = dayRows.filter(r => pacingSlotStart(timeToMinutes(r.reservation_time)) === slot)
+          .sort((a, b) => (b.reservation_time || '').localeCompare(a.reservation_time || ''))[0];
+        await raiseAlert('overbooked_slot', entityKey, {
+          severity: 'critical',
+          title: `${area.name} overbooked — ${fmtDateHuman(date)} ${pacingSlotLabel(slot)}`,
+          message: `${covers} covers booked into ${area.name} for ${fmtDateHuman(date)} ${pacingSlotLabel(slot)}, against a cap of ${area.max_covers_per_slot}.`,
+          targetStaffId: latest?.created_by || null,
+          notifyManagers: true,
+        });
+      }
+    }
+  }
+  await resolveStaleAlerts('overbooked_slot', active);
+}
+// Rule 3: an ingredient at or below its reorder_threshold with no draft/ordered purchase
+// order covering it yet.
+async function scanLowStockRule(){
+  const { data: ingsRaw } = await sb.from('ingredients').select('id,name,unit,current_stock,reorder_threshold').eq('active', true).not('reorder_threshold', 'is', null);
+  const low = (ingsRaw || []).filter(i => i.current_stock != null && i.current_stock <= i.reorder_threshold);
+  const active = new Set();
+  if (low.length){
+    const { data: openPOs } = await sb.from('purchase_orders').select('id').in('status', ['draft', 'ordered']);
+    const openPoIds = (openPOs || []).map(p => p.id);
+    let onOrder = new Set();
+    if (openPoIds.length){
+      const { data: poItems } = await sb.from('purchase_order_items').select('ingredient_id').in('po_id', openPoIds).in('ingredient_id', low.map(i => i.id));
+      onOrder = new Set((poItems || []).map(x => x.ingredient_id));
+    }
+    for (const ing of low){
+      if (onOrder.has(ing.id)) continue;
+      active.add(ing.id);
+      await raiseAlert('low_stock', ing.id, {
+        severity: 'warning',
+        title: `${ing.name} is low on stock`,
+        message: `${ing.name} is at ${ing.current_stock} ${ing.unit || ''} (reorder threshold ${ing.reorder_threshold}) with no open purchase order.`,
+        targetStaffId: null,
+        notifyManagers: true,
+      });
+    }
+  }
+  await resolveStaleAlerts('low_stock', active);
+}
+// Rule 4: a check item that's been sitting 'fired' (sent to kitchen/bar, not yet marked ready)
+// past AGENT_TICKET_STUCK_MINUTES.
+async function scanStuckTicketsRule(){
+  const cutoff = new Date(Date.now() - AGENT_TICKET_STUCK_MINUTES * 60000).toISOString();
+  const { data: stuckRaw } = await sb.from('check_items').select('id,name_snapshot,fired_at').eq('status', 'fired').lt('fired_at', cutoff);
+  const stuck = stuckRaw || [];
+  const active = new Set();
+  for (const ci of stuck){
+    active.add(ci.id);
+    const ageMin = Math.round((Date.now() - new Date(ci.fired_at).getTime()) / 60000);
+    await raiseAlert('stuck_ticket', ci.id, {
+      severity: 'warning',
+      title: `${ci.name_snapshot} stuck ${ageMin}m`,
+      message: `"${ci.name_snapshot}" has been fired for ${ageMin} minutes without being marked ready.`,
+      targetStaffId: null,
+      notifyManagers: true,
+    });
+  }
+  await resolveStaleAlerts('stuck_ticket', active);
+}
+async function reloadAgentAlerts(){
+  const { data } = await sb.from('agent_alerts').select('*').order('created_at', { ascending: false }).limit(200);
+  state.agentAlerts = data || [];
+}
+async function runAgentScan(){
+  if (!settingEnabled('agent_monitoring_enabled', true)) return;
+  try {
+    await Promise.all([scanTableWaitingRule(), scanOverbookingRule(), scanLowStockRule(), scanStuckTicketsRule()]);
+  } catch(e){ console.warn('agent scan failed', e); }
+  await reloadAgentAlerts();
+  render();
+}
+window.runAgentScanNow = async function(){
+  const btn = document.getElementById('agentScanNowBtn');
+  if (btn){ btn.disabled = true; btn.textContent = 'Scanning…'; }
+  await runAgentScan();
+  if (btn){ btn.disabled = false; btn.textContent = '🔍 Scan Now'; }
+};
+let _agentScanInterval = null;
+// Only sessions that are actually operationally relevant (order-takers, floor managers,
+// admins) run detection — everyone else still sees alerts land via the passive
+// reloadAgentAlerts() folded into the KDS poll above, without every idle tab also hammering
+// four extra queries every 30 seconds.
+function startAgentScanPolling(){
+  stopAgentScanPolling();
+  if (!(currentStaff.role === 'admin' || can('take_orders') || can('manage_reservations'))) return;
+  runAgentScan();
+  _agentScanInterval = setInterval(runAgentScan, 30000);
+}
+function stopAgentScanPolling(){ if (_agentScanInterval){ clearInterval(_agentScanInterval); _agentScanInterval = null; } }
+// Alerts relevant to whoever's currently signed in: called out by name, or a manager seeing
+// anything flagged for manager attention.
+function myAgentAlerts(){
+  const manager = isAgentManager();
+  return state.agentAlerts.filter(a => !a.resolved_at && (a.target_staff_id === currentStaff.id || (a.notify_managers && manager)));
+}
+function renderAlertBell(){
+  const btn = document.getElementById('alertBellBtn');
+  const countEl = document.getElementById('alertBellCount');
+  if (!btn || !countEl) return;
+  const n = myAgentAlerts().length;
+  countEl.textContent = String(n);
+  countEl.classList.toggle('hidden', n === 0);
+  btn.classList.toggle('hidden', !currentStaff);
+}
+window.openAgentAlertsModal = function(){
+  const active = myAgentAlerts().sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  const canScan = currentStaff.role === 'admin' || can('take_orders') || can('manage_reservations');
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `
+    <h3>🔔 Alerts</h3>
+    ${active.length ? active.map(a => `<div class="res-meta" style="background:${a.severity==='critical'?'#fee2e2':'#fef3c7'};border:1px solid ${a.severity==='critical'?'#fca5a5':'#f59e0b'};border-radius:6px;padding:8px 10px;margin-bottom:8px">
+      <div style="font-weight:600">${a.severity==='critical'?'🚨':'⚠️'} ${esc(a.title)}</div>
+      <div style="font-size:13px;margin:4px 0">${esc(a.message)}</div>
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span class="panel-sub" style="margin:0">${timeAgoLabel(a.created_at)}</span>
+        <span class="linkBtn" style="cursor:pointer" onclick="dismissAgentAlert('${a.id}')">Dismiss</span>
+      </div>
+    </div>`).join('') : '<div class="panel-sub" style="margin:0">Nothing needs attention right now.</div>'}
+    <div class="modal-actions">
+      ${canScan ? `<button class="modal-btn modal-btn-secondary" onclick="runAgentScanNow().then(()=>openAgentAlertsModal())">🔍 Scan Now</button>` : ''}
+      <button class="modal-btn modal-btn-primary" onclick="closeModal('formModal')">Close</button>
+    </div>`;
+  document.getElementById('formModal').classList.remove('hidden');
+};
+window.dismissAgentAlert = async function(id){
+  const { error } = await sb.from('agent_alerts').update({ resolved_at: new Date().toISOString(), resolved_by: currentStaff.id }).eq('id', id);
+  if (error){ alert('Error: '+error.message); return; }
+  await reloadAgentAlerts();
+  openAgentAlertsModal();
+};
 // Which ticket-destination columns this device shows on the Kitchen/Bar board — a display
 // preference for the physical screen sitting in that station, not a business setting, so it's
 // kept in localStorage per-device rather than the database. Kitchen doesn't want Main Bar/Secret
@@ -7559,6 +7799,44 @@ function renderBadgesSettingsSection(){
     </div>
   </div>`;
 }
+function renderAgentSettingsSection(){
+  const enabled = settingEnabled('agent_monitoring_enabled', true);
+  return `
+  <div class="panel-header"><h2 class="panel-title">🤖 Proactive Alerts</h2>
+    <button class="btn btn-primary btn-sm" id="agentScanNowBtn" onclick="runAgentScanNow()">🔍 Scan Now</button>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <label style="display:flex;align-items:center;gap:10px;font-size:15px;font-weight:600;cursor:pointer">
+      <input type="checkbox" ${enabled?'checked':''} onchange="toggleAgentMonitoringSetting(this.checked)"/>
+      Watch the floor for problems and alert staff/managers automatically
+    </label>
+    <p class="panel-sub" style="margin-top:10px;line-height:1.5">
+      When this is on, the app checks every 30 seconds (while someone with an operational role
+      has it open) for: a seated table nobody's ordered from after ${AGENT_TABLE_WAIT_MINUTES}
+      minutes, a pacing slot booked over an area's cover cap, an ingredient at or below its
+      reorder threshold with no purchase order open, and a kitchen/bar ticket sitting fired for
+      more than ${AGENT_TICKET_STUCK_MINUTES} minutes. Alerts show up in the 🔔 bell in the top
+      bar for the staff member called out (where there is one) and for any manager — in-app
+      only, nothing is texted or emailed. An alert clears itself automatically once the
+      underlying problem is resolved, or can be dismissed by hand.
+    </p>
+  </div>
+  <div class="section-heading">Active alerts right now</div>
+  <div class="card">
+    ${state.agentAlerts.filter(a=>!a.resolved_at).length ? state.agentAlerts.filter(a=>!a.resolved_at).map(a => `<div class="res-meta" style="padding:4px 0">
+      ${a.severity==='critical'?'🚨':'⚠️'} <strong>${esc(a.title)}</strong> — ${esc(a.message)} <span class="panel-sub" style="margin:0">(${timeAgoLabel(a.created_at)})</span>
+      <span class="linkBtn" style="cursor:pointer;margin-left:6px" onclick="dismissAgentAlert('${a.id}')">Dismiss</span>
+    </div>`).join('') : '<div class="panel-sub" style="margin:0">Nothing flagged right now.</div>'}
+  </div>`;
+}
+window.toggleAgentMonitoringSetting = async function(checked){
+  const { error } = await sb.from('app_settings').upsert({
+    key: 'agent_monitoring_enabled', value: checked, updated_by: currentStaff.id, updated_at: new Date().toISOString(),
+  });
+  if (error){ alert('Error: '+error.message); return; }
+  state.appSettings['agent_monitoring_enabled'] = checked;
+  render();
+};
 
 // Registry driving both the Settings directory (link grid) and the focused single-section
 // pop-out windows opened from it — one source of truth for what sections exist, their gating,
@@ -7577,6 +7855,7 @@ const SETTINGS_SECTIONS = [
   { key:'documents',   label:'📄 Documents',                     can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderDocumentsSection },
   { key:'allergen',    label:'⚠️ Allergen Checks',               can: () => can('manage_reservations'), render: renderAllergenSettingsSection },
   { key:'badges',      label:'🏅 Badges',                        can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderBadgesSettingsSection },
+  { key:'agent',       label:'🤖 Proactive Alerts',               can: () => can('manage_reservations'), render: renderAgentSettingsSection },
 ];
 
 function renderSettingsDirectory(){
