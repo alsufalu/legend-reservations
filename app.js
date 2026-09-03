@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.18';
+const APP_VERSION = '2.19';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -5413,6 +5413,7 @@ function renderAlertBell(){
 window.openAgentAlertsModal = function(){
   const active = myAgentAlerts().sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   const canScan = currentStaff.role === 'admin' || can('take_orders') || can('manage_reservations');
+  const idsJson = JSON.stringify(active.map(a => a.id));
   const box = document.getElementById('formModalBox');
   box.innerHTML = `
     <h3>🔔 Alerts</h3>
@@ -5425,6 +5426,7 @@ window.openAgentAlertsModal = function(){
       </div>
     </div>`).join('') : '<div class="panel-sub" style="margin:0">Nothing needs attention right now.</div>'}
     <div class="modal-actions">
+      ${active.length > 1 ? `<button class="modal-btn modal-btn-secondary" onclick='dismissAllAgentAlerts(${idsJson})'>Dismiss All</button>` : ''}
       ${canScan ? `<button class="modal-btn modal-btn-secondary" onclick="runAgentScanNow().then(()=>openAgentAlertsModal())">🔍 Scan Now</button>` : ''}
       <button class="modal-btn modal-btn-primary" onclick="closeModal('formModal')">Close</button>
     </div>`;
@@ -5435,6 +5437,16 @@ window.dismissAgentAlert = async function(id){
   if (error){ alert('Error: '+error.message); return; }
   await reloadAgentAlerts();
   openAgentAlertsModal();
+};
+window.dismissAllAgentAlerts = async function(ids){
+  if (!ids || !ids.length) return;
+  if (!confirm('Dismiss all ' + ids.length + ' alert' + (ids.length === 1 ? '' : 's') + '?')) return;
+  const { error } = await sb.from('agent_alerts').update({ resolved_at: new Date().toISOString(), resolved_by: currentStaff.id }).in('id', ids);
+  if (error){ alert('Error: '+error.message); return; }
+  await reloadAgentAlerts();
+  const modal = document.getElementById('formModal');
+  if (modal && !modal.classList.contains('hidden')) openAgentAlertsModal();
+  render();
 };
 // Which ticket-destination columns this device shows on the Kitchen/Bar board — a display
 // preference for the physical screen sitting in that station, not a business setting, so it's
@@ -7801,6 +7813,8 @@ function renderBadgesSettingsSection(){
 }
 function renderAgentSettingsSection(){
   const enabled = settingEnabled('agent_monitoring_enabled', true);
+  const activeAlerts = state.agentAlerts.filter(a=>!a.resolved_at);
+  const activeIdsJson = JSON.stringify(activeAlerts.map(a => a.id));
   return `
   <div class="panel-header"><h2 class="panel-title">🤖 Proactive Alerts</h2>
     <button class="btn btn-primary btn-sm" id="agentScanNowBtn" onclick="runAgentScanNow()">🔍 Scan Now</button>
@@ -7821,9 +7835,12 @@ function renderAgentSettingsSection(){
       underlying problem is resolved, or can be dismissed by hand.
     </p>
   </div>
-  <div class="section-heading">Active alerts right now</div>
+  <div class="section-heading" style="display:flex;justify-content:space-between;align-items:center">
+    <span>Active alerts right now</span>
+    ${activeAlerts.length > 1 ? `<span class="linkBtn" style="cursor:pointer;font-weight:400" onclick='dismissAllAgentAlerts(${activeIdsJson})'>Dismiss All</span>` : ''}
+  </div>
   <div class="card">
-    ${state.agentAlerts.filter(a=>!a.resolved_at).length ? state.agentAlerts.filter(a=>!a.resolved_at).map(a => `<div class="res-meta" style="padding:4px 0">
+    ${activeAlerts.length ? activeAlerts.map(a => `<div class="res-meta" style="padding:4px 0">
       ${a.severity==='critical'?'🚨':'⚠️'} <strong>${esc(a.title)}</strong> — ${esc(a.message)} <span class="panel-sub" style="margin:0">(${timeAgoLabel(a.created_at)})</span>
       <span class="linkBtn" style="cursor:pointer;margin-left:6px" onclick="dismissAgentAlert('${a.id}')">Dismiss</span>
     </div>`).join('') : '<div class="panel-sub" style="margin:0">Nothing flagged right now.</div>'}
