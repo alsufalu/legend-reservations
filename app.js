@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.19';
+const APP_VERSION = '2.21';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -3837,7 +3837,10 @@ function renderOrdersTab(){
       ${waitingTables.map(t => {
         const m = tableWaitMinutes(t);
         const color = m >= 10 ? '#dc2626' : m >= 5 ? '#d97706' : '#2563eb';
-        return `<div class="area-chip" style="cursor:pointer;border-color:${color};color:${color};font-weight:600" onclick="selectOrdersTable('${t.id}')">${esc(t.label)} · ${m}m</div>`;
+        return `<div class="area-chip" style="display:flex;align-items:center;gap:6px;border-color:${color};color:${color};font-weight:600">
+          <span style="cursor:pointer" onclick="selectOrdersTable('${t.id}')">${esc(t.label)} · ${m}m</span>
+          <span class="linkBtn" style="cursor:pointer;font-weight:400;font-size:12px" title="Nobody ordered and they left — clear this table" onclick="releaseTableNoOrder('${t.id}')">Mark available</span>
+        </div>`;
       }).join('')}
     </div>
   </div>` : ''}
@@ -4282,6 +4285,36 @@ window.deleteEmptyCheck = async function(checkId){
   if (error){ alert('Error: '+error.message); return; }
   if (state.ordersActiveCheckId === checkId) state.ordersActiveCheckId = null;
   await loadOrdersData();
+};
+// Lets take_orders/take_payment staff release a seated table straight from Orders when a party
+// leaves without ordering anything, instead of having to find someone with manage_reservations
+// to cycle it on the Floor Plan. Only ever touches a table that's genuinely still
+// tableWaitingForOrder() — nothing rung in on any open check across its combo group — so this
+// can't be used to bail on a table that's actually mid-service. dining_tables RLS already grants
+// take_orders/take_payment staff UPDATE on this table (tables_update_order_staff), so no new
+// migration is needed.
+window.releaseTableNoOrder = async function(tableId){
+  const t = tableById(tableId);
+  if (!t || !tableWaitingForOrder(t)){ alert('This table already has an order in progress — refresh and try again.'); return; }
+  if (!confirm(`Mark ${t.label} available? This clears the seated table since nothing was ordered.`)) return;
+  const groupIds = await comboGroupTableIds(tableId);
+  // Clean up any check that was opened on this table (e.g. just to run the allergen checklist)
+  // but never got an item rung in — nothing on it has fired, so it's safe to delete outright,
+  // same as the manual "Delete this check" action.
+  const emptyCheckIds = state.checks
+    .filter(c => c.status === 'open' && groupIds.includes(c.table_id))
+    .filter(c => !state.checkItems.some(ci => ci.check_id === c.id && ci.status !== 'voided'))
+    .map(c => c.id);
+  if (emptyCheckIds.length){
+    const { error: delErr } = await sb.from('checks').delete().in('id', emptyCheckIds);
+    if (delErr){ alert('Error: '+delErr.message); return; }
+  }
+  const { error } = await sb.from('dining_tables').update({ status: 'available', seated_at: null, paid_up_at: null }).in('id', groupIds);
+  if (error){ alert('Error: '+error.message); return; }
+  if (groupIds.includes(state.ordersActiveTableId)){ state.ordersActiveTableId = null; state.ordersActiveCheckId = null; }
+  await reloadTables();
+  await loadOrdersData();
+  render();
 };
 // A check can only be transferred to someone who is BOTH currently clocked in AND holds
 // take_orders permission — handing a table to someone off the clock (or without ordering
@@ -4898,7 +4931,6 @@ window.openPaymentModal = function(checkId){
     <div class="panel-sub" style="margin-bottom:10px">Subtotal $${subtotal.toFixed(2)}${discountTotal?` · Discounts -$${discountTotal.toFixed(2)}`:''} · Total due $${totalDue.toFixed(2)}${paid?` · Already paid $${paid.toFixed(2)}`:''}${ways>1?` · ${ways}-way split ≈ $${perWay.toFixed(2)} each`:''}</div>
     <div class="formgrid">
       <div><label class="field-label">Amount ($)</label><input type="number" min="0.01" step="0.01" class="modal-input" id="payAmount" value="${defaultAmount.toFixed(2)}"/></div>
-      <div><label class="field-label">Tip ($)</label><input type="number" min="0" step="0.01" class="modal-input" id="payTip" value="0"/></div>
     </div>
     <label class="field-label">Method</label>
     <select class="modal-select" id="payMethod" onchange="togglePayMethodFields()">
@@ -4909,7 +4941,7 @@ window.openPaymentModal = function(checkId){
     <div id="payMethodFields" class="panel-sub" style="margin-top:6px"></div>
     <div class="modal-actions">
       <button class="modal-btn modal-btn-secondary" onclick="closeModal('formModal')">Cancel</button>
-      <button class="modal-btn modal-btn-primary" id="payChargeBtn" onclick="processPayment('${checkId}')">Charge</button>
+      <button class="modal-btn modal-btn-primary" id="payChargeBtn" onclick="startPaymentFlow('${checkId}')">Continue</button>
     </div>`;
   document.getElementById('formModal').classList.remove('hidden');
   togglePayMethodFields();
@@ -4917,17 +4949,31 @@ window.openPaymentModal = function(checkId){
 window.togglePayMethodFields = function(){
   const method = document.getElementById('payMethod').value;
   const div = document.getElementById('payMethodFields');
+  const btn = document.getElementById('payChargeBtn');
   if (method === 'gift_card'){
-    div.innerHTML = `<label class="field-label" style="margin:0 0 4px">Gift card code</label><input type="text" class="modal-input" id="payGiftCode" placeholder="GC-XXXXXXXX" style="margin:0;text-transform:uppercase"/>`;
+    div.innerHTML = `<label class="field-label" style="margin:0 0 4px">Gift card code</label><input type="text" class="modal-input" id="payGiftCode" placeholder="GC-XXXXXXXX" style="margin:0 0 8px;text-transform:uppercase"/><label class="field-label" style="margin:0 0 4px">Tip ($)</label><input type="number" min="0" step="0.01" class="modal-input" id="payTip" value="0" style="margin:0"/>`;
   } else if (method === 'card_sandbox'){
-    div.innerHTML = 'A fake sandbox charge will be simulated — no real card is ever contacted.';
+    div.innerHTML = '💳 Next, hand the screen to the guest — they\'ll pick a tip and tap/insert their card. No real card is ever contacted (sandbox).';
   } else {
-    div.innerHTML = '';
+    div.innerHTML = `<label class="field-label" style="margin:0 0 4px">Tip ($)</label><input type="number" min="0" step="0.01" class="modal-input" id="payTip" value="0" style="margin:0"/>`;
+  }
+  if (btn) btn.textContent = method === 'card_sandbox' ? 'Continue' : 'Charge';
+};
+// Card payments hand off to the full-screen guest tip picker; cash/gift-card stay on this
+// staff-entered flow since there's no card reader step to hand the device over for.
+window.startPaymentFlow = function(checkId){
+  const amount = parseFloat(document.getElementById('payAmount').value) || 0;
+  const method = document.getElementById('payMethod').value;
+  if (amount <= 0){ alert('Enter a valid amount.'); return; }
+  if (method === 'card_sandbox'){
+    openGuestTipScreen(checkId, amount);
+  } else {
+    processPayment(checkId);
   }
 };
 window.processPayment = async function(checkId){
   const amount = parseFloat(document.getElementById('payAmount').value) || 0;
-  const tip_amount = parseFloat(document.getElementById('payTip').value) || 0;
+  const tip_amount = parseFloat(document.getElementById('payTip')?.value) || 0;
   const method = document.getElementById('payMethod').value;
   if (amount <= 0){ alert('Enter a valid amount.'); return; }
   const btn = document.getElementById('payChargeBtn');
@@ -4948,6 +4994,96 @@ window.processPayment = async function(checkId){
   });
   if (error){ alert('Error: '+error.message); if (btn){ btn.disabled = false; btn.textContent = 'Charge'; } return; }
   await maybeCloseCheck(checkId);
+  closeModal('formModal');
+  await loadOrdersData();
+};
+
+// ----------------------------------------------------------------------------
+// Guest-facing tip screen for card payments — styled like the Square/Toast tap-to-pay
+// tip prompt, meant to be handed straight to the guest to complete themselves. Tip
+// suggestions are computed as a percentage of the amount being charged (matches how
+// Square/Toast compute suggested tips off the pre-tip total, not the whole check if this
+// is a split payment). Still a sandbox charge underneath — same processing/insert as the
+// staff-entered flow, just reached from a different, guest-friendly screen.
+const GUEST_TIP_PRESETS = [0.18, 0.20, 0.25];
+window.openGuestTipScreen = function(checkId, amount){
+  state._guestPay = { checkId, amount, selectedPct: null, customTip: 0 };
+  renderGuestTipScreen();
+};
+function renderGuestTipScreen(){
+  const gp = state._guestPay;
+  if (!gp) return;
+  const { amount, selectedPct, customTip } = gp;
+  const box = document.getElementById('formModalBox');
+  const isCustom = selectedPct === 'custom';
+  const isNone = selectedPct === 0;
+  const tip = isCustom ? (customTip || 0) : (typeof selectedPct === 'number' ? Math.round(amount * selectedPct * 100) / 100 : null);
+  let customFieldHtml = '';
+  if (isCustom){
+    customFieldHtml = `<div style="margin-bottom:16px"><input type="number" min="0" step="0.01" class="modal-input" id="guestCustomTipInput" placeholder="Custom tip $" value="${customTip||''}" style="text-align:center;font-size:18px" oninput="updateGuestCustomTip(this.value)" autofocus/></div>`;
+  }
+  let totalHtml = '<div style="height:22px"></div>';
+  if (tip !== null){
+    totalHtml = `<div style="font-size:14px;color:#6b7280;margin-bottom:2px">Total with tip</div>
+      <div id="guestTotalDisplay" style="font-size:32px;font-weight:800;color:#0070f2;margin-bottom:20px">$${(amount+tip).toFixed(2)}</div>`;
+  }
+  box.innerHTML = `
+  <div style="text-align:center;padding:8px 4px 4px">
+    <div style="font-size:13px;color:#6b7280;letter-spacing:.05em;text-transform:uppercase">Amount Due</div>
+    <div style="font-size:46px;font-weight:800;margin:2px 0 6px">$${amount.toFixed(2)}</div>
+    <div style="font-size:17px;color:#374151;margin-bottom:18px">Would you like to add a tip?</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px">
+      ${GUEST_TIP_PRESETS.map(pct => {
+        const amt = Math.round(amount * pct * 100) / 100;
+        const active = selectedPct === pct;
+        return `<button class="btn ${active?'btn-primary':'btn-secondary'}" style="padding:18px 4px;font-size:19px;font-weight:700;border-radius:12px;line-height:1.3" onclick="selectGuestTip(${pct})">${Math.round(pct*100)}%<br><span style="font-size:14px;font-weight:500">$${amt.toFixed(2)}</span></button>`;
+      }).join('')}
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px">
+      <button class="btn ${isCustom?'btn-primary':'btn-secondary'}" style="padding:14px 4px;font-size:16px;font-weight:600;border-radius:12px" onclick="selectGuestTip('custom')">Custom Tip</button>
+      <button class="btn ${isNone?'btn-primary':'btn-secondary'}" style="padding:14px 4px;font-size:16px;font-weight:600;border-radius:12px" onclick="selectGuestTip(0)">No Tip</button>
+    </div>
+    ${customFieldHtml}
+    ${totalHtml}
+    <button class="btn btn-primary" style="width:100%;padding:18px;font-size:19px;font-weight:700;border-radius:12px" ${tip===null?'disabled':''} onclick="confirmGuestPayment()">💳 ${tip===null?'Select a tip amount':'Tap or Insert Card'}</button>
+    <div style="margin-top:16px"><span class="linkBtn" style="cursor:pointer;font-size:12px;color:#9ca3af" onclick="cancelGuestTipScreen()">Staff: cancel / go back</span></div>
+  </div>`;
+}
+window.selectGuestTip = function(pct){
+  if (!state._guestPay) return;
+  state._guestPay.selectedPct = pct;
+  if (pct === 'custom' && !state._guestPay.customTip) state._guestPay.customTip = 0;
+  renderGuestTipScreen();
+};
+window.updateGuestCustomTip = function(val){
+  if (!state._guestPay) return;
+  state._guestPay.customTip = parseFloat(val) || 0;
+  const totalEl = document.getElementById('guestTotalDisplay');
+  if (totalEl) totalEl.textContent = '$' + (state._guestPay.amount + state._guestPay.customTip).toFixed(2);
+  const chargeBtn = document.querySelector('#formModalBox .btn-primary[onclick="confirmGuestPayment()"]');
+  if (chargeBtn) chargeBtn.textContent = '💳 Tap or Insert Card';
+};
+window.cancelGuestTipScreen = function(){
+  const checkId = state._guestPay?.checkId;
+  state._guestPay = null;
+  if (checkId) openPaymentModal(checkId);
+};
+window.confirmGuestPayment = async function(){
+  const gp = state._guestPay;
+  if (!gp || gp.selectedPct === null) return;
+  const { checkId, amount, selectedPct, customTip } = gp;
+  const tip_amount = selectedPct === 'custom' ? (customTip || 0) : (typeof selectedPct === 'number' ? Math.round(amount * selectedPct * 100) / 100 : 0);
+  const box = document.getElementById('formModalBox');
+  box.innerHTML = `<div style="text-align:center;padding:70px 20px"><div style="font-size:19px;font-weight:600">Processing…</div></div>`;
+  const sandbox_txn_id = 'SANDBOX-' + Date.now().toString(36).toUpperCase();
+  const card_last4 = String(1000 + Math.floor(Math.random()*9000));
+  await new Promise(r => setTimeout(r, 700)); // simulated processing delay
+  const { error } = await sb.from('payments').insert({
+    check_id: checkId, amount, tip_amount, method: 'card_sandbox', sandbox_txn_id, card_last4, processed_by: currentStaff.id,
+  });
+  if (error){ alert('Error: '+error.message); state._guestPay = null; openPaymentModal(checkId); return; }
+  await maybeCloseCheck(checkId);
+  state._guestPay = null;
   closeModal('formModal');
   await loadOrdersData();
 };
@@ -5349,19 +5485,29 @@ async function scanLowStockRule(){
 // past AGENT_TICKET_STUCK_MINUTES.
 async function scanStuckTicketsRule(){
   const cutoff = new Date(Date.now() - AGENT_TICKET_STUCK_MINUTES * 60000).toISOString();
-  const { data: stuckRaw } = await sb.from('check_items').select('id,name_snapshot,fired_at').eq('status', 'fired').lt('fired_at', cutoff);
+  const { data: stuckRaw } = await sb.from('check_items').select('id,check_id,name_snapshot,fired_at').eq('status', 'fired').lt('fired_at', cutoff);
   const stuck = stuckRaw || [];
   const active = new Set();
-  for (const ci of stuck){
-    active.add(ci.id);
-    const ageMin = Math.round((Date.now() - new Date(ci.fired_at).getTime()) / 60000);
-    await raiseAlert('stuck_ticket', ci.id, {
-      severity: 'warning',
-      title: `${ci.name_snapshot} stuck ${ageMin}m`,
-      message: `"${ci.name_snapshot}" has been fired for ${ageMin} minutes without being marked ready.`,
-      targetStaffId: null,
-      notifyManagers: true,
-    });
+  if (stuck.length){
+    // Only flag items whose check is still open — a check can get closed/paid while an item was
+    // left sitting in 'fired' (never advanced to ready), and that item has no live parent check
+    // left to expedite. Without this check the Kitchen board (which only loads open checks) shows
+    // nothing, while this scan kept alerting on it forever.
+    const checkIds = [...new Set(stuck.map(ci => ci.check_id))];
+    const { data: openChecksRaw } = await sb.from('checks').select('id').in('id', checkIds).eq('status', 'open');
+    const openCheckIds = new Set((openChecksRaw || []).map(c => c.id));
+    for (const ci of stuck){
+      if (!openCheckIds.has(ci.check_id)) continue;
+      active.add(ci.id);
+      const ageMin = Math.round((Date.now() - new Date(ci.fired_at).getTime()) / 60000);
+      await raiseAlert('stuck_ticket', ci.id, {
+        severity: 'warning',
+        title: `${ci.name_snapshot} stuck ${ageMin}m`,
+        message: `"${ci.name_snapshot}" has been fired for ${ageMin} minutes without being marked ready.`,
+        targetStaffId: null,
+        notifyManagers: true,
+      });
+    }
   }
   await resolveStaleAlerts('stuck_ticket', active);
 }
