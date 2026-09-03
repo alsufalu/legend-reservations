@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.16';
+const APP_VERSION = '2.17';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -148,6 +148,7 @@ let state = {
   ingFilterCategory: '',
   menuInvSection: 'menu',
   appSettings: {}, // key -> value, loaded once at boot from app_settings (feature toggles)
+  badgeDefinitions: [], staffBadges: [],
 };
 
 // ============================================================================
@@ -866,7 +867,7 @@ async function loadAll(){
       sb.from('modifier_options').select('*').order('sort_order'),
       sb.from('menu_item_modifier_groups').select('*'),
     ]);
-    const [vendorsRes, poRes, poItemsRes, terminalsRes, clockRes, kitchenSettingsRes, positionsRes, docsRes, appSettingsRes] = await Promise.all([
+    const [vendorsRes, poRes, poItemsRes, terminalsRes, clockRes, kitchenSettingsRes, positionsRes, docsRes, appSettingsRes, badgeDefRes, staffBadgesRes] = await Promise.all([
       sb.from('vendors').select('*').order('name'),
       sb.from('purchase_orders').select('*').order('created_at', { ascending: false }),
       sb.from('purchase_order_items').select('*'),
@@ -876,6 +877,8 @@ async function loadAll(){
       sb.from('staff_positions').select('*').order('name'),
       sb.from('staff_documents').select('*').order('category').order('title'),
       sb.from('app_settings').select('*'),
+      sb.from('badge_definitions').select('*').order('sort_order'),
+      sb.from('staff_badges').select('*'),
     ]);
     state.vendors = vendorsRes.data || [];
     state.purchaseOrders = poRes.data || [];
@@ -885,6 +888,8 @@ async function loadAll(){
     state.staffPositions = positionsRes.data || [];
     state.staffDocuments = docsRes.data || [];
     state.appSettings = Object.fromEntries((appSettingsRes.data || []).map(r => [r.key, r.value]));
+    state.badgeDefinitions = badgeDefRes.data || [];
+    state.staffBadges = staffBadgesRes.data || [];
     state.kitchenSettings = kitchenSettingsRes.data || { course_hold_minutes: 12 };
     state.tables = tablesRes.data || [];
     state.areas = areasRes.data || [];
@@ -919,6 +924,17 @@ async function loadAll(){
     // (Settings > Staff Access) need the full row (email/phone/address), which RLS now allows for
     // manage_staff_permissions holders — fetch it here rather than exposing it to everyone.
     if (can('manage_staff_permissions')) await reloadStaffList();
+    // Badges have no server-side cron to run them (this app is client+Supabase, no scheduled
+    // functions) — so instead, once per calendar day, whichever manager happens to load the
+    // app first triggers a recalculation on everyone's behalf. Throttled via an app_settings
+    // marker so it costs nothing on every subsequent page load/poll that same day. Runs after
+    // sync status is reported so a slow recalculation never blocks the "Synced" indicator.
+    if (can('manage_staff_permissions') && state.badgeDefinitions.length){
+      const today = todayISO();
+      if (state.appSettings['badges_last_run_date'] !== today){
+        maybeAutoRecalculateBadges(today);
+      }
+    }
     setStatus(statusEl, '☁ Synced', 'synced');
   } catch(e){
     setStatus(statusEl, '⚠ Offline', 'error');
@@ -5453,6 +5469,7 @@ function renderScheduleTab(){
   </div>` : '';
 
   const docsReportsCard = can('view_own_schedule') ? renderMyDocsReportsSection() : '';
+  const badgesCard = can('view_own_schedule') ? renderMyBadgesCard() : '';
 
   return `
   <div class="panel-header"><h2 class="panel-title">Schedule</h2></div>
@@ -5460,6 +5477,7 @@ function renderScheduleTab(){
   ${kioskCard}
   ${scheduleCard}
   ${timeOffCard}
+  ${badgesCard}
   ${docsReportsCard}
   ${can('use_messaging') ? renderMessagesSection() : ''}
   ${can('manage_broadcasts') ? renderGroupsSection() : ''}
@@ -5467,6 +5485,31 @@ function renderScheduleTab(){
   ${can('manage_timecards') ? renderTimecardManagement() + renderClockTerminalsSection() : ''}`;
 }
 
+// Self-service badge case — earned badges (with the date earned) plus a preview of what's
+// still available, shown to every staff member on their own account so the criteria (see
+// Settings > Badges) double as visible goals rather than a surprise a manager hands out.
+function renderMyBadgesCard(){
+  const mine = state.staffBadges.filter(b => b.staff_id === currentStaff.id);
+  const earned = mine.map(b => ({ def: state.badgeDefinitions.find(d => d.key === b.badge_key), earnedAt: b.earned_at })).filter(x => x.def)
+    .sort((a,b) => new Date(b.earnedAt) - new Date(a.earnedAt));
+  const earnedKeys = new Set(mine.map(b => b.badge_key));
+  const locked = state.badgeDefinitions.filter(d => !earnedKeys.has(d.key));
+  return `
+  <div class="section-heading">🏅 My Badges</div>
+  <div class="card" style="margin-bottom:14px">
+    ${earned.length ? `<div style="display:flex;flex-wrap:wrap;gap:14px;margin-bottom:${locked.length?'14px':'0'}">
+      ${earned.map(x => `<div style="text-align:center;width:90px">
+        <div style="font-size:28px">${x.def.icon}</div>
+        <div style="font-size:12px;font-weight:600">${esc(x.def.name)}</div>
+        <div class="panel-sub" style="margin:0;font-size:11px">${new Date(x.earnedAt).toLocaleDateString()}</div>
+      </div>`).join('')}
+    </div>` : '<div class="panel-sub" style="margin:0 0 10px">No badges earned yet — keep at it!</div>'}
+    ${locked.length ? `<div class="panel-sub" style="margin:0 0 6px;font-weight:600">Still up for grabs</div>
+    <div style="display:flex;flex-direction:column;gap:6px">
+      ${locked.map(d => `<div class="res-meta" style="opacity:0.6"><span style="margin-right:6px">${d.icon}</span>${esc(d.name)} — ${esc(d.description)}</div>`).join('')}
+    </div>` : ''}
+  </div>`;
+}
 // ---- Per-employee "My Documents & Reports": each staff member's own private view of
 // company-wide handbooks/training guides, their own generated payout reports (see the
 // manager-side Employee Payout Report in the Reports tab), and a live daily tip breakdown
@@ -7345,6 +7388,178 @@ window.toggleAllergenCheckSetting = async function(checked){
   render();
 };
 
+// ---- Employee badges --------------------------------------------------------------------
+// This app has no server-side cron (client + Supabase only, no scheduled edge functions), so
+// badge criteria are evaluated here, client-side, whenever a manage_staff_permissions holder
+// triggers it — either the manual "Recalculate Badges" button in Settings, or the once-a-day
+// automatic run wired into loadAll(). Both funnel through computeAndAwardBadges() so the
+// criteria only live in one place.
+async function computeAndAwardBadges(){
+  const now = new Date();
+  const cutoff30 = new Date(now.getTime() - 30*86400000).toISOString();
+  const cutoff60 = new Date(now.getTime() - 60*86400000).toISOString();
+  const cutoffDate60 = toLocalISODate(new Date(now.getTime() - 60*86400000));
+
+  const [checksRes, shiftsRes, clockRes, swapsRes, existingBadgesRes] = await Promise.all([
+    sb.from('checks').select('id,server_id,notes,created_at').gte('created_at', cutoff30).not('server_id', 'is', null),
+    sb.from('schedule_shifts').select('id,staff_id,shift_date,scheduled_end').eq('published', true).gte('shift_date', cutoffDate60).lte('shift_date', todayISO()),
+    sb.from('time_clock_entries').select('staff_id,status,clock_in_at,shift_id').gte('clock_in_at', cutoff60),
+    sb.from('shift_swap_requests').select('claimed_by,status,decided_at').eq('status', 'approved').gte('decided_at', cutoff60),
+    sb.from('staff_badges').select('*'),
+  ]);
+  const checks30 = checksRes.data || [];
+  const checkIds30 = checks30.map(c => c.id);
+  // Payments aren't fetched until we know which checks are actually in-window — a separate,
+  // scoped query rather than pulling every payment ever made.
+  let payments30 = [];
+  if (checkIds30.length){
+    const { data } = await sb.from('payments').select('check_id,amount,tip_amount,status').in('check_id', checkIds30).eq('status', 'completed');
+    payments30 = data || [];
+  }
+  const shifts60 = shiftsRes.data || [];
+  const clock60 = clockRes.data || [];
+  const swaps60 = swapsRes.data || [];
+  const existingBadges = existingBadgesRes.data || [];
+  state.staffBadges = existingBadges;
+
+  const activeStaff = state.staffList.filter(s => s.active);
+  const newlyEarned = []; // { staffId, staffName, badgeKey }
+
+  for (const s of activeStaff){
+    const already = new Set(existingBadges.filter(b => b.staff_id === s.id).map(b => b.badge_key));
+    const earn = (key) => { if (!already.has(key)) newlyEarned.push({ staffId: s.id, staffName: s.name, badgeKey: key }); };
+
+    // 📝 Detail-Oriented: 90%+ of their checks in the trailing 30 days carry a note, min 15 checks
+    // (guards against a slow week where 2-for-2 notes would otherwise trivially qualify).
+    const myChecks = checks30.filter(c => c.server_id === s.id);
+    if (myChecks.length >= 15){
+      const withNotes = myChecks.filter(c => c.notes && c.notes.trim()).length;
+      if (withNotes / myChecks.length >= 0.9) earn('detail_oriented');
+    }
+
+    // 💰 Top Tipper: 20%+ average tip rate over the trailing 30 days, min $500 in completed
+    // payment volume so a single generous table can't carry the badge on its own.
+    const myCheckIds = new Set(myChecks.map(c => c.id));
+    const myPays = payments30.filter(p => myCheckIds.has(p.check_id));
+    const salesTotal = myPays.reduce((sum, p) => sum + Number(p.amount || 0), 0);
+    const tipsTotal = myPays.reduce((sum, p) => sum + Number(p.tip_amount || 0), 0);
+    if (salesTotal >= 500 && (tipsTotal / salesTotal) >= 0.20) earn('top_tipper');
+
+    // ⏰ Always On Time: zero clock-ins flagged 'late' (relative to their scheduled shift start
+    // — see punch_clock_in's status logic) over the trailing 60 days, min 10 shifts worked.
+    const myClocks = clock60.filter(e => e.staff_id === s.id);
+    if (myClocks.length >= 10 && !myClocks.some(e => e.status === 'late')) earn('always_on_time');
+
+    // 🎯 Perfect Attendance: every published shift in the trailing 60 days has a matching
+    // time_clock_entries row (same "missing punch" signal Timecard Management uses to flag a
+    // no-show/never-clocked-in shift), min 10 scheduled shifts.
+    const myShifts = shifts60.filter(sh => sh.staff_id === s.id);
+    if (myShifts.length >= 10){
+      const missed = myShifts.filter(sh => !clock60.some(e => e.shift_id === sh.id)).length;
+      if (missed === 0) earn('perfect_attendance');
+    }
+
+    // 🤝 Team Player: picked up 3+ approved open/swapped shifts over the trailing 60 days.
+    const mySwaps = swaps60.filter(sw => sw.claimed_by === s.id).length;
+    if (mySwaps >= 3) earn('team_player');
+
+    // 🏅🎖️ Veteran tiers, based on staff.created_at (account creation date ≈ join date) — only
+    // populated for managers whose session already pulled full staff rows via reloadStaffList().
+    if (s.created_at){
+      const daysIn = (now.getTime() - new Date(s.created_at).getTime()) / 86400000;
+      if (daysIn >= 90) earn('veteran_90');
+      if (daysIn >= 365) earn('veteran_1yr');
+    }
+  }
+
+  if (newlyEarned.length){
+    const rows = newlyEarned.map(n => ({ staff_id: n.staffId, badge_key: n.badgeKey, awarded_by: currentStaff.id }));
+    // ignoreDuplicates guards against two managers' sessions racing to award the same badge
+    // the same day — the unique(staff_id, badge_key) constraint just no-ops the second insert.
+    const { error } = await sb.from('staff_badges').upsert(rows, { onConflict: 'staff_id,badge_key', ignoreDuplicates: true });
+    if (error) throw error;
+    const { data: freshBadges } = await sb.from('staff_badges').select('*');
+    state.staffBadges = freshBadges || [];
+    // Best-effort congrats broadcast per newly earned badge. Posting to the broadcast thread
+    // requires manage_broadcasts, which whoever triggered this recalculation might not hold —
+    // that's fine, the badge is already awarded and visible on the employee's own account
+    // either way, the broadcast is just a nice-to-have on top.
+    for (const n of newlyEarned){
+      const def = state.badgeDefinitions.find(b => b.key === n.badgeKey);
+      if (!def) continue;
+      try {
+        const threadId = await findOrCreateBroadcastThread();
+        if (threadId){
+          await sb.from('messages').insert({ thread_id: threadId, sender_id: currentStaff.id, body: `🎉 Congrats to ${n.staffName} for earning the ${def.icon} ${def.name} badge!` });
+        }
+      } catch(e){ /* no messaging/broadcast permission on this session — skip silently */ }
+    }
+  }
+  return newlyEarned;
+}
+window.recalculateBadges = async function(){
+  const btn = document.getElementById('recalcBadgesBtn');
+  if (btn){ btn.disabled = true; btn.textContent = 'Recalculating…'; }
+  try {
+    const newlyEarned = await computeAndAwardBadges();
+    alert(newlyEarned.length ? `Awarded ${newlyEarned.length} new badge${newlyEarned.length===1?'':'s'}.` : "No new badges to award right now — everyone's caught up.");
+    render();
+  } catch(e){
+    alert('Error recalculating badges: '+e.message);
+  } finally {
+    if (btn){ btn.disabled = false; btn.textContent = '🔄 Recalculate Badges'; }
+  }
+};
+// Silent, once-per-calendar-day counterpart to the manual button (see loadAll) — no alert(),
+// and marks app_settings so it doesn't run again until tomorrow. If two managers happen to
+// load the app around the same moment before the marker lands, both may run once; the upsert
+// above keeps that harmless.
+async function maybeAutoRecalculateBadges(today){
+  try { await computeAndAwardBadges(); } catch(e){ /* best-effort — the manual button still works */ }
+  try {
+    await sb.from('app_settings').upsert({ key: 'badges_last_run_date', value: today, updated_by: currentStaff.id, updated_at: new Date().toISOString() });
+    state.appSettings['badges_last_run_date'] = today;
+  } catch(e){ /* non-fatal */ }
+  render();
+}
+function renderBadgesSettingsSection(){
+  const activeStaff = state.staffList.filter(s => s.active).sort((a,b) => a.name.localeCompare(b.name));
+  return `
+  <div class="panel-header"><h2 class="panel-title">🏅 Badges</h2>
+    <button class="btn btn-primary btn-sm" id="recalcBadgesBtn" onclick="recalculateBadges()">🔄 Recalculate Badges</button>
+  </div>
+  <p class="panel-sub" style="margin:0 0 14px">
+    Badges recalculate automatically once a day (whenever a manager first opens the app), or any
+    time using the button above. Earning a new badge posts a congrats message to the Everyone
+    broadcast and shows up on that employee's own account.
+  </p>
+  <div class="section-heading">Badge criteria</div>
+  <div class="card" style="margin-bottom:16px">
+    ${state.badgeDefinitions.map(b => `<div style="display:flex;gap:10px;align-items:flex-start;padding:6px 0">
+      <span style="font-size:20px">${b.icon}</span>
+      <div><div style="font-weight:600">${esc(b.name)}</div><div class="panel-sub" style="margin:0">${esc(b.description)}</div></div>
+    </div>`).join('') || '<div class="panel-sub" style="margin:0">No badge definitions found.</div>'}
+  </div>
+  <div class="section-heading">Team roster</div>
+  <div class="card">
+    <div class="table-scroll">
+    <table class="data-table">
+      <thead><tr><th>Staff</th><th>Badges earned</th></tr></thead>
+      <tbody>
+        ${activeStaff.map(s => {
+          const mine = state.staffBadges.filter(b => b.staff_id === s.id)
+            .map(b => state.badgeDefinitions.find(d => d.key === b.badge_key)).filter(Boolean);
+          return `<tr>
+            <td>${esc(s.name)}</td>
+            <td>${mine.length ? mine.map(d => `<span title="${esc(d.name)}" style="font-size:17px;margin-right:4px">${d.icon}</span>`).join('') : '<span class="panel-sub" style="margin:0">None yet</span>'}</td>
+          </tr>`;
+        }).join('') || `<tr><td colspan="2"><span class="panel-sub">No active staff.</span></td></tr>`}
+      </tbody>
+    </table>
+    </div>
+  </div>`;
+}
+
 // Registry driving both the Settings directory (link grid) and the focused single-section
 // pop-out windows opened from it — one source of truth for what sections exist, their gating,
 // and how to render them, so the two views can never drift out of sync with each other.
@@ -7361,6 +7576,7 @@ const SETTINGS_SECTIONS = [
   { key:'positions',   label:'🏷️ Positions',                    can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderPositionsSection },
   { key:'documents',   label:'📄 Documents',                     can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderDocumentsSection },
   { key:'allergen',    label:'⚠️ Allergen Checks',               can: () => can('manage_reservations'), render: renderAllergenSettingsSection },
+  { key:'badges',      label:'🏅 Badges',                        can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderBadgesSettingsSection },
 ];
 
 function renderSettingsDirectory(){
