@@ -250,22 +250,43 @@ table.data-table td{padding:10px 12px;border-top:1px solid var(--border);font-si
 .orders-main{flex:1;min-width:0;}
 .table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;}
 
-@media (max-width: 720px){
-  /* Stack the topbar into three tidy rows instead of letting the brand and a
-     dozen wrapping nav buttons fight for the same line: (1) brand/version,
-     (2) clock/sync/account controls, (3) the tab grid. DOM order is unchanged —
-     only the visual order is reflowed via flex `order`, so no HTML restructuring
-     was needed. */
-  .topbar{padding:10px 10px;flex-direction:column;align-items:stretch;gap:8px;}
+/* Kitchen/bar station board: a grid that reflows to fewer columns as the screen narrows,
+   instead of a fixed-width flex row that forces horizontal scrolling. This screen commonly
+   runs on a mounted tablet/monitor in the kitchen, where scrolling sideways mid-rush to see
+   a station is worse than just letting the columns wrap to a second row. */
+.kds-board{display:grid;grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));gap:14px;}
+
+/* Anything narrower than a full desktop window (this covers iPad portrait/landscape and most
+   laptops at their native resolution, not just phones) needs the topbar stacked instead of
+   left to wrap on its own — at the default single-row flex layout, a dozen nav buttons wrapping
+   mid-bar pushes the brand/account row down and interleaves with it, which looked broken on
+   anything from ~768px to ~1350px wide. Stack into three tidy rows instead: (1) brand/version,
+   (2) clock/sync/account controls, (3) the tab grid. DOM order is unchanged — only the visual
+   order is reflowed via flex `order`, so no HTML restructuring was needed. The tab grid uses
+   auto-fill so it naturally shows more columns on a wider tablet/laptop and fewer on a narrower
+   one, rather than a fixed column count that's cramped on some widths and sparse on others. */
+@media (max-width: 1350px){
+  .topbar{padding:10px 14px;flex-direction:column;align-items:stretch;gap:8px;}
   .topbar-left{order:1;}
   .topbar-actions{order:2;justify-content:flex-start;flex-wrap:wrap;row-gap:6px;}
-  .tabnav{order:3;display:grid;grid-template-columns:repeat(3, 1fr);gap:6px;width:100%;flex:none;}
-  .brand{font-size:15px;}
+  .tabnav{order:3;display:grid;grid-template-columns:repeat(auto-fill, minmax(120px, 1fr));gap:6px;width:100%;flex:none;}
   .tabbtn{
-    padding:9px 4px;font-size:11px;text-align:center;white-space:normal;line-height:1.25;
+    padding:9px 6px;font-size:12px;text-align:center;white-space:normal;line-height:1.25;
     border:1px solid var(--border);border-radius:8px;background:#fff;
   }
   .tabbtn.active{border-color:var(--primary);}
+  table.data-table{font-size:12.5px;}
+  table.data-table th, table.data-table td{padding:8px 8px;}
+}
+
+@media (max-width: 720px){
+  /* Phone-only tightening on top of the 1350px stack above: a fixed 3-column grid reads
+     better than auto-fill once buttons would otherwise be squeezed to a sliver, plus smaller
+     type and tighter padding throughout. */
+  .topbar{padding:10px 10px;}
+  .tabnav{grid-template-columns:repeat(3, 1fr);}
+  .brand{font-size:15px;}
+  .tabbtn{padding:9px 4px;font-size:11px;}
   .content{padding:12px;}
   .formgrid{grid-template-columns:1fr;}
   .orders-layout{flex-direction:column;}

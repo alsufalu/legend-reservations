@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.21';
+const APP_VERSION = '2.23';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -3163,6 +3163,20 @@ window.saveGuest = async function(id){
     tags: document.getElementById('gTags').value.split(',').map(s=>s.trim()).filter(Boolean),
     vip: document.getElementById('gVip').checked,
   };
+  // Case-insensitive name match against existing guests, new-guest only — nothing else catches
+  // e.g. "Tito" being added again when "tito" is already on file, and left unchecked the guest
+  // list just fragments over time (same person, split visit history). Not a hard block, just a
+  // heads-up the host can override for genuine same-name guests.
+  if (!id){
+    const newName = (payload.first_name + ' ' + payload.last_name).trim().toLowerCase();
+    const dupe = newName && state.guests.find(g => ((g.first_name||'') + ' ' + (g.last_name||'')).trim().toLowerCase() === newName);
+    if (dupe){
+      const dupeName = (dupe.first_name + ' ' + dupe.last_name).trim();
+      const dupeDetail = [dupe.phone, dupe.email].filter(Boolean).join(' · ') || 'no phone/email on file';
+      const proceed = confirm('A guest named "' + dupeName + '" already exists (' + dupeDetail + '). Add another guest with the same name anyway?');
+      if (!proceed) return;
+    }
+  }
   const { error } = id
     ? await sb.from('guests').update(payload).eq('id', id)
     : await sb.from('guests').insert(payload);
@@ -3210,13 +3224,41 @@ async function loadDashboard(){
   const startTs = new Date(startISO+'T00:00:00').toISOString();
   const endTs = new Date(endISO+'T23:59:59.999').toISOString();
 
-  const [{ data: kpiRows }, { data: allRes }, { data: payRows }, { data: discRows }, { data: itemRows }] = await Promise.all([
+  // Immediately-preceding period of the same length (e.g. current "7d" vs. the 7 days before
+  // that) — just enough data to show a vs-prior-period delta on the headline KPIs, so a number
+  // like "$800 total sales" has some context for whether that's good or bad at a glance.
+  const priorEndDate = new Date(start); priorEndDate.setDate(priorEndDate.getDate() - 1);
+  const priorStartDate = new Date(priorEndDate); priorStartDate.setDate(priorStartDate.getDate() - (state.dashRange - 1));
+  const priorStartISO = toLocalISODate(priorStartDate);
+  const priorEndISO = toLocalISODate(priorEndDate);
+  const priorStartTs = new Date(priorStartISO+'T00:00:00').toISOString();
+  const priorEndTs = new Date(priorEndISO+'T23:59:59.999').toISOString();
+
+  const [{ data: kpiRows }, { data: allRes }, { data: payRows }, { data: discRows }, { data: itemRows }, { data: priorKpiRows }, { data: priorPayRows }] = await Promise.all([
     sb.from('kpi_daily').select('*').gte('day', startISO).lte('day', endISO),
     sb.from('reservations').select('reservation_time,party_size,status,guest_id').gte('reservation_date', startISO).lte('reservation_date', endISO),
     sb.from('payments').select('*').gte('created_at', startTs).lte('created_at', endTs),
     sb.from('check_discounts').select('*').gte('created_at', startTs).lte('created_at', endTs),
     sb.from('check_items').select('check_id,fired_at,delivered_at,status').gte('created_at', startTs).lte('created_at', endTs),
+    sb.from('kpi_daily').select('total_covers,total_reservations').gte('day', priorStartISO).lte('day', priorEndISO),
+    sb.from('payments').select('amount,refunded_amount,tip_amount').gte('created_at', priorStartTs).lte('created_at', priorEndTs),
   ]);
+  const priorTotalCovers = (priorKpiRows||[]).reduce((s,r)=>s+r.total_covers,0);
+  const priorTotalRes = (priorKpiRows||[]).reduce((s,r)=>s+r.total_reservations,0);
+  const priorPays = priorPayRows || [];
+  const priorTotalSales = priorPays.reduce((s,p)=>s+Number(p.amount)-Number(p.refunded_amount||0),0);
+  const priorTotalTips = priorPays.reduce((s,p)=>s+Number(p.tip_amount||0),0);
+  const dashRangeLabel = state.dashRange === 1 ? 'prior day' : 'prior ' + state.dashRange + 'd';
+  // Higher isn't always simply "good" for every KPI, but for these four (the ones people scan
+  // first) it always is, so a plain up=green/down=red arrow reads correctly without per-card logic.
+  const kpiDelta = (current, prior) => {
+    if (!prior && !current) return '';
+    if (!prior) return `<div class="kpi-delta up">▲ new vs ${dashRangeLabel}</div>`;
+    const pct = ((current - prior) / prior) * 100;
+    const dir = pct > 0.5 ? 'up' : pct < -0.5 ? 'down' : 'flat';
+    const arrow = dir === 'up' ? '▲' : dir === 'down' ? '▼' : '▬';
+    return `<div class="kpi-delta ${dir}">${arrow} ${Math.abs(pct).toFixed(0)}% vs ${dashRangeLabel}</div>`;
+  };
   const pays = payRows || [];
   const payCheckIds = [...new Set(pays.map(p=>p.check_id))];
   const { data: payChecks } = payCheckIds.length ? await sb.from('checks').select('id,server_id').in('id', payCheckIds) : { data: [] };
@@ -3283,8 +3325,8 @@ async function loadDashboard(){
   if (!el) return;
   el.innerHTML = `
     <div class="grid grid-4" style="margin-bottom:20px">
-      <div class="kpi-card"><div class="kpi-value">${totalCovers}</div><div class="kpi-label">Total Covers</div></div>
-      <div class="kpi-card"><div class="kpi-value">${totalRes}</div><div class="kpi-label">Reservations</div></div>
+      <div class="kpi-card"><div class="kpi-value">${totalCovers}</div><div class="kpi-label">Total Covers</div>${kpiDelta(totalCovers, priorTotalCovers)}</div>
+      <div class="kpi-card"><div class="kpi-value">${totalRes}</div><div class="kpi-label">Reservations</div>${kpiDelta(totalRes, priorTotalRes)}</div>
       <div class="kpi-card"><div class="kpi-value">${completed}</div><div class="kpi-label">Completed</div></div>
       <div class="kpi-card"><div class="kpi-value">${avgParty}</div><div class="kpi-label">Avg Party Size</div></div>
       <div class="kpi-card"><div class="kpi-value">${noShowRate}%</div><div class="kpi-label">No-Show Rate</div></div>
@@ -3295,8 +3337,8 @@ async function loadDashboard(){
 
     <div class="section-heading">Sales &amp; Tips</div>
     <div class="grid grid-4" style="margin-bottom:20px">
-      <div class="kpi-card"><div class="kpi-value">$${totalSales.toFixed(2)}</div><div class="kpi-label">Total Sales</div></div>
-      <div class="kpi-card"><div class="kpi-value">$${totalTips.toFixed(2)}</div><div class="kpi-label">Total Tips</div></div>
+      <div class="kpi-card"><div class="kpi-value">$${totalSales.toFixed(2)}</div><div class="kpi-label">Total Sales</div>${kpiDelta(totalSales, priorTotalSales)}</div>
+      <div class="kpi-card"><div class="kpi-value">$${totalTips.toFixed(2)}</div><div class="kpi-label">Total Tips</div>${kpiDelta(totalTips, priorTotalTips)}</div>
       <div class="kpi-card"><div class="kpi-value">${tipPct.toFixed(1)}%</div><div class="kpi-label">Tip %</div></div>
       <div class="kpi-card"><div class="kpi-value">${avgOrderMin!=null?avgOrderMin.toFixed(1)+'m':'—'}</div><div class="kpi-label">Avg Order Time</div></div>
     </div>
@@ -5186,7 +5228,7 @@ window.openRecentPaymentsModal = async function(){
         const table = chk ? tableById(chk.table_id) : null;
         const refundable = p.status !== 'refunded' && (p.amount - p.refunded_amount) > 0;
         return `<div class="res-meta" style="display:flex;justify-content:space-between;align-items:center;padding:5px 0">
-          <span>${esc(table?.label||'')}${chk?.guest_label?' · '+esc(chk.guest_label):''} — $${Number(p.amount).toFixed(2)} ${esc(p.method)} ${p.status!=='completed'?`<span class="badge badge-pending">${esc(p.status)}</span>`:''}<div class="panel-sub" style="margin:0">${new Date(p.created_at).toLocaleString()}</div></span>
+          <span>${esc(table?.label||'')}${chk?.guest_label?' · '+esc(chk.guest_label):''} — $${Number(p.amount).toFixed(2)}${Number(p.tip_amount)?' + $'+Number(p.tip_amount).toFixed(2)+' tip':''} ${esc(p.method)} ${p.status!=='completed'?`<span class="badge badge-pending">${esc(p.status)}</span>`:''}<div class="panel-sub" style="margin:0">${new Date(p.created_at).toLocaleString()}</div></span>
           ${refundable ? `<button class="btn btn-sm btn-danger" onclick="openRefundModal('${p.id}', ${Number(p.amount) - Number(p.refunded_amount)})">Refund</button>` : ''}
         </div>`;
       }).join('') || '<div class="panel-sub">No payments yet.</div>'}
@@ -5511,6 +5553,56 @@ async function scanStuckTicketsRule(){
   }
   await resolveStaleAlerts('stuck_ticket', active);
 }
+// Rule 5: a waitlist party still sitting active far longer than anything reasonable — almost
+// always a forgotten entry (never seated, never removed) rather than a real party still
+// standing by, which otherwise just sits there quietly looking wrong to every host who opens
+// the tab. Flags once the actual wait clears BOTH a flat floor and 3x what they were quoted, so
+// a party genuinely quoted a long wait on a busy night doesn't get flagged the moment they pass
+// their own quote — only once they're way past it.
+const AGENT_WAITLIST_STALE_MINUTES = 90;
+async function scanStaleWaitlistRule(){
+  const active = new Set();
+  for (const w of state.waitlist){
+    const waitMin = Math.round((Date.now() - new Date(w.added_at).getTime()) / 60000);
+    const threshold = Math.max(AGENT_WAITLIST_STALE_MINUTES, (w.quoted_wait_minutes || 0) * 3);
+    if (waitMin < threshold) continue;
+    active.add(w.id);
+    await raiseAlert('stale_waitlist', w.id, {
+      severity: 'warning',
+      title: `${w.guest_name || 'Waitlist party'} waiting ${waitMin}m`,
+      message: `Quoted ${w.quoted_wait_minutes ?? '?'} min but still on the waitlist after ${waitMin} minutes — probably forgotten. Seat or remove them.`,
+      targetStaffId: null,
+      notifyManagers: true,
+    });
+  }
+  await resolveStaleAlerts('stale_waitlist', active);
+}
+// Rule 6: a staff member still clocked in well beyond any realistic shift length — almost
+// always a forgotten clock-out (walked out, device died, etc.) rather than someone actually
+// working a 14+ hour shift, and it quietly inflates the running labor-cost total on Reports
+// until someone happens to notice and fix it by hand. RLS only lets a session see clock entries
+// it's permitted to (its own, or all of them with manage_timecards/manage_payroll/admin), so on
+// a plain take_orders/manage_reservations session this naturally only ever catches that staff
+// member's own forgotten punch — which is still useful, just not exhaustive from every device.
+const AGENT_LONG_SHIFT_HOURS = 14;
+async function scanLongShiftRule(){
+  const { data: openEntries } = await sb.from('time_clock_entries').select('id,staff_id,clock_in_at').is('clock_out_at', null);
+  const active = new Set();
+  for (const e of (openEntries || [])){
+    const hrs = (Date.now() - new Date(e.clock_in_at).getTime()) / 3600000;
+    if (hrs < AGENT_LONG_SHIFT_HOURS) continue;
+    active.add(e.id);
+    const staffName = state.staffList.find(s=>s.id===e.staff_id)?.name || 'Someone';
+    await raiseAlert('long_shift', e.id, {
+      severity: 'warning',
+      title: `${staffName} clocked in ${hrs.toFixed(1)}h`,
+      message: `${staffName} has been clocked in for ${hrs.toFixed(1)} hours without clocking out — probably a forgotten clock-out. Check Reports → Labor & Clock.`,
+      targetStaffId: e.staff_id,
+      notifyManagers: true,
+    });
+  }
+  await resolveStaleAlerts('long_shift', active);
+}
 async function reloadAgentAlerts(){
   const { data } = await sb.from('agent_alerts').select('*').order('created_at', { ascending: false }).limit(200);
   state.agentAlerts = data || [];
@@ -5518,7 +5610,7 @@ async function reloadAgentAlerts(){
 async function runAgentScan(){
   if (!settingEnabled('agent_monitoring_enabled', true)) return;
   try {
-    await Promise.all([scanTableWaitingRule(), scanOverbookingRule(), scanLowStockRule(), scanStuckTicketsRule()]);
+    await Promise.all([scanTableWaitingRule(), scanOverbookingRule(), scanLowStockRule(), scanStuckTicketsRule(), scanStaleWaitlistRule(), scanLongShiftRule()]);
   } catch(e){ console.warn('agent scan failed', e); }
   await reloadAgentAlerts();
   render();
@@ -5639,7 +5731,7 @@ function renderKitchenTab(){
       <button class="btn btn-secondary btn-sm" onclick="saveCourseHoldMinutes()">Save</button>
     </div>` : ''}
   </div>
-  <div style="display:flex;gap:14px;overflow-x:auto;padding-bottom:8px">
+  <div class="kds-board">
     ${destinations.map(td => {
       const items = relevantItems.filter(ci => ci.ticket_destination_id === td.id);
       const checkIds = [...new Set(items.map(ci=>ci.check_id))];
@@ -5650,7 +5742,7 @@ function renderKitchenTab(){
         return { check, items: tItems, firedAt };
       }).filter(t => t.check).sort((a,b) => new Date(a.firedAt||0) - new Date(b.firedAt||0));
       return `
-      <div style="flex:0 0 300px">
+      <div>
         <div class="section-heading" style="margin-top:0">${esc(td.name)} <span class="panel-sub" style="margin:0">(${tickets.length})</span></div>
         <div style="display:flex;flex-direction:column;gap:10px">
           ${tickets.map(t => renderKitchenTicket(t)).join('') || '<div class="card"><div class="panel-sub" style="margin:0">No active tickets.</div></div>'}
@@ -7974,11 +8066,14 @@ function renderAgentSettingsSection(){
       When this is on, the app checks every 30 seconds (while someone with an operational role
       has it open) for: a seated table nobody's ordered from after ${AGENT_TABLE_WAIT_MINUTES}
       minutes, a pacing slot booked over an area's cover cap, an ingredient at or below its
-      reorder threshold with no purchase order open, and a kitchen/bar ticket sitting fired for
-      more than ${AGENT_TICKET_STUCK_MINUTES} minutes. Alerts show up in the 🔔 bell in the top
-      bar for the staff member called out (where there is one) and for any manager — in-app
-      only, nothing is texted or emailed. An alert clears itself automatically once the
-      underlying problem is resolved, or can be dismissed by hand.
+      reorder threshold with no purchase order open, a kitchen/bar ticket sitting fired for
+      more than ${AGENT_TICKET_STUCK_MINUTES} minutes, a waitlist party stuck active well past
+      what they were quoted, and a shift clocked in for ${AGENT_LONG_SHIFT_HOURS}+ hours without
+      a clock-out (almost always a forgotten punch, and it inflates the running labor cost on
+      Reports until it's fixed). Alerts show up in the 🔔 bell in the top bar for the staff
+      member called out (where there is one) and for any manager — in-app only, nothing is
+      texted or emailed. An alert clears itself automatically once the underlying problem is
+      resolved, or can be dismissed by hand.
     </p>
   </div>
   <div class="section-heading" style="display:flex;justify-content:space-between;align-items:center">
@@ -8001,6 +8096,119 @@ window.toggleAgentMonitoringSetting = async function(checked){
   render();
 };
 
+// ----------------------------------------------------------------------------
+// FULL DATA BACKUP — admin-only JSON export of every table, meant to be saved somewhere
+// outside Supabase (this computer, a cloud drive, etc.) as an actual local backup, since
+// nothing else in the app does this (the payroll CSV export in Reports only covers one report,
+// not the whole database). Supabase backs up its own infrastructure separately, but retention
+// and whether point-in-time recovery is included depends on the project's plan tier — not
+// something the app can see or control — so this exists as a belt-and-suspenders copy an admin
+// can pull themselves whenever they want one, independent of that.
+const BACKUP_TABLES = [
+  'staff','dining_tables','guests','service_periods','reservations','waitlist','activity_log',
+  'floor_areas','floor_plan_settings','server_sections','table_combo_members',
+  'area_availability_overrides','server_roster','loyalty_tiers','loyalty_members',
+  'loyalty_redemptions','priority_holidays','permissions','role_permissions',
+  'staff_permission_overrides','schedule_shifts','time_clock_entries','time_off_requests',
+  'staff_groups','staff_group_members','message_threads','thread_participants','messages',
+  'shift_swap_requests','ticket_destinations','ingredient_categories','ingredients',
+  'menu_categories','menu_items','item_ingredients','modifier_groups','modifier_options',
+  'menu_item_modifier_groups','checks','check_items','payments','check_discounts','vendors',
+  'purchase_orders','purchase_order_items','gift_cards','gift_card_transactions',
+  'clock_terminals','kitchen_settings','staff_pay_history','staff_comments','staff_positions',
+  'payroll_periods','payroll_period_items','staff_documents','app_settings',
+  'badge_definitions','staff_badges','agent_alerts',
+];
+// PostgREST caps a plain .select('*') at 1000 rows by default — page through with .range() so
+// a table that grows past that (reservations and check_items are already the closest) still
+// comes back complete instead of silently truncating at row 1000.
+async function fetchAllRows(table){
+  const pageSize = 1000;
+  let offset = 0, all = [];
+  while (true){
+    const { data, error } = await sb.from(table).select('*').range(offset, offset + pageSize - 1);
+    if (error) return { error };
+    all = all.concat(data || []);
+    if (!data || data.length < pageSize) break;
+    offset += pageSize;
+  }
+  return { data: all };
+}
+window.downloadFullBackup = async function(){
+  const btn = document.getElementById('backupNowBtn');
+  const statusEl = document.getElementById('backupStatus');
+  if (btn){ btn.disabled = true; btn.textContent = 'Exporting…'; }
+  const backup = { generated_at: new Date().toISOString(), app_version: APP_VERSION, tables: {} };
+  const failedTables = [];
+  for (const table of BACKUP_TABLES){
+    if (statusEl) statusEl.textContent = 'Exporting ' + table + '…';
+    const { data, error } = await fetchAllRows(table);
+    if (error){ failedTables.push(table); continue; }
+    backup.tables[table] = data;
+  }
+  const json = JSON.stringify(backup, null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'agent-backup-' + todayISO() + '.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  if (btn){ btn.disabled = false; btn.textContent = '⬇️ Download Full Backup (JSON)'; }
+  if (statusEl){
+    const rowCount = Object.values(backup.tables).reduce((s,rows)=>s+rows.length,0);
+    statusEl.textContent = failedTables.length
+      ? 'Done, but ' + failedTables.length + ' table(s) couldn\'t be read: ' + failedTables.join(', ')
+      : 'Backup downloaded — ' + rowCount + ' rows across ' + BACKUP_TABLES.length + ' tables.';
+  }
+};
+window.setBackupAutoFrequency = async function(freq){
+  const { error } = await sb.from('app_settings').upsert({
+    key: 'backup_auto_frequency', value: freq, updated_by: currentStaff.id, updated_at: new Date().toISOString(),
+  });
+  if (error){ alert('Error: '+error.message); return; }
+  state.appSettings['backup_auto_frequency'] = freq;
+  render();
+};
+function renderBackupSettingsSection(){
+  const freq = state.appSettings['backup_auto_frequency'] || 'off';
+  const lastRun = state.appSettings['backup_last_run_at'];
+  const lastRunLine = lastRun
+    ? `Last automatic backup: ${new Date(lastRun).toLocaleString()}`
+    : 'No automatic backup has run yet.';
+  return `
+  <div class="panel-header"><h2 class="panel-title">💾 Backup &amp; Export</h2></div>
+  <div class="card">
+    <p class="panel-sub" style="margin:0 0 12px;line-height:1.5">
+      Downloads a single JSON file with every table in the database — reservations, guests,
+      checks, payments, staff, menu, everything — meant to be saved somewhere outside Supabase
+      (this computer, a cloud drive, etc.) as your own local copy. Supabase backs up its own
+      infrastructure separately, but that's outside the app's control and isn't a substitute for
+      having a copy of your own. This can take a little while on a large database — the button
+      shows progress as it works through each table.
+    </p>
+    <button class="btn btn-primary" id="backupNowBtn" onclick="downloadFullBackup()">⬇️ Download Full Backup (JSON)</button>
+    <div id="backupStatus" class="panel-sub" style="margin-top:10px"></div>
+  </div>
+  <div class="card" style="margin-top:16px">
+    <h4 style="margin:0 0 8px">Automatic Backups</h4>
+    <p class="panel-sub" style="margin:0 0 12px;line-height:1.5">
+      Separately from the manual button above, a scheduled check can save a backup file straight
+      into your PM Reservations folder on its own — no one has to remember to click anything.
+      Choose how often:
+    </p>
+    <select class="modal-select" style="max-width:220px;margin:0" onchange="setBackupAutoFrequency(this.value)">
+      <option value="off" ${freq==='off'?'selected':''}>Off</option>
+      <option value="daily" ${freq==='daily'?'selected':''}>Daily</option>
+      <option value="weekly" ${freq==='weekly'?'selected':''}>Weekly</option>
+      <option value="monthly" ${freq==='monthly'?'selected':''}>Monthly</option>
+    </select>
+    <p class="panel-sub" style="margin-top:10px">${lastRunLine}</p>
+  </div>`;
+}
+
 // Registry driving both the Settings directory (link grid) and the focused single-section
 // pop-out windows opened from it — one source of truth for what sections exist, their gating,
 // and how to render them, so the two views can never drift out of sync with each other.
@@ -8019,6 +8227,7 @@ const SETTINGS_SECTIONS = [
   { key:'allergen',    label:'⚠️ Allergen Checks',               can: () => can('manage_reservations'), render: renderAllergenSettingsSection },
   { key:'badges',      label:'🏅 Badges',                        can: () => currentStaff.role==='admin' || can('manage_staff_permissions'), render: renderBadgesSettingsSection },
   { key:'agent',       label:'🤖 Proactive Alerts',               can: () => can('manage_reservations'), render: renderAgentSettingsSection },
+  { key:'backup',      label:'💾 Backup & Export',               can: () => currentStaff.role==='admin', render: renderBackupSettingsSection },
 ];
 
 function renderSettingsDirectory(){
