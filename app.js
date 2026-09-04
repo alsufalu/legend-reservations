@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.25';
+const APP_VERSION = '2.26';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -8199,6 +8199,116 @@ window.runServerBackupNow = async function(){
   if (btn){ btn.disabled = false; btn.textContent = '▶️ Run Backup Now (Server-Side, to Dropbox)'; }
   render();
 };
+// ----------------------------------------------------------------------------
+// RESTORE FROM BACKUP — admin-only full wipe-and-replace restore from a previously exported
+// JSON backup file (either one downloaded via the button above, or one pulled from Dropbox).
+// Deliberately simple semantics per Alberto: full wipe and replace, not a smart merge — that's
+// what actually recovers cleanly from an accidental deletion or bad data. Two safety nets:
+//   1. An automatic "pre-restore" safety backup is taken and uploaded to Dropbox immediately
+//      before the destructive wipe runs, every time, with no way to skip it — so whatever is
+//      about to be deleted is always recoverable even if the wrong file gets restored by mistake.
+//   2. An explicit typed confirmation is required before the restore call is even made.
+// The actual delete+reload happens server-side in the restore_from_backup() Postgres function
+// (single transaction, all 93 FK constraints deferred, all-or-nothing).
+let restoreFilePayload = null;   // parsed backup JSON, kept outside `state` so it survives re-renders
+let restoreFileMeta = null;      // { filename, error } | { filename, generatedAt, source, tableCount, rowCount }
+
+window.handleRestoreFileSelect = function(event){
+  const file = event.target.files && event.target.files[0];
+  restoreFilePayload = null;
+  restoreFileMeta = null;
+  if (!file){ render(); return; }
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const parsed = JSON.parse(reader.result);
+      if (!parsed || typeof parsed.tables !== 'object' || Array.isArray(parsed.tables)){
+        restoreFileMeta = { filename: file.name, error: 'This file doesn\'t look like an Agent backup — no "tables" object found.' };
+      } else {
+        const tableNames = Object.keys(parsed.tables);
+        const rowCount = tableNames.reduce((s,t) => s + (Array.isArray(parsed.tables[t]) ? parsed.tables[t].length : 0), 0);
+        restoreFilePayload = parsed;
+        restoreFileMeta = {
+          filename: file.name,
+          generatedAt: parsed.generated_at ? new Date(parsed.generated_at).toLocaleString() : 'unknown',
+          source: parsed.source || 'unknown',
+          tableCount: tableNames.length,
+          rowCount,
+        };
+      }
+    } catch(e){
+      restoreFileMeta = { filename: file.name, error: 'Couldn\'t parse this file as JSON: ' + (e.message || e) };
+    }
+    render();
+  };
+  reader.onerror = () => {
+    restoreFileMeta = { filename: file.name, error: 'Couldn\'t read this file.' };
+    render();
+  };
+  reader.readAsText(file);
+};
+
+window.checkRestoreConfirmText = function(el){
+  const btn = document.getElementById('restoreNowBtn');
+  if (btn) btn.disabled = (el.value.trim() !== 'RESTORE') || !restoreFilePayload;
+};
+
+window.runRestoreFromBackup = async function(){
+  if (!restoreFilePayload){ alert('Choose a backup file first.'); return; }
+  const confirmInput = document.getElementById('restoreConfirmInput');
+  if (!confirmInput || confirmInput.value.trim() !== 'RESTORE'){ alert('Type RESTORE to confirm.'); return; }
+  const proceed = confirm(
+    'This will PERMANENTLY DELETE all current data in every table and replace it with the contents ' +
+    'of "' + restoreFileMeta.filename + '" (backed up ' + restoreFileMeta.generatedAt + ').\n\n' +
+    'A safety backup of what\'s about to be deleted will be taken automatically first, but this ' +
+    'action itself cannot be undone once it runs.\n\nContinue?'
+  );
+  if (!proceed) return;
+
+  const btn = document.getElementById('restoreNowBtn');
+  const statusEl = document.getElementById('restoreStatus');
+  if (btn){ btn.disabled = true; btn.textContent = 'Restoring…'; }
+
+  try {
+    if (statusEl) statusEl.textContent = 'Step 1 of 2 — backing up current data to Dropbox before deleting anything…';
+    const { data: preData, error: preError } = await sb.functions.invoke('agent-auto-backup', { body: { reason: 'pre_restore' } });
+    if (preError) throw new Error('Pre-restore safety backup failed, so the restore was NOT started (your data is untouched): ' + preError.message);
+    if (!preData || preData.status !== 'completed'){
+      throw new Error('Pre-restore safety backup did not complete, so the restore was NOT started (your data is untouched): ' + (preData && preData.message ? preData.message : JSON.stringify(preData)));
+    }
+    const safetyPath = preData.dropbox_path;
+
+    if (statusEl) statusEl.textContent = `Safety backup saved to Dropbox (${safetyPath}). Step 2 of 2 — restoring from "${restoreFileMeta.filename}"…`;
+    const { data, error } = await sb.rpc('restore_from_backup', { payload: restoreFilePayload });
+    if (error) throw new Error('Restore failed: ' + error.message + ' — your pre-restore safety backup is still at ' + safetyPath + ' in Dropbox if you need to check current state.');
+
+    if (statusEl){
+      statusEl.innerHTML = `Done — restored ${data.rows_restored} rows across ${data.tables_restored} tables.<br>` +
+        `Safety backup of the data just replaced was saved to Dropbox: ${safetyPath}<br><br>` +
+        `<button class="btn btn-primary" onclick="location.reload()">🔄 Reload App Now</button>`;
+    }
+    restoreFilePayload = null;
+    restoreFileMeta = null;
+  } catch(e){
+    if (statusEl) statusEl.textContent = 'Error: ' + (e.message || e);
+    if (btn){ btn.disabled = false; btn.textContent = '⚠️ Restore From This Backup (Deletes All Current Data)'; }
+    return;
+  }
+};
+
+function renderRestoreSummaryHtml(){
+  if (!restoreFileMeta) return '';
+  if (restoreFileMeta.error){
+    return `<p class="panel-sub" style="margin-top:10px;color:var(--danger,#c0392b)">${restoreFileMeta.filename}: ${restoreFileMeta.error}</p>`;
+  }
+  return `<p class="panel-sub" style="margin-top:10px;line-height:1.5">
+    <strong>${restoreFileMeta.filename}</strong><br>
+    Backed up: ${restoreFileMeta.generatedAt}<br>
+    Source: ${restoreFileMeta.source}<br>
+    ${restoreFileMeta.tableCount} tables, ${restoreFileMeta.rowCount} total rows
+  </p>`;
+}
+
 function renderBackupSettingsSection(){
   const freq = state.appSettings['backup_auto_frequency'] || 'off';
   const lastRun = state.appSettings['backup_last_run_at'];
@@ -8235,6 +8345,22 @@ function renderBackupSettingsSection(){
       <option value="monthly" ${freq==='monthly'?'selected':''}>Monthly</option>
     </select>
     <p class="panel-sub" style="margin-top:10px">${lastRunLine}</p>
+  </div>
+  <div class="card" style="margin-top:16px;border:1px solid var(--danger,#c0392b)">
+    <h4 style="margin:0 0 8px">⚠️ Restore From Backup</h4>
+    <p class="panel-sub" style="margin:0 0 12px;line-height:1.5">
+      Full wipe and replace: this deletes everything currently in every table and replaces it
+      with the contents of the backup file you pick below. Use this to recover from an accidental
+      deletion or bad data change — not for partial fixes. Before anything is deleted, the app
+      automatically takes a fresh backup of the current data and uploads it to Dropbox, so
+      today's data is never lost even if the wrong file gets restored by mistake.
+    </p>
+    <input type="file" id="restoreFileInput" accept="application/json,.json" onchange="handleRestoreFileSelect(event)"/>
+    ${renderRestoreSummaryHtml()}
+    <p class="panel-sub" style="margin:16px 0 6px">Type <strong>RESTORE</strong> to confirm, then click the button:</p>
+    <input type="text" class="modal-input" id="restoreConfirmInput" placeholder="Type RESTORE" style="max-width:220px;display:inline-block;margin-right:10px" oninput="checkRestoreConfirmText(this)"/>
+    <button class="btn btn-danger" id="restoreNowBtn" onclick="runRestoreFromBackup()" disabled>⚠️ Restore From This Backup (Deletes All Current Data)</button>
+    <div id="restoreStatus" class="panel-sub" style="margin-top:10px"></div>
   </div>`;
 }
 
