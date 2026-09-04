@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.26';
+const APP_VERSION = '2.27';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -8177,26 +8177,33 @@ window.setBackupAutoFrequency = async function(freq){
 // cron shared secret. Always runs immediately regardless of the auto-frequency/due-date setting
 // below -- that's the point of a manual "run now" button. Runs entirely server-side, so this
 // keeps working the same way whether triggered from here or by the schedule.
+// serverBackupStatusText/serverBackupInProgress are read by renderBackupSettingsSection() below
+// rather than being written straight to DOM elements. This app re-renders on realtime events
+// (new reservations, checks, etc. coming in from other terminals), which regenerates this whole
+// settings card's HTML from scratch -- a status message set only via statusEl.textContent would
+// get silently wiped out by the next unrelated re-render. Sourcing it from these module-level
+// variables means every render() call (ours or anyone else's) shows the current true status.
+let serverBackupStatusText = '';
+let serverBackupInProgress = false;
 window.runServerBackupNow = async function(){
-  const btn = document.getElementById('serverBackupNowBtn');
-  const statusEl = document.getElementById('serverBackupStatus');
-  if (btn){ btn.disabled = true; btn.textContent = 'Running…'; }
-  if (statusEl) statusEl.textContent = 'Backing up every table and uploading to Dropbox — this can take a little while…';
+  serverBackupInProgress = true;
+  serverBackupStatusText = 'Backing up every table and uploading to Dropbox — this can take a little while…';
+  render();
   try {
     const { data, error } = await sb.functions.invoke('agent-auto-backup', { body: {} });
     if (error) throw error;
     if (data && data.status === 'completed'){
       state.appSettings['backup_last_run_at'] = new Date().toISOString();
-      if (statusEl) statusEl.textContent = `Done — ${data.rows} rows across ${data.tables} tables uploaded to Dropbox (${data.dropbox_path}).`;
+      serverBackupStatusText = `Done — ${data.rows} rows across ${data.tables} tables uploaded to Dropbox (${data.dropbox_path}).`;
     } else if (data && data.status === 'error'){
-      if (statusEl) statusEl.textContent = 'Error: ' + data.message;
+      serverBackupStatusText = 'Error: ' + data.message;
     } else {
-      if (statusEl) statusEl.textContent = 'Unexpected response: ' + JSON.stringify(data);
+      serverBackupStatusText = 'Unexpected response: ' + JSON.stringify(data);
     }
   } catch(e){
-    if (statusEl) statusEl.textContent = 'Error: ' + (e.message || e);
+    serverBackupStatusText = 'Error: ' + (e.message || e);
   }
-  if (btn){ btn.disabled = false; btn.textContent = '▶️ Run Backup Now (Server-Side, to Dropbox)'; }
+  serverBackupInProgress = false;
   render();
 };
 // ----------------------------------------------------------------------------
@@ -8210,13 +8217,24 @@ window.runServerBackupNow = async function(){
 //   2. An explicit typed confirmation is required before the restore call is even made.
 // The actual delete+reload happens server-side in the restore_from_backup() Postgres function
 // (single transaction, all 93 FK constraints deferred, all-or-nothing).
-let restoreFilePayload = null;   // parsed backup JSON, kept outside `state` so it survives re-renders
+// All of this is module-level state rather than DOM manipulation, same reasoning as
+// serverBackupStatusText above: this app re-renders on realtime events from other terminals, and
+// the restore flow involves multiple slow awaited steps (pre-restore backup, then the restore
+// itself), so an unrelated re-render landing mid-flow is a real risk, not a theoretical one --
+// it's exactly what buried the result of Alberto's first restore attempt. Every render() call,
+// regardless of what triggered it, now reconstructs the true current status from these variables.
+let restoreFilePayload = null;   // parsed backup JSON
 let restoreFileMeta = null;      // { filename, error } | { filename, generatedAt, source, tableCount, rowCount }
+let restoreStatusText = '';
+let restoreInProgress = false;
+let restoreJustSucceeded = false;
 
 window.handleRestoreFileSelect = function(event){
   const file = event.target.files && event.target.files[0];
   restoreFilePayload = null;
   restoreFileMeta = null;
+  restoreStatusText = '';
+  restoreJustSucceeded = false;
   if (!file){ render(); return; }
   const reader = new FileReader();
   reader.onload = () => {
@@ -8250,7 +8268,7 @@ window.handleRestoreFileSelect = function(event){
 
 window.checkRestoreConfirmText = function(el){
   const btn = document.getElementById('restoreNowBtn');
-  if (btn) btn.disabled = (el.value.trim() !== 'RESTORE') || !restoreFilePayload;
+  if (btn) btn.disabled = restoreInProgress || (el.value.trim() !== 'RESTORE') || !restoreFilePayload;
 };
 
 window.runRestoreFromBackup = async function(){
@@ -8265,12 +8283,12 @@ window.runRestoreFromBackup = async function(){
   );
   if (!proceed) return;
 
-  const btn = document.getElementById('restoreNowBtn');
-  const statusEl = document.getElementById('restoreStatus');
-  if (btn){ btn.disabled = true; btn.textContent = 'Restoring…'; }
+  restoreInProgress = true;
+  restoreJustSucceeded = false;
+  restoreStatusText = 'Step 1 of 2 — backing up current data to Dropbox before deleting anything…';
+  render();
 
   try {
-    if (statusEl) statusEl.textContent = 'Step 1 of 2 — backing up current data to Dropbox before deleting anything…';
     const { data: preData, error: preError } = await sb.functions.invoke('agent-auto-backup', { body: { reason: 'pre_restore' } });
     if (preError) throw new Error('Pre-restore safety backup failed, so the restore was NOT started (your data is untouched): ' + preError.message);
     if (!preData || preData.status !== 'completed'){
@@ -8278,22 +8296,21 @@ window.runRestoreFromBackup = async function(){
     }
     const safetyPath = preData.dropbox_path;
 
-    if (statusEl) statusEl.textContent = `Safety backup saved to Dropbox (${safetyPath}). Step 2 of 2 — restoring from "${restoreFileMeta.filename}"…`;
+    restoreStatusText = `Safety backup saved to Dropbox (${safetyPath}). Step 2 of 2 — restoring from "${restoreFileMeta.filename}"…`;
+    render();
     const { data, error } = await sb.rpc('restore_from_backup', { payload: restoreFilePayload });
     if (error) throw new Error('Restore failed: ' + error.message + ' — your pre-restore safety backup is still at ' + safetyPath + ' in Dropbox if you need to check current state.');
 
-    if (statusEl){
-      statusEl.innerHTML = `Done — restored ${data.rows_restored} rows across ${data.tables_restored} tables.<br>` +
-        `Safety backup of the data just replaced was saved to Dropbox: ${safetyPath}<br><br>` +
-        `<button class="btn btn-primary" onclick="location.reload()">🔄 Reload App Now</button>`;
-    }
+    restoreStatusText = `DONE — restored ${data.rows_restored} rows across ${data.tables_restored} tables. ` +
+      `Safety backup of the data just replaced was saved to Dropbox: ${safetyPath}.`;
+    restoreJustSucceeded = true;
     restoreFilePayload = null;
     restoreFileMeta = null;
   } catch(e){
-    if (statusEl) statusEl.textContent = 'Error: ' + (e.message || e);
-    if (btn){ btn.disabled = false; btn.textContent = '⚠️ Restore From This Backup (Deletes All Current Data)'; }
-    return;
+    restoreStatusText = 'Error: ' + (e.message || e);
   }
+  restoreInProgress = false;
+  render();
 };
 
 function renderRestoreSummaryHtml(){
@@ -8335,8 +8352,8 @@ function renderBackupSettingsSection(){
       itself and uploads straight to Dropbox. It runs automatically on the schedule below, or
       click the button to run it right now on demand, same as the schedule would.
     </p>
-    <button class="btn btn-primary" id="serverBackupNowBtn" onclick="runServerBackupNow()">▶️ Run Backup Now (Server-Side, to Dropbox)</button>
-    <div id="serverBackupStatus" class="panel-sub" style="margin-top:10px"></div>
+    <button class="btn btn-primary" id="serverBackupNowBtn" ${serverBackupInProgress?'disabled':''} onclick="runServerBackupNow()">${serverBackupInProgress?'Running…':'▶️ Run Backup Now (Server-Side, to Dropbox)'}</button>
+    <div id="serverBackupStatus" class="panel-sub" style="margin-top:10px">${serverBackupStatusText}</div>
     <p class="panel-sub" style="margin:16px 0 12px;line-height:1.5">Automatic schedule:</p>
     <select class="modal-select" style="max-width:220px;margin:0" onchange="setBackupAutoFrequency(this.value)">
       <option value="off" ${freq==='off'?'selected':''}>Off</option>
@@ -8355,12 +8372,13 @@ function renderBackupSettingsSection(){
       automatically takes a fresh backup of the current data and uploads it to Dropbox, so
       today's data is never lost even if the wrong file gets restored by mistake.
     </p>
-    <input type="file" id="restoreFileInput" accept="application/json,.json" onchange="handleRestoreFileSelect(event)"/>
+    <input type="file" id="restoreFileInput" accept="application/json,.json" ${restoreInProgress?'disabled':''} onchange="handleRestoreFileSelect(event)"/>
     ${renderRestoreSummaryHtml()}
     <p class="panel-sub" style="margin:16px 0 6px">Type <strong>RESTORE</strong> to confirm, then click the button:</p>
-    <input type="text" class="modal-input" id="restoreConfirmInput" placeholder="Type RESTORE" style="max-width:220px;display:inline-block;margin-right:10px" oninput="checkRestoreConfirmText(this)"/>
-    <button class="btn btn-danger" id="restoreNowBtn" onclick="runRestoreFromBackup()" disabled>⚠️ Restore From This Backup (Deletes All Current Data)</button>
-    <div id="restoreStatus" class="panel-sub" style="margin-top:10px"></div>
+    <input type="text" class="modal-input" id="restoreConfirmInput" placeholder="Type RESTORE" ${restoreInProgress?'disabled':''} style="max-width:220px;display:inline-block;margin-right:10px" oninput="checkRestoreConfirmText(this)"/>
+    <button class="btn btn-danger" id="restoreNowBtn" onclick="runRestoreFromBackup()" disabled>${restoreInProgress?'Restoring…':'⚠️ Restore From This Backup (Deletes All Current Data)'}</button>
+    <div id="restoreStatus" class="panel-sub" style="margin-top:10px;white-space:pre-wrap">${restoreStatusText}</div>
+    ${restoreJustSucceeded ? '<button class="btn btn-primary" style="margin-top:10px" onclick="location.reload()">🔄 Reload App Now</button>' : ''}
   </div>`;
 }
 
