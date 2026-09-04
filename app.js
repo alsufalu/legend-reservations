@@ -6,7 +6,7 @@
 const SUPABASE_URL = 'https://bnjtoobxqfvosbvwnrie.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJuanRvb2J4cWZ2b3NidnducmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQwMTQ4MzksImV4cCI6MjA5OTU5MDgzOX0.2Zpknuae2DIhHhMLyKZ78kvId1RoT9a-M7oqxFTImuE';
 const ADMIN_EMAIL = 'aerubio1@yahoo.com';
-const APP_VERSION = '2.23';
+const APP_VERSION = '2.25';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -8172,14 +8172,40 @@ window.setBackupAutoFrequency = async function(freq){
   state.appSettings['backup_auto_frequency'] = freq;
   render();
 };
+// Triggers the serverless backup (Supabase Edge Function -> Dropbox) on demand, the same
+// function the daily pg_cron job calls, just authenticated as this admin instead of via the
+// cron shared secret. Always runs immediately regardless of the auto-frequency/due-date setting
+// below -- that's the point of a manual "run now" button. Runs entirely server-side, so this
+// keeps working the same way whether triggered from here or by the schedule.
+window.runServerBackupNow = async function(){
+  const btn = document.getElementById('serverBackupNowBtn');
+  const statusEl = document.getElementById('serverBackupStatus');
+  if (btn){ btn.disabled = true; btn.textContent = 'Running…'; }
+  if (statusEl) statusEl.textContent = 'Backing up every table and uploading to Dropbox — this can take a little while…';
+  try {
+    const { data, error } = await sb.functions.invoke('agent-auto-backup', { body: {} });
+    if (error) throw error;
+    if (data && data.status === 'completed'){
+      state.appSettings['backup_last_run_at'] = new Date().toISOString();
+      if (statusEl) statusEl.textContent = `Done — ${data.rows} rows across ${data.tables} tables uploaded to Dropbox (${data.dropbox_path}).`;
+    } else if (data && data.status === 'error'){
+      if (statusEl) statusEl.textContent = 'Error: ' + data.message;
+    } else {
+      if (statusEl) statusEl.textContent = 'Unexpected response: ' + JSON.stringify(data);
+    }
+  } catch(e){
+    if (statusEl) statusEl.textContent = 'Error: ' + (e.message || e);
+  }
+  if (btn){ btn.disabled = false; btn.textContent = '▶️ Run Backup Now (Server-Side, to Dropbox)'; }
+  render();
+};
 function renderBackupSettingsSection(){
   const freq = state.appSettings['backup_auto_frequency'] || 'off';
   const lastRun = state.appSettings['backup_last_run_at'];
   const lastRunLine = lastRun
-    ? `Last automatic backup: ${new Date(lastRun).toLocaleString()}`
-    : 'No automatic backup has run yet.';
+    ? `Last server-side backup: ${new Date(lastRun).toLocaleString()}`
+    : 'No server-side backup has run yet.';
   return `
-  <div class="panel-header"><h2 class="panel-title">💾 Backup &amp; Export</h2></div>
   <div class="card">
     <p class="panel-sub" style="margin:0 0 12px;line-height:1.5">
       Downloads a single JSON file with every table in the database — reservations, guests,
@@ -8193,12 +8219,15 @@ function renderBackupSettingsSection(){
     <div id="backupStatus" class="panel-sub" style="margin-top:10px"></div>
   </div>
   <div class="card" style="margin-top:16px">
-    <h4 style="margin:0 0 8px">Automatic Backups</h4>
+    <h4 style="margin:0 0 8px">Server-Side Backup (to Dropbox)</h4>
     <p class="panel-sub" style="margin:0 0 12px;line-height:1.5">
-      Separately from the manual button above, a scheduled check can save a backup file straight
-      into your PM Reservations folder on its own — no one has to remember to click anything.
-      Choose how often:
+      This one doesn't touch your browser or this computer at all — it runs inside Supabase
+      itself and uploads straight to Dropbox. It runs automatically on the schedule below, or
+      click the button to run it right now on demand, same as the schedule would.
     </p>
+    <button class="btn btn-primary" id="serverBackupNowBtn" onclick="runServerBackupNow()">▶️ Run Backup Now (Server-Side, to Dropbox)</button>
+    <div id="serverBackupStatus" class="panel-sub" style="margin-top:10px"></div>
+    <p class="panel-sub" style="margin:16px 0 12px;line-height:1.5">Automatic schedule:</p>
     <select class="modal-select" style="max-width:220px;margin:0" onchange="setBackupAutoFrequency(this.value)">
       <option value="off" ${freq==='off'?'selected':''}>Off</option>
       <option value="daily" ${freq==='daily'?'selected':''}>Daily</option>
